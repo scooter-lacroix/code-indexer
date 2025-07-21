@@ -46,3 +46,30 @@ CLAUDE.md
 
 # Roo specific files
 /.roo/
+
+# Code indexer data and cache files
+.code_indexer_data/
+data/
+file_content_cache.json.tmp
+
+# Test and debug files
+test_*.py
+test_*.txt
+debug_*.py
+simple_search_test.py
+mcp_test_file.py
+
+# Backup files
+*.backup
+backups/
+
+# Temporary files
+*.tmp
+*.temp
+
+# Migration and fix scripts (development only)
+apply_migrations.py
+fix_postgresql_schema.py
+
+# Kiro IDE files
+.kiro/

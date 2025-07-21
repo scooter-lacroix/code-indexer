@@ -16,6 +16,7 @@ import tempfile
 import subprocess
 import time
 import asyncio
+from datetime import datetime # Import datetime
 from .lazy_loader import LazyContentManager
 from mcp.server.fastmcp import FastMCP, Context, Image
 from mcp import types
@@ -25,6 +26,7 @@ from .optimized_project_settings import OptimizedProjectSettings
 from .constants import SETTINGS_DIR
 from .ignore_patterns import IgnorePatternMatcher
 from .config_manager import ConfigManager
+from .global_config_manager import GlobalConfigManager # Import GlobalConfigManager
 from .incremental_indexer import IncrementalIndexer
 from .parallel_processor import ParallelIndexer, IndexingTask, IndexingResult
 from .memory_profiler import MemoryProfiler, MemoryLimits, MemoryAwareLazyContentManager, create_memory_config_from_yaml
@@ -33,7 +35,17 @@ from .progress_tracker import (
     progress_manager, ProgressContext, ProgressTracker, CancellationToken,
     ProgressEventType, OperationStatus, LoggingProgressHandler
 )
+from elasticsearch import Elasticsearch
 from .file_change_tracker import FileChangeTracker # Import FileChangeTracker
+from .realtime_indexer import RabbitMQProducer, RabbitMQConsumer, RealtimeIndexer # Import RealtimeIndexer and RabbitMQ classes
+from .constants import (
+    ES_HOST, ES_PORT, ES_INDEX_NAME,
+    RABBITMQ_HOST, RABBITMQ_PORT, RABBITMQ_QUEUE_NAME,
+    RABBITMQ_EXCHANGE_NAME, RABBITMQ_ROUTING_KEY
+) # Import Elasticsearch and RabbitMQ constants
+from .storage.dal_factory import get_dal_instance
+from .storage.storage_interface import DALInterface, SearchInterface # Import DALInterface and SearchInterface
+from .logger_config import logger # Import the centralized logger
 
 # Create the MCP server
 mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
@@ -41,6 +53,21 @@ mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
 # In-memory references (will be loaded from persistent storage)
 file_index = {}
 lazy_content_manager = LazyContentManager(max_loaded_files=100)
+
+# Global DAL instance
+dal_instance: Optional[DALInterface] = None
+
+# Global Elasticsearch client, RabbitMQ producer/consumer, and real-time indexer
+es_client: Optional[Elasticsearch] = None
+rabbitmq_producer: Optional[RabbitMQProducer] = None
+rabbitmq_consumer: Optional[RabbitMQConsumer] = None
+realtime_indexer: Optional[RealtimeIndexer] = None
+
+# Global variable to store the current project path persistently
+_current_project_path: str = ""
+
+# Global instance of GlobalConfigManager
+global_config_manager = GlobalConfigManager()
 
 # Global memory profiler - will be initialized when project is set
 memory_profiler = None
@@ -55,9 +82,9 @@ def ensure_performance_monitor():
     if performance_monitor is None:
         try:
             performance_monitor = PerformanceMonitor()
-            print("Initialized default performance monitor")
+            logger.info("Initialized default performance monitor")
         except Exception as e:
-            print(f"Warning: Could not initialize performance monitor: {e}")
+            logger.warning(f"Could not initialize performance monitor: {e}")
     return performance_monitor
 
 supported_extensions = [
@@ -91,39 +118,109 @@ class CodeIndexerContext:
     base_path: str
     settings: OptimizedProjectSettings
     file_count: int = 0
-    file_change_tracker: Optional[FileChangeTracker] = None # Add file_change_tracker
+    file_change_tracker: Optional[FileChangeTracker] = None
+    dal: Optional[DALInterface] = None # Add DAL instance to context
+    es_client: Optional[Elasticsearch] = None
+    rabbitmq_producer: Optional[RabbitMQProducer] = None
+    rabbitmq_consumer: Optional[RabbitMQConsumer] = None
+    realtime_indexer: Optional[RealtimeIndexer] = None
 
 @asynccontextmanager
 async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]:
     """Manage the lifecycle of the Code Indexer MCP server."""
-    # Don't set a default path, user must explicitly set project path
-    base_path = ""  # Empty string to indicate no path is set
+    global es_client, rabbitmq_producer, rabbitmq_consumer, realtime_indexer, dal_instance
 
-    print("Initializing Code Indexer MCP server...")
+    # Load base_path from settings if available, otherwise default to empty string
+    logger.info("Initializing Code Indexer MCP server...")
 
-    # Initialize settings manager with skip_load=True to skip loading files
-    settings = OptimizedProjectSettings(base_path, skip_load=True, storage_backend='sqlite', use_trie_index=True)
+    # Initialize a temporary settings manager to load the base_path from the default config location
+    # This ensures we can retrieve the last saved project path even if the server restarts
+    default_settings = OptimizedProjectSettings("", skip_load=True, storage_backend='sqlite', use_trie_index=True)
+    base_path_from_config = default_settings.load_config().get('base_path', "")
+    
+    global _current_project_path
+    _current_project_path = base_path_from_config # Initialize global variable
 
-    # Initialize FileChangeTracker
-    # Initialize IncrementalIndexer
+    # Initialize the actual settings manager with the loaded base_path
+    # This settings object will be used throughout the server's lifespan
+    settings = OptimizedProjectSettings(base_path_from_config, skip_load=not bool(base_path_from_config), storage_backend='sqlite', use_trie_index=True)
+    
+    # Update the base_path in the settings object itself, as it might have been initialized with an empty string
+    settings.base_path = base_path_from_config
+
+    # Initialize DAL instance (use configured backend type)
+    dal_instance = get_dal_instance()
+
+    # Initialize IncrementalIndexer and FileChangeTracker
     incremental_indexer = IncrementalIndexer(settings)
-    file_change_tracker = FileChangeTracker(settings.metadata_storage, incremental_indexer)
+    file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
+
+    # Initialize Elasticsearch client
+    try:
+        es_client = Elasticsearch(hosts=[{"host": ES_HOST, "port": ES_PORT, "scheme": "http"}])
+        # Test connection
+        if not es_client.ping():
+            logger.warning(f"Could not connect to Elasticsearch at {ES_HOST}:{ES_PORT}. Real-time indexing will be disabled.")
+            es_client = None # Set to None if connection fails
+        else:
+            logger.info(f"Connected to Elasticsearch at {ES_HOST}:{ES_PORT}")
+            # Initialize RabbitMQ producer and consumer only if ES is connected
+            rabbitmq_producer = RabbitMQProducer(
+                host=RABBITMQ_HOST,
+                port=RABBITMQ_PORT,
+                exchange=RABBITMQ_EXCHANGE_NAME,
+                routing_key=RABBITMQ_ROUTING_KEY
+            )
+            rabbitmq_consumer = RabbitMQConsumer(
+                es_client=es_client,
+                base_path=base_path_from_config, # Will be updated by set_project_path
+                host=RABBITMQ_HOST,
+                port=RABBITMQ_PORT,
+                queue_name=RABBITMQ_QUEUE_NAME,
+                exchange=RABBITMQ_EXCHANGE_NAME,
+                routing_key=RABBITMQ_ROUTING_KEY
+            )
+            realtime_indexer = RealtimeIndexer(es_client, base_path_from_config, rabbitmq_producer, rabbitmq_consumer)
+            realtime_indexer.start() # Start the consumer worker thread
+            logger.info("RealtimeIndexer (RabbitMQ) started.")
+    except Exception as e:
+        logger.error(f"Error initializing Elasticsearch or RabbitMQ client: {e}. Real-time indexing will be disabled.")
+        es_client = None
+        rabbitmq_producer = None
+        rabbitmq_consumer = None
+        realtime_indexer = None
 
     # Initialize context
     context = CodeIndexerContext(
-        base_path=base_path,
+        base_path=base_path_from_config,
         settings=settings,
-        file_change_tracker=file_change_tracker # Pass file_change_tracker to context
+        file_change_tracker=file_change_tracker,
+        dal=dal_instance, # Store DAL instance in context
+        es_client=es_client,
+        rabbitmq_producer=rabbitmq_producer,
+        rabbitmq_consumer=rabbitmq_consumer,
+        realtime_indexer=realtime_indexer
     )
 
     try:
-        print("Server ready. Waiting for user to set project path...")
-        # Provide context to the server
+        logger.info("Server ready. Waiting for user to set project path...")
         yield context
     finally:
+        # Close DAL instance
+        if dal_instance:
+            logger.info("Closing DAL instance...")
+            dal_instance.close()
+            logger.info("DAL instance closed.")
+
+        # Stop RealtimeIndexer worker thread
+        if realtime_indexer:
+            logger.info("Stopping RealtimeIndexer...")
+            realtime_indexer.stop()
+            logger.info("RealtimeIndexer stopped.")
+
         # Only save index if project path has been set
         if context.base_path and file_index:
-            print(f"Saving index for project: {context.base_path}")
+            logger.info(f"Saving index for project: {context.base_path}")
             settings.save_index(file_index)
 
         # Export memory profile on shutdown if configured
@@ -138,17 +235,17 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
                     timestamp = int(time.time())
                     profile_path = os.path.join(tempfile.gettempdir(), f"memory_profile_shutdown_{timestamp}.json")
                     memory_profiler.export_profile(profile_path)
-                    print(f"Memory profile exported to: {profile_path}")
+                    logger.info(f"Memory profile exported to: {profile_path}")
                 
                 # Stop monitoring
                 memory_profiler.stop_monitoring()
-                print("Memory monitoring stopped")
+                logger.info("Memory monitoring stopped")
             except Exception as e:
-                print(f"Error during memory profiler shutdown: {e}")
+                logger.error(f"Error during memory profiler shutdown: {e}")
 
         # Save memory stats for loaded files
         memory_stats = lazy_content_manager.get_memory_stats()
-        print(f"Memory Stats: {memory_stats}")
+        logger.info(f"Memory Stats: {memory_stats}")
 
 # Initialize the server with our lifespan manager
 mcp = FastMCP("CodeIndexer", lifespan=indexer_lifespan)
@@ -292,16 +389,98 @@ def set_project_path(path: str, ctx: Context) -> str:
             return f"Error: Path is not a directory: {abs_path}"
 
         # Clear existing in-memory index and unload cached content
-        global file_index, lazy_content_manager, memory_profiler, memory_aware_manager, performance_monitor
+        global file_index, lazy_content_manager, memory_profiler, memory_aware_manager, performance_monitor, es_client, realtime_indexer, dal_instance
         file_index = {}  # Always reset to dictionary - will be loaded as TrieFileIndex if available
         lazy_content_manager.unload_all()
 
-        # Update the base path in context
+        # Update the base path in context and global variable
         ctx.request_context.lifespan_context.base_path = abs_path
+        global _current_project_path
+        _current_project_path = abs_path
+
+        # Save project path to config for persistence
+        config = ctx.request_context.lifespan_context.settings.load_config()
+        ctx.request_context.lifespan_context.settings.save_config({
+            **config,
+            'base_path': abs_path
+        })
 
         # Create a new settings manager for the new path (don't skip loading files)
-        ctx.request_context.lifespan_context.settings = OptimizedProjectSettings(abs_path, skip_load=False, storage_backend='sqlite', use_trie_index=True)
+        new_settings = OptimizedProjectSettings(abs_path, skip_load=False, storage_backend='sqlite', use_trie_index=True)
+        ctx.request_context.lifespan_context.settings = new_settings
+
+        # Re-initialize IncrementalIndexer and FileChangeTracker with the new settings
+        new_incremental_indexer = IncrementalIndexer(new_settings)
         
+        # Initialize FileChangeTracker with DAL metadata backend after DAL is re-initialized
+        ctx.request_context.lifespan_context.file_change_tracker = FileChangeTracker(
+            dal_instance.metadata,
+            new_incremental_indexer
+        )
+        
+        # Re-initialize DAL instance based on settings
+        try:
+            # Close existing DAL instance if it exists
+            if dal_instance:
+                dal_instance.close()
+            
+            # Use environment variables for DAL configuration instead of hardcoded values
+            # This allows the DAL factory to use the proper backend configuration
+            dal_instance = get_dal_instance()
+            ctx.request_context.lifespan_context.dal = dal_instance
+            logger.info(f"DAL instance re-initialized using environment configuration")
+        except Exception as e:
+            logger.error(f"Error re-initializing DAL instance: {e}. Falling back to SQLite DAL.")
+            dal_instance = get_dal_instance({"backend_type": "sqlite"})
+            ctx.request_context.lifespan_context.dal = dal_instance
+
+        # Re-initialize Elasticsearch client, RabbitMQ producer/consumer, and RealtimeIndexer if ES is available
+        if es_client:
+            try:
+                # Stop existing RealtimeIndexer if running
+                if realtime_indexer:
+                    realtime_indexer.stop()
+                
+                # Re-initialize RabbitMQ producer and consumer with the new base_path
+                rabbitmq_producer = RabbitMQProducer(
+                    host=RABBITMQ_HOST,
+                    port=RABBITMQ_PORT,
+                    exchange=RABBITMQ_EXCHANGE_NAME,
+                    routing_key=RABBITMQ_ROUTING_KEY
+                )
+                rabbitmq_consumer = RabbitMQConsumer(
+                    es_client=es_client,
+                    base_path=abs_path, # Update base_path for consumer
+                    host=RABBITMQ_HOST,
+                    port=RABBITMQ_PORT,
+                    queue_name=RABBITMQ_QUEUE_NAME,
+                    exchange=RABBITMQ_EXCHANGE_NAME,
+                    routing_key=RABBITMQ_ROUTING_KEY
+                )
+                realtime_indexer = RealtimeIndexer(es_client, abs_path, rabbitmq_producer, rabbitmq_consumer)
+                realtime_indexer.start()
+                ctx.request_context.lifespan_context.es_client = es_client
+                ctx.request_context.lifespan_context.rabbitmq_producer = rabbitmq_producer
+                ctx.request_context.lifespan_context.rabbitmq_consumer = rabbitmq_consumer
+                ctx.request_context.lifespan_context.realtime_indexer = realtime_indexer
+                logger.info("RealtimeIndexer (RabbitMQ) re-initialized and started for new project path.")
+            except Exception as e:
+                logger.error(f"Error re-initializing RealtimeIndexer (RabbitMQ) for new project path: {e}. Real-time indexing will be disabled.")
+                ctx.request_context.lifespan_context.es_client = None
+                ctx.request_context.lifespan_context.rabbitmq_producer = None
+                ctx.request_context.lifespan_context.rabbitmq_consumer = None
+                ctx.request_context.lifespan_context.realtime_indexer = None
+                es_client = None # Ensure global is also None
+                rabbitmq_producer = None
+                rabbitmq_consumer = None
+                realtime_indexer = None
+        else:
+            logger.info("Elasticsearch client not initialized, skipping RealtimeIndexer (RabbitMQ) setup.")
+            ctx.request_context.lifespan_context.es_client = None
+            ctx.request_context.lifespan_context.rabbitmq_producer = None
+            ctx.request_context.lifespan_context.rabbitmq_consumer = None
+            ctx.request_context.lifespan_context.realtime_indexer = None
+
         # Initialize memory profiler with configuration from settings
         try:
             config_manager = ConfigManager()
@@ -322,11 +501,11 @@ def set_project_path(path: str, ctx: Context) -> str:
             if config_data.get('memory', {}).get('enable_monitoring', True):
                 interval = config_data.get('memory', {}).get('monitoring_interval', 30.0)
                 memory_profiler.start_monitoring(interval)
-                print(f"Memory monitoring started with {interval}s interval")
+                logger.info(f"Memory monitoring started with {interval}s interval")
             
-            print(f"Memory profiler initialized: {memory_limits}")
+            logger.info(f"Memory profiler initialized: {memory_limits}")
         except Exception as e:
-            print(f"Warning: Could not initialize memory profiler: {e}")
+            logger.warning(f"Could not initialize memory profiler: {e}")
         
         # Initialize performance monitor with configuration from settings
         try:
@@ -336,24 +515,23 @@ def set_project_path(path: str, ctx: Context) -> str:
             # Create performance monitor from configuration
             performance_monitor = create_performance_monitor_from_config(config_data)
             
-            print(f"Performance monitor initialized")
+            logger.info(f"Performance monitor initialized")
         except Exception as e:
-            print(f"Warning: Could not initialize performance monitor: {e}")
+            logger.warning(f"Could not initialize performance monitor: {e}")
             # Fallback to default performance monitor
             performance_monitor = PerformanceMonitor()
 
         # Print the settings path for debugging
         settings_path = ctx.request_context.lifespan_context.settings.settings_path
-        print(f"Project settings path: {settings_path}")
+        logger.info(f"Project settings path: {settings_path}")
 
         # Try to load existing index and cache
-        print(f"Project path set to: {abs_path}")
-        print(f"Attempting to load existing index and cache...")
+        logger.info(f"Attempting to load existing index and cache...")
 
         # Try to load index
         loaded_index = ctx.request_context.lifespan_context.settings.load_index()
         if loaded_index:
-            print(f"Existing index found and loaded successfully")
+            logger.info(f"Existing index found and loaded successfully")
             # Convert TrieFileIndex to dictionary format for compatibility
             if hasattr(loaded_index, 'get_all_files'):
                 # This is a TrieFileIndex - convert to dict format
@@ -377,7 +555,7 @@ def set_project_path(path: str, ctx: Context) -> str:
                         "path": file_path,
                         "ext": file_info.get('extension', '')
                     }
-                print(f"Converted TrieFileIndex to dictionary format")
+                logger.info(f"Converted TrieFileIndex to dictionary format")
             else:
                 file_index = loaded_index
             
@@ -396,7 +574,7 @@ def set_project_path(path: str, ctx: Context) -> str:
             
             return f"Project path set to: {abs_path}. Loaded existing index with {file_count} files.{search_info}"
         else:
-            print(f"No existing index found, creating new index...")
+            logger.info(f"No existing index found, creating new index...")
 
         # If no existing index, create a new one
         file_count = _index_project(abs_path)
@@ -423,6 +601,7 @@ def set_project_path(path: str, ctx: Context) -> str:
 
         return f"Project path set to: {abs_path}. Indexed {file_count} files.{search_info}"
     except Exception as e:
+        logger.error(f"Error setting project path: {e}")
         return f"Error setting project path: {e}"
 
 @mcp.tool()
@@ -433,13 +612,18 @@ async def search_code_advanced(
     context_lines: int = 0,
     file_pattern: Optional[str] = None,
     fuzzy: bool = False,
+    fuzziness_level: Optional[str] = None, # New parameter for Elasticsearch fuzziness
+    content_boost: float = 1.0, # New parameter for content field boosting
+    filepath_boost: float = 1.0, # New parameter for file_path field boosting
+    highlight_pre_tag: str = "<em>", # New parameter for highlight pre-tag
+    highlight_post_tag: str = "</em>", # New parameter for highlight post-tag
     page: int = 1,
     page_size: int = 20
 ) -> Dict[str, Any]:
     """
     Search for a code pattern in the project using an advanced, fast tool.
     
-    This tool automatically selects the best available command-line search tool 
+    This tool automatically selects the best available command-line search tool
     (like ugrep, ripgrep, ag, or grep) for maximum performance.
     
     Args:
@@ -447,9 +631,15 @@ async def search_code_advanced(
         case_sensitive: Whether the search should be case-sensitive.
         context_lines: Number of lines to show before and after the match.
         file_pattern: A glob pattern to filter files to search in (e.g., "*.py").
-        fuzzy: If True, treats the pattern as a regular expression. 
+        fuzzy: If True, treats the pattern as a regular expression.
                If False, performs a literal/fixed-string search.
                For 'ugrep', this enables fuzzy matching features.
+        fuzziness_level: Elasticsearch fuzziness level (e.g., "AUTO", "0", "1", "2").
+                         Only applicable when using Elasticsearch backend.
+        content_boost: Boosting factor for content field. Only applicable when using Elasticsearch backend.
+        filepath_boost: Boosting factor for file_path field. Only applicable when using Elasticsearch backend.
+        highlight_pre_tag: HTML tag to prepend to highlighted terms. Only applicable when using Elasticsearch backend.
+        highlight_post_tag: HTML tag to append to highlighted terms. Only applicable when using Elasticsearch backend.
         page: Page number for paginated results.
         page_size: Number of results per page.
                
@@ -461,6 +651,7 @@ async def search_code_advanced(
         return {"error": "Project path not set. Please use set_project_path first."}
 
     settings = ctx.request_context.lifespan_context.settings
+    dal = ctx.request_context.lifespan_context.dal # Get DAL instance from context
     
     # Ensure performance monitor is initialized
     ensure_performance_monitor()
@@ -468,19 +659,14 @@ async def search_code_advanced(
     # Use global lazy_content_manager for now
     global lazy_content_manager
     
-    # Get all available strategies in priority order for fallback
-    all_strategies = settings.available_strategies
-    if not all_strategies:
-        return {"error": "No search strategies available. This is unexpected."}
-    
-    strategy = all_strategies[0]  # Start with the highest priority strategy
-    print(f"Using search strategy: {strategy.name}")
-
     # Create query key for caching
-    query_key = "{}:{}:{}:{}:{}:{}".format(pattern, case_sensitive, context_lines, file_pattern, fuzzy, page)
+    query_key = "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
+        pattern, case_sensitive, context_lines, file_pattern, fuzzy,
+        fuzziness_level, content_boost, filepath_boost, highlight_pre_tag, highlight_post_tag, page
+    )
     cached_result = lazy_content_manager.get_cached_search_result(query_key)
     if cached_result:
-        print(f"Returning cached result for query: {query_key}")
+        logger.info(f"Returning cached result for query: {query_key}")
         # Log cache hit
         if performance_monitor:
             performance_monitor.increment_counter("search_cache_hits_total")
@@ -491,25 +677,240 @@ async def search_code_advanced(
     if performance_monitor:
         performance_monitor.increment_counter("search_cache_misses_total")
 
-    # Try each strategy in order until one succeeds
-    last_error = None
-    
-    for strategy_index, strategy in enumerate(all_strategies):
-        print(f"Trying search strategy {strategy_index + 1}/{len(all_strategies)}: {strategy.name}")
+    # Check if DAL's search backend is ElasticsearchSearch and if a pattern is provided
+    if dal and isinstance(dal.search, SearchInterface):
+        if pattern:
+            logger.info("Using Elasticsearch for content search.")
+            try:
+                if performance_monitor:
+                    with performance_monitor.time_operation("search",
+                                                           pattern=pattern,
+                                                           strategy="Elasticsearch_Content",
+                                                           file_pattern=file_pattern,
+                                                           case_sensitive=case_sensitive,
+                                                           fuzzy=fuzzy,
+                                                           fuzziness_level=fuzziness_level,
+                                                           content_boost=content_boost,
+                                                           filepath_boost=filepath_boost) as operation:
+                        
+                        results_list = dal.search.search_content(
+                            query=pattern,
+                            is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
+                            fuzziness=fuzziness_level,
+                            content_boost=content_boost,
+                            file_path_boost=filepath_boost,
+                            highlight_pre_tags=[highlight_pre_tag],
+                            highlight_post_tags=[highlight_post_tag]
+                        )
+                        
+                        results_dict = {}
+                        logger.debug(f"Processing results_list with {len(results_list)} items")
+                        for i, result_item in enumerate(results_list):
+                            logger.debug(f"Result item {i}: type={type(result_item)}, value={result_item}")
+                            try:
+                                file_path, result_doc = result_item
+                                if file_path not in results_dict:
+                                    results_dict[file_path] = []
+                            except ValueError as e:
+                                logger.error(f"Error unpacking result item {i}: {e}, item: {result_item}")
+                                raise
+                            content_highlights = result_doc.get('highlight', {}).get('content', [])
+                            file_path_highlights = result_doc.get('highlight', {}).get('file_path', [])
+
+                            combined_highlights = content_highlights + file_path_highlights
+                            
+                            if combined_highlights:
+                                for highlight_text in combined_highlights:
+                                    results_dict[file_path].append({
+                                        "line": 0, # Placeholder, ES doesn't provide line numbers directly
+                                        "text": highlight_text,
+                                        "start": 0, # Placeholder
+                                        "end": 0 # Placeholder
+                                    })
+                            else:
+                                results_dict[file_path].append({
+                                    "line": 0,
+                                    "text": result_doc.get('content', 'No content available'),
+                                    "start": 0,
+                                    "end": 0
+                                })
+
+                        total_matches = len(results_list)
+                        operation.metadata.update({
+                            "files_searched": len(results_dict),
+                            "total_matches": total_matches
+                        })
+                        
+                        # Debug: Log the structure of results_dict
+                        logger.debug(f"results_dict structure: {list(results_dict.keys())[:3]}")  # First 3 keys
+                        for file_path, matches in list(results_dict.items())[:1]:  # First file
+                            logger.debug(f"File: {file_path}, matches type: {type(matches)}, first match: {matches[0] if matches else 'None'}")
+                        
+                        paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
+                        lazy_content_manager.cache_search_result(query_key, paginated_results)
+                        logger.info(f"Search successful with Elasticsearch. Cached result for query: {query_key}")
+                        
+                        performance_monitor.log_structured("info", "Search completed successfully",
+                                                          pattern=pattern,
+                                                          strategy="Elasticsearch_Content",
+                                                          files_searched=len(results_dict),
+                                                          total_matches=total_matches,
+                                                          duration_ms=operation.duration_ms)
+                        return paginated_results
+            except Exception as e:
+                error_message = f"Error during Elasticsearch content search: {e}"
+                logger.error(error_message)
+                if performance_monitor:
+                    performance_monitor.log_structured("error", "Elasticsearch content search failed",
+                                                      pattern=pattern,
+                                                      error=str(e))
+                    performance_monitor.increment_counter("search_errors_total")
+                return {"error": error_message}
+        elif file_pattern:
+            logger.info("Using Elasticsearch for file path search.")
+            try:
+                if performance_monitor:
+                    with performance_monitor.time_operation("search",
+                                                           pattern=file_pattern,
+                                                           strategy="Elasticsearch_FilePath",
+                                                           file_pattern=file_pattern,
+                                                           fuzziness_level=fuzziness_level,
+                                                           filepath_boost=filepath_boost) as operation:
+                        
+                        paths = dal.search.search_file_paths(
+                            query=file_pattern,
+                            is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
+                            fuzziness=fuzziness_level,
+                            file_path_boost=filepath_boost,
+                            highlight_pre_tags=[highlight_pre_tag],
+                            highlight_post_tags=[highlight_post_tag]
+                        )
+                        
+                        results_dict = {}
+                        for path in paths:
+                            results_dict[path] = [{
+                                "line": 0, # No specific line for file path match
+                                "text": path,
+                                "start": 0,
+                                "end": 0
+                            }]
+
+                        total_matches = len(paths)
+                        operation.metadata.update({
+                            "files_searched": len(results_dict),
+                            "total_matches": total_matches
+                        })
+                        
+                        paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
+                        lazy_content_manager.cache_search_result(query_key, paginated_results)
+                        logger.info(f"Search successful with Elasticsearch file path search. Cached result for query: {query_key}")
+                        
+                        performance_monitor.log_structured("info", "Search completed successfully",
+                                                          pattern=file_pattern,
+                                                          strategy="Elasticsearch_FilePath",
+                                                          files_searched=len(results_dict),
+                                                          total_matches=total_matches,
+                                                          duration_ms=operation.duration_ms)
+                        return paginated_results
+            except Exception as e:
+                error_message = f"Error during Elasticsearch file path search: {e}"
+                logger.error(error_message)
+                if performance_monitor:
+                    performance_monitor.log_structured("error", "Elasticsearch file path search failed",
+                                                      pattern=file_pattern,
+                                                      error=str(e))
+                    performance_monitor.increment_counter("search_errors_total")
+                return {"error": error_message}
+        else:
+            return {"error": "No search pattern or file pattern provided for Elasticsearch search."}
+    else:
+        logger.info("Elasticsearch search not available or DAL not configured for it. Falling back to command-line tools.")
+        # Get all available strategies in priority order for fallback
+        all_strategies = settings.available_strategies
+        if not all_strategies:
+            return {"error": "No search strategies available. This is unexpected."}
         
-        # Use performance monitoring context manager for timing
-        if performance_monitor:
-            with performance_monitor.time_operation("search", 
-                                                   pattern=pattern, 
-                                                   strategy=strategy.name,
-                                                   file_pattern=file_pattern,
-                                                   case_sensitive=case_sensitive,
-                                                   fuzzy=fuzzy,
-                                                   attempt=strategy_index + 1) as operation:
+        strategy = all_strategies[0]  # Start with the highest priority strategy
+        logger.info(f"Using search strategy: {strategy.name}")
+
+        # Try each strategy in order until one succeeds
+        last_error = None
+        
+        for strategy_index, strategy in enumerate(all_strategies):
+            logger.info(f"Trying search strategy {strategy_index + 1}/{len(all_strategies)}: {strategy.name}")
+            
+            # Use performance monitoring context manager for timing
+            if performance_monitor:
+                with performance_monitor.time_operation("search",
+                                                       pattern=pattern,
+                                                       strategy=strategy.name,
+                                                       file_pattern=file_pattern,
+                                                       case_sensitive=case_sensitive,
+                                                       fuzzy=fuzzy,
+                                                       attempt=strategy_index + 1) as operation:
+                    try:
+                        # Use async search with progress callback
+                        def progress_callback(progress: float):
+                            logger.debug(f"Search progress ({strategy.name}): {progress:.1%}")
+                        
+                        results = await strategy.search_async(
+                            pattern=pattern,
+                            base_path=base_path,
+                            case_sensitive=case_sensitive,
+                            context_lines=context_lines,
+                            file_pattern=file_pattern,
+                            fuzzy=fuzzy,
+                            progress_callback=progress_callback
+                        )
+                        
+                        # Count results for metrics
+                        total_matches = sum(len(matches) for matches in results.values())
+                        operation.metadata.update({
+                            "files_searched": len(results),
+                            "total_matches": total_matches
+                        })
+                        
+                        paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
+                        lazy_content_manager.cache_search_result(query_key, paginated_results)
+                        logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
+                        
+                        # Log successful search
+                        performance_monitor.log_structured("info", "Search completed successfully",
+                                                          pattern=pattern,
+                                                          strategy=strategy.name,
+                                                          files_searched=len(results),
+                                                          total_matches=total_matches,
+                                                          duration_ms=operation.duration_ms,
+                                                          attempt=strategy_index + 1)
+                        return paginated_results
+                    except Exception as e:
+                        last_error = e
+                        # Log search error but continue to next strategy
+                        performance_monitor.log_structured("warning", "Search strategy failed, trying next",
+                                                          pattern=pattern,
+                                                          strategy=strategy.name,
+                                                          error=str(e),
+                                                          attempt=strategy_index + 1)
+                        performance_monitor.increment_counter("search_strategy_failures_total")
+                        
+                        # If this isn't the last strategy, continue to the next one
+                        if strategy_index < len(all_strategies) - 1:
+                            logger.warning(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
+                            continue
+                        else:
+                            # This was the last strategy, return error
+                            performance_monitor.log_structured("error", "All search strategies failed",
+                                                              pattern=pattern,
+                                                              error=str(e),
+                                                              total_attempts=len(all_strategies))
+                            performance_monitor.increment_counter("search_errors_total")
+                            return {"error": f"All search strategies failed. Last error from '{strategy.name}': {e}"}
+            else:
+                # Fallback without monitoring - same logic but without performance tracking
                 try:
                     # Use async search with progress callback
                     def progress_callback(progress: float):
-                        print(f"Search progress ({strategy.name}): {progress:.1%}")
+                        logger.debug(f"Search progress ({strategy.name}): {progress:.1%}")
                     
                     results = await strategy.search_async(
                         pattern=pattern,
@@ -521,81 +922,22 @@ async def search_code_advanced(
                         progress_callback=progress_callback
                     )
                     
-                    # Count results for metrics
-                    total_matches = sum(len(matches) for matches in results.values())
-                    operation.metadata.update({
-                        "files_searched": len(results),
-                        "total_matches": total_matches
-                    })
-                    
                     paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
                     lazy_content_manager.cache_search_result(query_key, paginated_results)
-                    print(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
-                    
-                    # Log successful search
-                    performance_monitor.log_structured("info", "Search completed successfully", 
-                                                      pattern=pattern, 
-                                                      strategy=strategy.name,
-                                                      files_searched=len(results),
-                                                      total_matches=total_matches,
-                                                      duration_ms=operation.duration_ms,
-                                                      attempt=strategy_index + 1)
+                    logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
                     return paginated_results
                 except Exception as e:
                     last_error = e
-                    # Log search error but continue to next strategy
-                    performance_monitor.log_structured("warning", "Search strategy failed, trying next", 
-                                                      pattern=pattern, 
-                                                      strategy=strategy.name,
-                                                      error=str(e),
-                                                      attempt=strategy_index + 1)
-                    performance_monitor.increment_counter("search_strategy_failures_total")
-                    
                     # If this isn't the last strategy, continue to the next one
                     if strategy_index < len(all_strategies) - 1:
-                        print(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
+                        logger.warning(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
                         continue
                     else:
                         # This was the last strategy, return error
-                        performance_monitor.log_structured("error", "All search strategies failed", 
-                                                          pattern=pattern, 
-                                                          error=str(e),
-                                                          total_attempts=len(all_strategies))
-                        performance_monitor.increment_counter("search_errors_total")
                         return {"error": f"All search strategies failed. Last error from '{strategy.name}': {e}"}
-        else:
-            # Fallback without monitoring - same logic but without performance tracking
-            try:
-                # Use async search with progress callback
-                def progress_callback(progress: float):
-                    print(f"Search progress ({strategy.name}): {progress:.1%}")
-                
-                results = await strategy.search_async(
-                    pattern=pattern,
-                    base_path=base_path,
-                    case_sensitive=case_sensitive,
-                    context_lines=context_lines,
-                    file_pattern=file_pattern,
-                    fuzzy=fuzzy,
-                    progress_callback=progress_callback
-                )
-                
-                paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
-                lazy_content_manager.cache_search_result(query_key, paginated_results)
-                print(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
-                return paginated_results
-            except Exception as e:
-                last_error = e
-                # If this isn't the last strategy, continue to the next one
-                if strategy_index < len(all_strategies) - 1:
-                    print(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
-                    continue
-                else:
-                    # This was the last strategy, return error
-                    return {"error": f"All search strategies failed. Last error from '{strategy.name}': {e}"}
-    
-    # This should never be reached, but just in case
-    return {"error": f"Unexpected error: no strategies were attempted. Last error: {last_error}"}
+        
+        # This should never be reached, but just in case
+        return {"error": f"Unexpected error: no strategies were attempted. Last error: {last_error}"}
 @mcp.tool()
 def find_files(pattern: str, ctx: Context) -> List[str]:
     """Find files in the project matching a specific glob pattern."""
@@ -780,9 +1122,9 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
                 try:
                     if file_index:
                         ctx.request_context.lifespan_context.settings.save_index(file_index)
-                        print("Saved partial index state during cancellation")
+                        logger.info("Saved partial index state during cancellation")
                 except Exception as e:
-                    print(f"Error saving partial state: {e}")
+                    logger.error(f"Error saving partial state: {e}")
             
             progress_tracker.add_cleanup_task(cleanup_partial_state)
             
@@ -888,7 +1230,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
         
         # Clear caches if requested
         if clear_cache:
-            print("Clearing all caches and metadata...")
+            logger.info("Clearing all caches and metadata...")
             
             # Clear settings cache
             ctx.request_context.lifespan_context.settings.clear()
@@ -909,7 +1251,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             import gc
             gc.collect()
             
-            print("Cache clearing completed.")
+            logger.info("Cache clearing completed.")
 
         # Create progress tracker for force indexing
         async with ProgressContext(
@@ -933,7 +1275,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             
             # Count files for progress tracking
             total_files = 0
-            print(f"Scanning directory: {base_path}")
+            logger.info(f"Scanning directory: {base_path}")
             
             for root, dirs, files in os.walk(base_path):
                 total_files += len(files)
@@ -951,7 +1293,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
                 message=f"Complete scan finished: {total_files} files found"
             )
             
-            print(f"Force re-indexing {total_files} files...")
+            logger.info(f"Force re-indexing {total_files} files...")
             
             # Stage 3: Full Indexing
             await progress_tracker.update_progress(
@@ -1030,14 +1372,20 @@ async def write_to_file(path: str, content: str, line_count: int, ctx: Context) 
     """
     base_path = ctx.request_context.lifespan_context.base_path
     file_change_tracker = ctx.request_context.lifespan_context.file_change_tracker
+    dal_instance = ctx.request_context.lifespan_context.dal
 
     if not base_path:
         return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
 
     full_path = os.path.join(base_path, path)
     
-    # Capture pre-edit state
-    old_content = file_change_tracker._capture_pre_edit_state(full_path)
+    # Ensure file is added to metadata store before version tracking
+    file_extension = os.path.splitext(path)[1]
+    file_type = "file"
+    dal_instance.metadata.add_file(path, file_type, file_extension)
+    
+    # Capture pre-edit state (use relative path for consistency)
+    old_content = file_change_tracker._capture_pre_edit_state(path)
 
     try:
         # Ensure directory exists
@@ -1046,8 +1394,9 @@ async def write_to_file(path: str, content: str, line_count: int, ctx: Context) 
         with open(full_path, 'w', encoding='utf-8') as f:
             f.write(content)
         
-        # Record post-edit state
-        file_change_tracker._record_post_edit_state(full_path, old_content, content)
+        # Record post-edit state (use relative path for consistency)
+        file_change_tracker._record_post_edit_state(path, old_content, content)
+        file_change_tracker.flush()
 
         return {"success": True, "message": f"File '{path}' written successfully."}
     except Exception as e:
@@ -1131,10 +1480,17 @@ async def apply_diff(args: List[Dict[str, Any]], ctx: Context) -> Dict[str, Any]
             with open(full_path, 'w', encoding='utf-8') as f:
                 f.write(modified_content)
             
-            # Record post-edit state
+            # Record post-edit state for versioning
             file_change_tracker._record_post_edit_state(full_path, old_content, modified_content)
+            file_change_tracker.flush()
 
-            results.append({"path": file_path, "success": True, "message": f"File '{file_path}' modified successfully."})
+            # Enqueue for real-time indexing if RealtimeIndexer is available
+            realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
+            if realtime_indexer:
+                realtime_indexer.enqueue_change(file_path, "update")
+                results.append({"path": file_path, "success": True, "message": f"File '{file_path}' modified successfully and enqueued for update."})
+            else:
+                results.append({"path": file_path, "success": True, "message": f"File '{file_path}' modified successfully (real-time indexing not active)."})
 
         except Exception as e:
             results.append({"path": file_path, "success": False, "error": f"Error applying diff to file '{file_path}': {e}"})
@@ -1179,6 +1535,7 @@ async def insert_content(path: str, line: int, content: str, ctx: Context) -> Di
         
         # Record post-edit state
         file_change_tracker._record_post_edit_state(full_path, old_content, modified_content)
+        file_change_tracker.flush()
 
         return {"success": True, "message": f"Content inserted into '{path}' at line {line}."}
     except Exception as e:
@@ -1194,6 +1551,7 @@ async def search_and_replace(path: str, search: str, replace: str, ctx: Context,
     base_path = ctx.request_context.lifespan_context.base_path
     file_change_tracker = ctx.request_context.lifespan_context.file_change_tracker
     settings = ctx.request_context.lifespan_context.settings
+    dal_instance = ctx.request_context.lifespan_context.dal
     
     if not base_path:
         return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
@@ -1204,11 +1562,16 @@ async def search_and_replace(path: str, search: str, replace: str, ctx: Context,
         return {"success": False, "error": f"File not found: {path}"}
 
     try:
+        # Ensure file is added to metadata store before version tracking
+        file_extension = os.path.splitext(path)[1]
+        file_type = "file"
+        dal_instance.metadata.add_file(path, file_type, file_extension)
+        
         with open(full_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
         
-        # Capture pre-edit state
-        old_content = file_change_tracker._capture_pre_edit_state(full_path)
+        # Capture pre-edit state (use relative path for consistency)
+        old_content = file_change_tracker._capture_pre_edit_state(path)
 
         modified_lines = []
         replacements_made = 0
@@ -1238,8 +1601,9 @@ async def search_and_replace(path: str, search: str, replace: str, ctx: Context,
         with open(full_path, 'w', encoding='utf-8') as f:
             f.write(modified_content)
         
-        # Record post-edit state
-        file_change_tracker._record_post_edit_state(full_path, old_content, modified_content, operation_type="search_replace")
+        # Record post-edit state (use relative path for consistency)
+        file_change_tracker._record_post_edit_state(path, old_content, modified_content, operation_type="search_replace")
+        file_change_tracker.flush()
 
         # Update incremental indexer
         indexer = IncrementalIndexer(settings)
@@ -1276,6 +1640,7 @@ def delete_file(file_path: str, ctx: Context) -> Dict[str, Any]:
 
         # Record post-edit state (new_content is empty for deletion)
         file_change_tracker._record_post_edit_state(full_path, old_content, "", operation_type="delete")
+        file_change_tracker.flush()
 
         # Update the incremental indexer
         indexer = IncrementalIndexer(settings)
@@ -1334,6 +1699,7 @@ def rename_file(old_file_path: str, new_file_path: str, ctx: Context) -> Dict[st
             operation_type="rename",
             new_file_path=new_file_path
         )
+        file_change_tracker.flush()
 
         # Update the incremental indexer
         indexer = IncrementalIndexer(settings)
@@ -1391,6 +1757,7 @@ async def revert_file_to_version(file_path: str, ctx: Context, version_id: Optio
         
         # Record the post-edit state for the revert operation
         file_change_tracker._record_post_edit_state(full_path, current_content, reconstructed_content, operation_type="revert")
+        file_change_tracker.flush()
 
         # Update the incremental indexer
         indexer = IncrementalIndexer(settings)
@@ -1400,6 +1767,28 @@ async def revert_file_to_version(file_path: str, ctx: Context, version_id: Optio
         return {"success": True, "message": f"File '{file_path}' reverted to specified version successfully."}
     except Exception as e:
         return {"success": False, "error": f"Error reverting file '{file_path}': {e}"}
+
+@mcp.tool()
+def get_file_history(file_path: str, ctx: Context) -> Dict[str, Any]:
+    """Retrieves the history of changes for a given file path."""
+    base_path = ctx.request_context.lifespan_context.base_path
+    file_change_tracker = ctx.request_context.lifespan_context.file_change_tracker
+
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    full_path = os.path.join(base_path, file_path)
+
+    if not os.path.exists(full_path):
+        return {"success": False, "error": f"File not found: {file_path}"}
+
+    try:
+        # Use relative path for consistency with storage
+        history = file_change_tracker.get_file_history(file_path)
+        return {"success": True, "file_path": file_path, "history": history}
+    except Exception as e:
+        logger.error(f"Error retrieving file history for '{file_path}': {e}", exc_info=True)
+        return {"success": False, "error": f"Error retrieving file history for '{file_path}': {e}"}
 
 @mcp.tool()
 def get_settings_info(ctx: Context) -> Dict[str, Any]:
@@ -2112,11 +2501,11 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
 
         # Get pattern information for debugging
         pattern_info = ignore_matcher.get_pattern_sources()
-        print(f"Ignore patterns loaded: {pattern_info}")
+        logger.info(f"Ignore patterns loaded: {pattern_info}")
 
         # Get filtering configuration
         filtering_stats = config_manager.get_filtering_stats()
-        print(f"Filtering configuration: {filtering_stats}")
+        logger.info(f"Filtering configuration: {filtering_stats}")
 
         should_log = config_manager.should_log_filtering_decisions()
 
@@ -2141,13 +2530,15 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
             
             # Skip the current directory if it should be ignored by pattern matcher
             if rel_path != '.' and ignore_matcher.should_ignore_directory(rel_path):
+                logger.debug(f"Skipping directory '{rel_path}' due to ignore pattern.")
                 dirs[:] = []  # Don't recurse into subdirectories
+                filtered_dirs += 1
                 continue
             
             # Check if directory should be skipped due to size/count filtering
             if rel_path != '.' and config_manager.should_skip_directory_by_pattern(rel_path):
                 if should_log:
-                    print(f"Skipping directory by pattern: {rel_path}")
+                    logger.debug(f"Skipping directory by pattern: {rel_path}")
                 dirs[:] = []  # Don't recurse into subdirectories
                 filtered_dirs += 1
                 continue
@@ -2159,16 +2550,19 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 
                 # Skip hidden files and files with unsupported extensions
                 _, ext = os.path.splitext(file)
-                if file.startswith('.') or ext not in supported_extensions:
+                if file.startswith('.'):
+                    continue
+                if ext not in supported_extensions:
+                    logger.debug(f"Skipping file with unsupported extension: '{os.path.join(rel_path, file)}' (extension: '{ext}')")
                     continue
                 
-                # Create file path for checking
                 file_path = os.path.join(rel_path, file).replace('\\', '/')
                 if rel_path == '.':
                     file_path = file
                 
                 # Check if file should be ignored by pattern matcher
                 if ignore_matcher.should_ignore(file_path):
+                    logger.debug(f"Skipping file '{file_path}' due to ignore pattern.")
                     continue
                 
                 # Check file size
@@ -2177,12 +2571,12 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                     file_size = os.path.getsize(full_file_path)
                     if config_manager.should_skip_file_by_size(file_path, file_size):
                         if should_log:
-                            print(f"Skipping large file: {file_path} ({file_size} bytes)")
+                            logger.debug(f"Skipping large file: {file_path} ({file_size} bytes)")
                         filtered_files += 1
                         continue
                 except (OSError, IOError) as e:
-                    if should_log:
-                        print(f"Error getting file size for {file_path}: {e}")
+                    logger.exception(f"Error getting file size for {file_path}: {e}")
+                    filtered_files += 1 # Count as filtered due to error
                     continue
                 
                 visible_files.append((file, file_path, ext))
@@ -2194,7 +2588,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
             # Apply directory count filtering
             if config_manager.should_skip_directory_by_count(rel_path, len(visible_files), len(visible_dirs)):
                 if should_log:
-                    print(f"Skipping directory by count: {rel_path} ({len(visible_files)} files, {len(visible_dirs)} subdirs)")
+                    logger.debug(f"Skipping directory by count: {rel_path} ({len(visible_files)} files, {len(visible_dirs)} subdirs)")
                 dirs[:] = []  # Don't recurse into subdirectories
                 filtered_dirs += 1
                 continue
@@ -2220,7 +2614,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
         # Clean up deleted files metadata
         indexer.clean_deleted_files(deleted_files)
 
-        print(f"Incremental indexing: Added: {len(added_files)}, Modified: {len(modified_files)}, Deleted: {len(deleted_files)}")
+        logger.info(f"Incremental indexing: Added: {len(added_files)}, Modified: {len(modified_files)}, Deleted: {len(deleted_files)}")
         
         await progress_tracker.update_progress(
             message=f"Incremental analysis: {len(added_files)} added, {len(modified_files)} modified, {len(deleted_files)} deleted"
@@ -2230,7 +2624,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
         # Only process changed files (added + modified) for efficiency
         changed_files = added_files + modified_files
         if not changed_files and not deleted_files:
-            print("No changes detected, using existing index")
+            logger.info("No changes detected, using existing index")
             # Count existing files in the metadata
             file_count = len(indexer.file_metadata)
             await progress_tracker.update_progress(
@@ -2240,7 +2634,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
 
         # Use parallel processing for chunked indexing of changed files
         if changed_files:
-            print(f"Processing {len(changed_files)} changed files using parallel indexing...")
+            logger.info(f"Processing {len(changed_files)} changed files using parallel indexing...")
             
             await progress_tracker.update_progress(
                 message=f"Processing {len(changed_files)} changed files..."
@@ -2255,6 +2649,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 
                 # Skip if file doesn't exist (might have been deleted)
                 if not os.path.exists(full_file_path):
+                    logger.debug(f"Skipping indexing of non-existent file: {file_path}")
                     continue
                 
                 # Get file info
@@ -2321,22 +2716,43 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                 # Update file metadata
                                 full_file_path = os.path.join(base_path, file_path)
                                 indexer.update_file_metadata(file_path, full_file_path)
-                        else:
-                            print(f"Failed to index task {result.task_id}: {result.errors}")
-                            
-                    await progress_tracker.update_progress(
-                        message=f"Parallel indexing completed: {file_count} files processed"
-                    )
-                    print(f"Parallel indexing completed: {file_count} files processed")
-                except Exception as e:
-                    print(f"Error in parallel processing: {e}")
-                    # Fall back to sequential processing
-                    print("Falling back to sequential processing...")
+   
+                                # Index content into Elasticsearch
+                                if dal_instance and dal_instance.search:
+                                    try:
+                                        lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
+                                        if lazy_content_obj:
+                                            content = lazy_content_obj.content
+                                            logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
+                                            doc_id = file_path # Use file_path as doc_id
+                                            document = {
+                                                "file_id": doc_id,
+                                                "path": file_path,
+                                                "content": content,
+                                                "language": file_info.get("extension", "").lstrip('.'),
+                                                "last_modified": datetime.fromtimestamp(os.path.getmtime(full_file_path)).isoformat(),
+                                                "size": os.path.getsize(full_file_path),
+                                                "checksum": indexer.get_file_hash(full_file_path)
+                                            }
+                                            logger.debug(f"Calling dal_instance.search.index_document for {file_path}")
+                                            response = dal_instance.search.index_document(doc_id, document)
+                                            if response:
+                                                logger.debug(f"Indexed {file_path} into Elasticsearch. Response: {response}")
+                                            else:
+                                                logger.error(f"Failed to index {file_path} into Elasticsearch. Indexing method returned False.")
+                                        else:
+                                            logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path}, skipping Elasticsearch indexing.")
+                                    except Exception as es_e:
+                                        logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
                     
+                    logger.info(f"Parallel indexing completed: {file_count} files processed")
+                except Exception as e:
+                    logger.exception(f"Error in parallel processing: {e}")
+                    # Fall back to sequential processing
                     await progress_tracker.update_progress(
                         message="Parallel processing failed, falling back to sequential..."
                     )
-                    
+            
                     # Sequential fallback (processing only changed files)
                     processed_files = 0
                     for file_path in changed_files:
@@ -2346,6 +2762,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                         
                         # Skip if file doesn't exist
                         if not os.path.exists(full_file_path):
+                            logger.debug(f"Skipping sequential indexing of non-existent file: {file_path}")
                             continue
                         
                         # Navigate to the correct directory in the index
@@ -2374,6 +2791,34 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                         
                         # Update file metadata
                         indexer.update_file_metadata(file_path, full_file_path)
+
+                        # Index content into Elasticsearch (sequential fallback)
+                        if dal_instance and dal_instance.search:
+                            try:
+                                lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
+                                content = lazy_content_obj.content
+                                if content is not None:
+                                    logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
+                                    doc_id = file_path # Use file_path as doc_id
+                                    document = {
+                                        "file_id": doc_id,
+                                        "path": file_path,
+                                        "content": content,
+                                        "language": ext.lstrip('.'),
+                                        "last_modified": datetime.fromtimestamp(os.path.getmtime(full_file_path)).isoformat(),
+                                        "size": os.path.getsize(full_file_path),
+                                        "checksum": indexer.get_file_hash(full_file_path)
+                                    }
+                                    logger.debug(f"Calling dal_instance.search.index_document for {file_path} (sequential)")
+                                    response = dal_instance.search.index_document(doc_id, document)
+                                    if response:
+                                        logger.debug(f"Indexed {file_path} into Elasticsearch (sequential). Response: {response}")
+                                    else:
+                                        logger.error(f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False.")
+                                else:
+                                    logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path} (sequential), skipping Elasticsearch indexing.")
+                            except Exception as es_e:
+                                logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
                         
                         # Update progress periodically
                         if processed_files % 10 == 0:
@@ -2382,18 +2827,18 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                 items_processed=1,
                                 message=f"Sequential processing: {processed_files}/{len(changed_files)} files ({progress_percent:.1f}%)"
                             )
-            else:
-                print("No files to process in parallel, using existing index")
+            else: # This else is for 'if indexing_tasks:'
+                logger.info("No files to process in parallel, using existing index")
                 await progress_tracker.update_progress(
                     message="No files to process"
                 )
-
+        
         # Save updated metadata
         await progress_tracker.update_progress(
             message="Saving metadata..."
         )
         indexer.save_metadata()
-        
+            
         # Complete performance monitoring
         if performance_monitor and indexing_context:
             try:
@@ -2411,7 +2856,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 indexing_context.__exit__(None, None, None)
                 
                 # Log completion
-                performance_monitor.log_structured("info", "Project indexing with progress completed successfully", 
+                performance_monitor.log_structured("info", "Project indexing with progress completed successfully",
                                                   base_path=base_path,
                                                   files_indexed=file_count,
                                                   files_filtered=filtered_files,
@@ -2423,7 +2868,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 
             except Exception as e:
                 # Log indexing error
-                performance_monitor.log_structured("error", "Error during indexing performance monitoring", 
+                performance_monitor.log_structured("error", "Error during indexing performance monitoring",
                                                   error=str(e))
                 # Still exit the context to avoid resource leaks
                 if indexing_context:
@@ -2435,11 +2880,11 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
         await progress_tracker.update_progress(
             message=f"Indexing completed: {file_count} files indexed, {filtered_files} files filtered, {filtered_dirs} directories filtered"
         )
-        print(f"Indexing completed: {file_count} files indexed, {filtered_files} files filtered, {filtered_dirs} directories filtered")
+        logger.info(f"Indexing completed: {file_count} files indexed, {filtered_files} files filtered, {filtered_dirs} directories filtered")
         return file_count
         
     except asyncio.CancelledError:
-        print("Indexing operation was cancelled")
+        logger.warning("Indexing operation was cancelled")
         if performance_monitor and indexing_context:
             try:
                 indexing_context.metadata.update({"cancelled": True})
@@ -2449,7 +2894,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 pass
         raise
     except Exception as e:
-        print(f"Error during indexing: {e}")
+        logger.exception(f"Error during indexing: {e}")
         if performance_monitor and indexing_context:
             try:
                 indexing_context.__exit__(Exception, type(e), None)
@@ -2491,11 +2936,11 @@ def _index_project(base_path: str) -> int:
 
     # Get pattern information for debugging
     pattern_info = ignore_matcher.get_pattern_sources()
-    print(f"Ignore patterns loaded: {pattern_info}")
+    logger.info(f"Ignore patterns loaded: {pattern_info}")
 
     # Get filtering configuration
     filtering_stats = config_manager.get_filtering_stats()
-    print(f"Filtering configuration: {filtering_stats}")
+    logger.info(f"Filtering configuration: {filtering_stats}")
 
     should_log = config_manager.should_log_filtering_decisions()
 
@@ -2508,13 +2953,14 @@ def _index_project(base_path: str) -> int:
         
         # Skip the current directory if it should be ignored by pattern matcher
         if rel_path != '.' and ignore_matcher.should_ignore_directory(rel_path):
-            dirs[:] = []  # Don't recurse into subdirectories
+            logger.debug(f"Skipping directory '{rel_path}' due to ignore pattern.")
+            filtered_dirs += 1
             continue
         
         # Check if directory should be skipped due to size/count filtering
         if rel_path != '.' and config_manager.should_skip_directory_by_pattern(rel_path):
             if should_log:
-                print(f"Skipping directory by pattern: {rel_path}")
+                logger.debug(f"Skipping directory by pattern: {rel_path}")
             dirs[:] = []  # Don't recurse into subdirectories
             filtered_dirs += 1
             continue
@@ -2522,18 +2968,24 @@ def _index_project(base_path: str) -> int:
         # Count files and subdirectories for directory filtering
         visible_files = []
         for file in files:
-            # Skip hidden files and files with unsupported extensions
             _, ext = os.path.splitext(file)
-            if file.startswith('.') or ext not in supported_extensions:
-                continue
-            
-            # Create file path for checking
             file_path = os.path.join(rel_path, file).replace('\\', '/')
             if rel_path == '.':
                 file_path = file
+
+            if file.startswith('.'):
+                logger.debug(f"Skipping hidden file: '{file_path}'")
+                filtered_files += 1
+                continue
+            if ext not in supported_extensions:
+                logger.debug(f"Skipping file with unsupported extension: '{file_path}' (extension: '{ext}')")
+                filtered_files += 1
+                continue
             
             # Check if file should be ignored by pattern matcher
             if ignore_matcher.should_ignore(file_path):
+                logger.debug(f"Skipping file '{file_path}' due to ignore pattern.")
+                filtered_files += 1
                 continue
             
             # Check file size
@@ -2542,13 +2994,11 @@ def _index_project(base_path: str) -> int:
                 file_size = os.path.getsize(full_file_path)
                 if config_manager.should_skip_file_by_size(file_path, file_size):
                     if should_log:
-                        print(f"Skipping large file: {file_path} ({file_size} bytes)")
+                        logger.debug(f"Skipping large file: {file_path} ({file_size} bytes)")
                     filtered_files += 1
                     continue
             except (OSError, IOError) as e:
-                if should_log:
-                    print(f"Error getting file size for {file_path}: {e}")
-                continue
+                logger.exception(f"Error getting file size for {file_path}: {e}")
             
             visible_files.append((file, file_path, ext))
         
@@ -2559,7 +3009,7 @@ def _index_project(base_path: str) -> int:
         # Apply directory count filtering
         if config_manager.should_skip_directory_by_count(rel_path, len(visible_files), len(visible_dirs)):
             if should_log:
-                print(f"Skipping directory by count: {rel_path} ({len(visible_files)} files, {len(visible_dirs)} subdirs)")
+                logger.debug(f"Skipping directory by count: {rel_path} ({len(visible_files)} files, {len(visible_dirs)} subdirs)")
             dirs[:] = []  # Don't recurse into subdirectories
             filtered_dirs += 1
             continue
@@ -2577,19 +3027,19 @@ def _index_project(base_path: str) -> int:
     # Clean up deleted files metadata
     indexer.clean_deleted_files(deleted_files)
 
-    print(f"Incremental indexing: Added: {len(added_files)}, Modified: {len(modified_files)}, Deleted: {len(deleted_files)}")
+    logger.info(f"Incremental indexing: Added: {len(added_files)}, Modified: {len(modified_files)}, Deleted: {len(deleted_files)}")
 
     # Only process changed files (added + modified) for efficiency
     changed_files = added_files + modified_files
     if not changed_files and not deleted_files:
-        print("No changes detected, using existing index")
+        logger.info("No changes detected, using existing index")
         # Count existing files in the metadata
         file_count = len(indexer.file_metadata)
         return file_count
 
     # Use parallel processing for chunked indexing of changed files
     if changed_files:
-        print(f"Processing {len(changed_files)} changed files using parallel indexing...")
+        logger.info(f"Processing {len(changed_files)} changed files using parallel indexing...")
         
         # Create indexing tasks for changed files
         indexing_tasks = []
@@ -2598,6 +3048,7 @@ def _index_project(base_path: str) -> int:
             
             # Skip if file doesn't exist (might have been deleted)
             if not os.path.exists(full_file_path):
+                logger.debug(f"Skipping indexing of non-existent file: {file_path}")
                 continue
             
             # Get file info
@@ -2651,14 +3102,41 @@ def _index_project(base_path: str) -> int:
                             # Update file metadata
                             full_file_path = os.path.join(base_path, file_path)
                             indexer.update_file_metadata(file_path, full_file_path)
+                            # Index content into Elasticsearch
+                            if dal_instance and dal_instance.search:
+                                try:
+                                    lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
+                                    if lazy_content_obj:
+                                        content = lazy_content_obj.content
+                                        logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
+                                        doc_id = file_path # Use file_path as doc_id
+                                        document = {
+                                            "file_id": doc_id,
+                                            "path": file_path,
+                                            "content": content,
+                                            "language": file_info.get("extension", "").lstrip('.'),
+                                            "last_modified": datetime.fromtimestamp(os.path.getmtime(full_file_path)).isoformat(),
+                                            "size": os.path.getsize(full_file_path),
+                                            "checksum": indexer.get_file_hash(full_file_path)
+                                        }
+                                        logger.debug(f"Calling dal_instance.search.index_document for {file_path}")
+                                        response = dal_instance.search.index_document(doc_id, document)
+                                        if response:
+                                            logger.debug(f"Indexed {file_path} into Elasticsearch. Response: {response}")
+                                        else:
+                                            logger.error(f"Failed to index {file_path} into Elasticsearch. Indexing method returned False.")
+                                    else:
+                                        logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path}, skipping Elasticsearch indexing.")
+                                except Exception as es_e:
+                                    logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
                     else:
-                        print(f"Failed to index task {result.task_id}: {result.errors}")
-                        
-                print(f"Parallel indexing completed: {file_count} files processed")
+                        logger.error(f"Failed to index task {result.task_id}: {result.errors}")
+
+                logger.info(f"Parallel indexing completed: {file_count} files processed")
             except Exception as e:
-                print(f"Error in parallel processing: {e}")
+                logger.exception(f"Error in parallel processing: {e}")
                 # Fall back to sequential processing
-                print("Falling back to sequential processing...")
+                logger.info("Falling back to sequential processing...")
                 
                 # Sequential fallback (existing logic)
                 for root, dirs, files in os.walk(base_path):
@@ -2667,48 +3145,53 @@ def _index_project(base_path: str) -> int:
                     
                     # Skip the current directory if it should be ignored by pattern matcher
                     if rel_path != '.' and ignore_matcher.should_ignore_directory(rel_path):
+                        logger.debug(f"Skipping directory '{rel_path}' due to ignore pattern (sequential fallback).")
                         dirs[:] = []  # Don't recurse into subdirectories
                         continue
                     
                     # Check if directory should be skipped due to size/count filtering
                     if rel_path != '.' and config_manager.should_skip_directory_by_pattern(rel_path):
+                        logger.debug(f"Skipping directory by pattern: {rel_path} (sequential fallback)")
                         dirs[:] = []  # Don't recurse into subdirectories
                         continue
+                # Count files and subdirectories for directory filtering
+                visible_files = []
+                for file in files:
+                    _, ext = os.path.splitext(file)
+                    file_path = os.path.join(rel_path, file).replace('\\', '/')
+                    if rel_path == '.':
+                        file_path = file
+  
+                    if file.startswith('.'):
+                        logger.debug(f"Skipping hidden file: '{file_path}' (sequential fallback)")
+                        continue
+                    if ext not in supported_extensions:
+                        logger.debug(f"Skipping file with unsupported extension: '{file_path}' (extension: '{ext}') (sequential fallback)")
+                        continue
                     
-                    # Count files and subdirectories for directory filtering
-                    visible_files = []
-                    for file in files:
-                        # Skip hidden files and files with unsupported extensions
-                        _, ext = os.path.splitext(file)
-                        if file.startswith('.') or ext not in supported_extensions:
-                            continue
-                        
-                        # Create file path for checking
-                        file_path = os.path.join(rel_path, file).replace('\\', '/')
-                        if rel_path == '.':
-                            file_path = file
-                        
-                        # Check if file should be ignored by pattern matcher
-                        if ignore_matcher.should_ignore(file_path):
-                            continue
-                        
-                        # Check file size
-                        full_file_path = os.path.join(root, file)
-                        try:
-                            file_size = os.path.getsize(full_file_path)
-                            if config_manager.should_skip_file_by_size(file_path, file_size):
-                                continue
-                        except (OSError, IOError):
-                            continue
-                        
-                        visible_files.append((file, file_path, ext))
+                    # Check if file should be ignored by pattern matcher
+                    if ignore_matcher.should_ignore(file_path):
+                        logger.debug(f"Skipping file '{file_path}' due to ignore pattern (sequential fallback).")
+                        continue
                     
+                    full_file_path = os.path.join(root, file)
+                    try:
+                        file_size = os.path.getsize(full_file_path)
+                        if config_manager.should_skip_file_by_size(file_path, file_size):
+                            logger.debug(f"Skipping large file: {file_path} ({file_size} bytes) (sequential fallback)")
+                            continue
+                    except (OSError, IOError) as e:
+                        logger.exception(f"Error getting file size for {file_path}: {e} (sequential fallback)")
+                        continue
+                    
+                    visible_files.append((file, file_path, ext))
+                
                     visible_dirs = [d for d in dirs if not ignore_matcher.should_ignore_directory(
                         os.path.join(rel_path, d) if rel_path != '.' else d
                     )]
-                    
                     # Apply directory count filtering
                     if config_manager.should_skip_directory_by_count(rel_path, len(visible_files), len(visible_dirs)):
+                        logger.debug(f"Skipping directory by count: {rel_path} ({len(visible_files)} files, {len(visible_dirs)} subdirs) (sequential fallback)")
                         dirs[:] = []  # Don't recurse into subdirectories
                         continue
                     
@@ -2716,7 +3199,7 @@ def _index_project(base_path: str) -> int:
                     dirs[:] = visible_dirs
                     
                     current_dir = file_index
-
+    
                     # Skip the '.' directory (base_path itself)
                     if rel_path != '.':
                         # Split the path and navigate/create the tree
@@ -2725,7 +3208,7 @@ def _index_project(base_path: str) -> int:
                             if part not in current_dir:
                                 current_dir[part] = {}
                             current_dir = current_dir[part]
-
+    
                     # Add files to current directory and update metadata
                     for file, file_path, ext in visible_files:
                         # Only add to index if it's a changed file or if we're doing a full rebuild
@@ -2736,57 +3219,80 @@ def _index_project(base_path: str) -> int:
                                 "ext": ext
                             }
                             file_count += 1
-
+  
                             # Update file metadata for changed files
                             if file_path in changed_files:
                                 full_file_path = os.path.join(base_path, file_path)
                                 indexer.update_file_metadata(file_path, full_file_path)
-    else:
-        print("No files to process in parallel, using existing index")
-
-    # Save updated metadata
-    indexer.save_metadata()
-
-    # Complete performance monitoring
-    if performance_monitor and indexing_context:
-        try:
-            # Update operation metadata with results
-            indexing_context.metadata.update({
-                "files_indexed": file_count,
-                "files_filtered": filtered_files,
-                "directories_filtered": filtered_dirs,
-                "added_files": len(added_files) if 'added_files' in locals() else 0,
-                "modified_files": len(modified_files) if 'modified_files' in locals() else 0,
-                "deleted_files": len(deleted_files) if 'deleted_files' in locals() else 0
-            })
-            
-            # Exit the timing context
-            indexing_context.__exit__(None, None, None)
-            
-            # Log completion
-            performance_monitor.log_structured("info", "Project indexing completed successfully", 
-                                              base_path=base_path,
-                                              files_indexed=file_count,
-                                              files_filtered=filtered_files,
-                                              directories_filtered=filtered_dirs,
-                                              duration_ms=getattr(indexing_context, 'duration_ms', 0))
-            
-            # Increment success counter
-            performance_monitor.increment_counter("indexing_operations_total")
-            
-        except Exception as e:
-            # Log indexing error
-            performance_monitor.log_structured("error", "Error during indexing performance monitoring", 
-                                              error=str(e))
-            # Still exit the context to avoid resource leaks
-            if indexing_context:
-                try:
-                    indexing_context.__exit__(Exception, type(e), None)
-                except:
-                    pass
-
-    print(f"Indexing completed: {file_count} files indexed, {filtered_files} files filtered, {filtered_dirs} directories filtered")
-    return file_count
+                                # Index content into Elasticsearch (sequential fallback)
+                                if dal_instance and dal_instance.search:
+                                    try:
+                                        lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
+                                        content = lazy_content_obj.content
+                                        if content is not None:
+                                            logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
+                                            doc_id = file_path # Use file_path as doc_id
+                                            document = {
+                                                "file_id": doc_id,
+                                                "language": ext.lstrip('.'),
+                                                "last_modified": datetime.fromtimestamp(os.path.getmtime(full_file_path)).isoformat(),
+                                                "size": os.path.getsize(full_file_path),
+                                                "checksum": indexer.get_file_hash(full_file_path)
+                                            }
+                                            logger.debug(f"Calling dal_instance.search.index_document for {file_path} (sequential)")
+                                            response = dal_instance.search.index_document(doc_id, document)
+                                            if response:
+                                                logger.debug(f"Indexed {file_path} into Elasticsearch (sequential). Response: {response}")
+                                            else:
+                                                logger.error(f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False.")
+                                        else:
+                                            logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path} (sequential), skipping Elasticsearch indexing.")
+                                    except Exception as es_e:
+                                        logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
+                        
+        # Save updated metadata
+        indexer.save_metadata()
+                
+        # Complete performance monitoring
+        if performance_monitor and indexing_context:
+            try:
+                # Update operation metadata with results
+                indexing_context.metadata.update({
+                    "files_indexed": file_count,
+                    "files_filtered": filtered_files,
+                    "directories_filtered": filtered_dirs,
+                    "added_files": len(added_files) if 'added_files' in locals() else 0,
+                    "modified_files": len(modified_files) if 'modified_files' in locals() else 0,
+                    "deleted_files": len(deleted_files) if 'deleted_files' in locals() else 0
+                })
+                
+                # Exit the timing context
+                indexing_context.__exit__(None, None, None)
+                
+                # Log completion
+                performance_monitor.log_structured("info", "Project indexing completed successfully",
+                                                  base_path=base_path,
+                                                  files_indexed=file_count,
+                                                  files_filtered=filtered_files,
+                                                  directories_filtered=filtered_dirs,
+                                                  duration_ms=getattr(indexing_context, 'duration_ms', 0))
+                
+                # Increment success counter
+                performance_monitor.increment_counter("indexing_operations_total")
+                
+            except Exception as e:
+                # Log indexing error
+                performance_monitor.log_structured("error", "Error during indexing performance monitoring",
+                                                  error=str(e))
+                # Still exit the context to avoid resource leaks
+                if indexing_context:
+                    try:
+                        indexing_context.__exit__(Exception, type(e), None)
+                    except:
+                        pass
+        
+        logger.info(f"Indexing completed: {file_count} files indexed, {filtered_files} files filtered, {filtered_dirs} directories filtered")
+        return file_count
 
 def _count_files(directory) -> int:
     """

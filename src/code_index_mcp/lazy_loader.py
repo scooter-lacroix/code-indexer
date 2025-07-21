@@ -8,6 +8,7 @@ until required by analysis/search operations.
 import os
 import hashlib
 import mmap
+import logging
 from typing import Dict, Optional, Any, List, Callable
 from pathlib import Path
 from threading import Lock, Thread, Event
@@ -15,6 +16,8 @@ import time
 import atexit
 from concurrent.futures import ThreadPoolExecutor
 from weakref import WeakValueDictionary
+
+logger = logging.getLogger(__name__)
 
 
 class LazyFileContent:
@@ -431,7 +434,7 @@ class LazyContentManager:
         return future
     
     @staticmethod
-    def paginate_results(results: Dict[str, List[tuple]], page: int = 1, page_size: int = 20) -> Dict[str, Any]:
+    def paginate_results(results: Dict[str, List], page: int = 1, page_size: int = 20) -> Dict[str, Any]:
         """Paginate search results."""
         if page < 1:
             page = 1
@@ -441,7 +444,22 @@ class LazyContentManager:
         # Convert results to a flat list of matches
         all_matches = []
         for file_path, matches in results.items():
-            for line_number, line_content in matches:
+            for match in matches:
+                # Debug: Log the match structure
+                logger.debug(f"Processing match: type={type(match)}, value={match}")
+                
+                # Handle both tuple format (line_number, line_content) and dict format
+                if isinstance(match, tuple) and len(match) == 2:
+                    line_number, line_content = match
+                elif isinstance(match, dict):
+                    line_number = match.get('line', 0)
+                    line_content = match.get('text', '')
+                else:
+                    # Fallback for unexpected formats
+                    logger.warning(f"Unexpected match format: {type(match)} - {match}")
+                    line_number = 0
+                    line_content = str(match)
+                
                 all_matches.append({
                     'file_path': file_path,
                     'line_number': line_number,

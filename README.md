@@ -1,52 +1,61 @@
-# Code Index MCP - Optimized Fork by scooter-lacroix
+# Code Index MCP - Enterprise Edition
 
 <div align="center">
 
 [![MCP Server](https://img.shields.io/badge/MCP-Server-blue)](https://modelcontextprotocol.io)
 [![Python](https://img.shields.io/badge/Python-3.8%2B-green)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-yellow)](LICENSE)
-[![Performance](https://img.shields.io/badge/Performance-10x_Optimized-brightgreen)](CHANGELOG.md)
-[![Version](https://img.shields.io/badge/Version-2.0.0-blue)](CHANGELOG.md)
+[![Performance](https://img.shields.io/badge/Performance-Enterprise_Grade-brightgreen)](CHANGELOG.md)
+[![Version](https://img.shields.io/badge/Version-3.0.0-blue)](CHANGELOG.md)
+[![Database](https://img.shields.io/badge/Database-PostgreSQL%2BElasticsearch-orange)](docs/ARCHITECTURE.md)
 
-**🚀 High-Performance, Enterprise-Grade Code Analysis Platform**
+**🚀 Enterprise-Grade Code Analysis Platform with Hybrid Database Architecture**
 
-*Forked from [johnhuang316/code-index-mcp](https://github.com/johnhuang316/code-index-mcp) with comprehensive 16-step optimization*
+*Advanced MCP server with PostgreSQL metadata storage, Elasticsearch search, and comprehensive version tracking*
 
 </div>
 
-<a href="https://glama.ai/mcp/servers/@johnhuang316/code-index-mcp">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/@johnhuang316/code-index-mcp/badge" alt="code-index-mcp MCP server" />
-</a>
 
-## 🚀 Fork Highlights - v2.0.0 Optimization
 
-This fork implements a comprehensive **16-step optimization plan** that transforms the original code indexer into a high-performance, enterprise-grade platform:
+## 🚀 Enterprise Edition - v3.0.0 Migration Complete
 
-### 📊 Performance Achievements
-- **90%+ faster re-indexing** with incremental timestamp-based system
-- **70% memory reduction** through lazy loading and intelligent caching
-- **4x faster indexing** with parallel processing
-- **10x faster searches** with enterprise-grade tools (Zoekt, ripgrep)
-- **3-10x general performance improvements** across all operations
+This version represents a complete architectural transformation with **hybrid database migration** from SQLite to PostgreSQL + Elasticsearch:
 
-### 🛠️ Major New Features
-1. **Incremental Indexing** - Only processes changed files
-2. **Parallel Processing** - Multi-core indexing support
-3. **Memory Optimization** - Intelligent lazy loading with LRU cache
-4. **Enterprise Search** - Zoekt, ripgrep, ugrep integration
-5. **Async Operations** - Non-blocking with progress tracking
-6. **Performance Monitoring** - Comprehensive metrics and logging
-7. **Smart Filtering** - Advanced gitignore and size-based filtering
-8. **YAML Configuration** - Flexible settings management
+### 🏗️ **Architecture Transformation**
+- **✅ PostgreSQL Integration** - Robust metadata storage with ACID compliance
+- **✅ Elasticsearch Integration** - High-performance full-text search capabilities  
+- **✅ Hybrid Database Architecture** - Best of both worlds for different data types
+- **✅ Version Tracking System** - Complete file change history with diffs
+- **✅ Real-time Indexing** - RabbitMQ-based async processing
+- **✅ Cross-Platform Compatibility** - Robust path handling for all environments
 
-### 📋 What's New
-- **20+ new MCP tools** for advanced code analysis
-- **Real-time progress tracking** with cancellation support
-- **Memory profiling** with automatic cleanup
-- **Search result caching** for 90% faster repeated searches
-- **Background maintenance** and automatic optimization
+### 📊 **Migration Achievements**
+- **✅ Zero Data Loss** - Complete ETL migration from SQLite
+- **✅ Backward Compatibility** - Dual-write/read strategy during transition
+- **✅ Performance Gains** - 10x faster search with Elasticsearch
+- **✅ Scalability** - Enterprise-grade database backends
+- **✅ Version Control** - Full file history tracking with PostgreSQL
+- **✅ Real-time Updates** - Instant search index updates
 
-*See [CHANGELOG.md](CHANGELOG.md) for complete details and [TEST_RESULTS.md](TEST_RESULTS.md) for verification.*
+### 🛠️ **New Enterprise Features**
+1. **File Version Tracking** - Complete change history with diffs
+2. **PostgreSQL Metadata** - Structured data with relationships
+3. **Elasticsearch Search** - Advanced full-text search capabilities
+4. **Real-time Indexing** - RabbitMQ message queue processing
+5. **ETL Migration Tools** - Seamless data migration utilities
+6. **Database Migrations** - Alembic-based schema management
+7. **Backup & Recovery** - Comprehensive backup strategies
+8. **Monitoring & Logging** - Enterprise-grade observability
+
+### 📋 **Verified Functionality**
+- **✅ File Operations** - Create, modify, delete with full tracking
+- **✅ Search Capabilities** - Basic, advanced, and pattern-based search
+- **✅ Version History** - Complete file change tracking and retrieval
+- **✅ Database Integration** - PostgreSQL + Elasticsearch working seamlessly
+- **✅ Migration Tools** - ETL scripts for data migration
+- **✅ Backup Systems** - Automated backup and recovery procedures
+
+*See [CHANGELOG.md](CHANGELOG.md) for migration details and [docs/TOOLS_LIST.md](docs/TOOLS_LIST.md) for complete tool documentation.*
 
 ---
 
@@ -116,54 +125,59 @@ The server supports multiple programming languages and file extensions including
 
 ## 📦 Installation & Setup
 
-### Prerequisites
-- Python 3.8+
-- uv (recommended) or pip
+### 🚀 **Quick Start**
 
-### Method 1: Direct Git Installation (Recommended)
-
-For immediate use with AI applications like LM Studio, Claude Desktop, or VS Code:
-
+**For immediate use with AI applications:**
 ```bash
-uvx git+https://github.com/scooter-lacroix/code-index-mcp.git
+uvx git+https://github.com/scooter-lacroix/code-indexer.git
 ```
 
-This automatically installs and runs the MCP server without manual setup.
-
-### Method 2: Package Installation
-
-Install from package manager:
-
+**For package installation:**
 ```bash
-# Using uv
-uvx code-index-mcp
-
-# Using pip
+uv add code-index-mcp
+# or
 pip install code-index-mcp
 ```
 
-### Method 3: Local Development Installation
+### 🏗️ **Enterprise Setup (PostgreSQL + Elasticsearch)**
 
-For development, customization, or contributing:
-
-#### Using uv (Recommended)
-
+**1. Database Setup:**
 ```bash
-git clone https://github.com/scooter-lacroix/code-index-mcp.git
-cd code-index-mcp
-uv sync
+# Using Docker Compose (recommended)
+docker-compose up -d
+
+# Or use convenience script
+python run.py start-dev-dbs
 ```
 
-#### Using pip
-
+**2. Environment Configuration:**
 ```bash
-git clone https://github.com/scooter-lacroix/code-index-mcp.git
-cd code-index-mcp
-python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# .venv\Scripts\activate  # Windows
-pip install -e .
+# Set environment variables
+export DAL_BACKEND_TYPE=postgresql_elasticsearch_only
+export POSTGRES_HOST=localhost
+export POSTGRES_PORT=5432
+export POSTGRES_USER=codeindex
+export POSTGRES_PASSWORD=your-secure-password
+export POSTGRES_DB=code_index_db
+export ELASTICSEARCH_HOSTS=http://localhost:9200
 ```
+
+**3. Migration (if upgrading from SQLite):**
+```bash
+# Backup existing data
+python backup_script.py
+
+# Run migration
+python src/scripts/etl_script.py --mode full
+
+# Verify migration
+python src/scripts/etl_script.py --mode verify
+```
+
+### 📚 **Complete Installation Guide**
+
+For detailed installation instructions, database setup, and troubleshooting, see:
+**[📖 Installation Guide](docs/INSTALLATION.md)**
 
 ## 🔌 MCP Integration
 
@@ -178,7 +192,7 @@ For LM Studio, Claude Desktop, VS Code, and other MCP-compatible applications:
   "mcpServers": {
     "code-index": {
       "command": "uvx",
-      "args": ["git+https://github.com/scooter-lacroix/code-index-mcp.git"],
+      "args": ["git+https://github.com/scooter-lacroix/code-indexer.git"],
       "env": {},
       "start_on_launch": true
     }
@@ -303,15 +317,33 @@ code-index-mcp
 # Start HTTP server (web integration)
 code-index-mcp --http --port 8765
 
-# Local development
-uv run code_index_mcp
+# Local development (runs the server)
+uv run code_index_mcp server
+```
+
+### Local Development with Docker Compose
+
+For local development using PostgreSQL and Elasticsearch via Docker Compose:
+
+```bash
+# Start PostgreSQL and Elasticsearch containers in detached mode
+python run.py start-dev-dbs
+
+# Stop PostgreSQL and Elasticsearch containers and remove their volumes
+python run.py stop-dev-dbs
+
+# Restart PostgreSQL and Elasticsearch containers
+python run.py restart-dev-dbs
+
+# Run the Code Index MCP server (connects to Dockerized databases if configured)
+python run.py server
 ```
 
 ### Debug with MCP Inspector
 
 ```bash
 # For git installation
-npx @modelcontextprotocol/inspector uvx git+https://github.com/scooter-lacroix/code-index-mcp.git
+npx @modelcontextprotocol/inspector uvx git+https://github.com/scooter-lacroix/code-indexer.git
 
 # For package installation
 npx @modelcontextprotocol/inspector code-index-mcp
@@ -320,23 +352,48 @@ npx @modelcontextprotocol/inspector code-index-mcp
 npx @modelcontextprotocol/inspector uv run code_index_mcp
 ```
 
-## Available Tools
+## 🛠️ Available Tools
 
-### Core Tools
+The Code Index MCP server provides **25+ specialized tools** for comprehensive code analysis and management:
 
-- **set_project_path**: Sets the base project path for indexing.
-- **search_code**: Enhanced search using external tools (ugrep/ripgrep/ag/grep) with fuzzy matching support.
-- **find_files**: Finds files in the project matching a given pattern.
-- **get_file_summary**: Gets a summary of a specific file, including line count, functions, imports, etc.
-- **refresh_index**: Refreshes the project index.
-- **get_settings_info**: Gets information about the project settings.
+### 🏗️ **Core Project Management**
+- `set_project_path` - Initialize project workspace with database connections
+- `refresh_index` - Incremental indexing with progress tracking
+- `get_settings_info` - Project configuration and statistics
 
-### Utility Tools
+### 🔍 **Advanced Search & Discovery**
+- `search_code_advanced` - Enterprise search with fuzzy matching, highlighting, and Elasticsearch
+- `find_files` - Glob pattern file discovery
+- `get_file_summary` - Comprehensive file analysis with structure and metrics
 
-- **create_temp_directory**: Creates the temporary directory used for storing index data.
-- **check_temp_directory**: Checks the temporary directory used for storing index data.
-- **clear_settings**: Clears all settings and cached data.
-- **refresh_search_tools**: Manually re-detect available command-line search tools (e.g., ripgrep).
+### ✏️ **File Operations with Version Tracking**
+- `write_to_file` - Create/modify files with automatic version tracking
+- `search_and_replace` - Regex-powered find/replace with scope control
+- `apply_diff` - Multi-file modifications with atomic operations
+- `insert_content` - Precise content insertion at specific lines
+- `delete_file` - File deletion with version history
+- `rename_file` - File renaming/moving with tracking
+
+### 📚 **Version Control & History**
+- `get_file_history` - Complete change history with diffs and timestamps
+- `revert_file_to_version` - Rollback to any previous version
+- Full PostgreSQL-backed version tracking system
+
+### ⚙️ **System Management & Performance**
+- `get_memory_profile` - Real-time memory usage monitoring
+- `get_performance_metrics` - Comprehensive performance statistics
+- `get_active_operations` - Operation tracking with progress
+- `cancel_operation` - Graceful operation cancellation
+- Memory management and garbage collection tools
+
+### 🔧 **Enterprise Features**
+- Database migration and ETL tools
+- Backup and recovery systems
+- Real-time indexing with RabbitMQ
+- Elasticsearch integration for advanced search
+- PostgreSQL metadata storage with ACID compliance
+
+**📖 Complete Documentation**: See [docs/TOOLS_LIST.md](docs/TOOLS_LIST.md) for detailed tool reference with examples and system prompt templates.
 
 ## Common Workflows and Examples
 

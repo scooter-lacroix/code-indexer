@@ -5,27 +5,29 @@ This module implements storage backends using SQLite for efficient
 key-value storage and full-text search capabilities.
 """
 
+import logging
 import sqlite3
 import json
 import os
 import fnmatch
 from typing import Any, Dict, Optional, List, Tuple, Iterator
 from pathlib import Path
-from .storage_interface import StorageInterface, FileIndexInterface
+from .storage_interface import StorageInterface, FileMetadataInterface, SearchInterface, DALInterface
 
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class SQLiteStorage(StorageInterface):
     """SQLite-based key-value storage with FTS support."""
     
-    def __init__(self, db_path: str, enable_fts: bool = True):
+    def __init__(self, db_path: str):
         """Initialize SQLite storage.
         
         Args:
             db_path: Path to SQLite database file
-            enable_fts: Whether to enable Full-Text Search
         """
         self.db_path = db_path
-        self.enable_fts = enable_fts
+        logger.debug(f"Initializing SQLiteStorage with db_path: {self.db_path}")
         self._ensure_db_directory()
         self._init_db()
     
@@ -48,80 +50,6 @@ class SQLiteStorage(StorageInterface):
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
-            # Create FTS table if enabled
-            if self.enable_fts:
-                conn.execute('''
-                    CREATE VIRTUAL TABLE IF NOT EXISTS kv_fts USING fts5(
-                        key, value_text, content='kv_store', content_rowid='rowid'
-                    )
-                ''')
-                
-                # Create triggers to maintain FTS index
-                conn.execute('''
-                    CREATE TRIGGER IF NOT EXISTS kv_store_ai AFTER INSERT ON kv_store BEGIN
-                        INSERT INTO kv_fts(rowid, key, value_text) 
-                        VALUES (new.rowid, new.key, CASE 
-                            WHEN new.value_type = 'text' THEN new.value
-                            ELSE ''
-                        END);
-                    END
-                ''')
-                
-                conn.execute('''
-                    CREATE TRIGGER IF NOT EXISTS kv_store_ad AFTER DELETE ON kv_store BEGIN
-                        INSERT INTO kv_fts(kv_fts, rowid, key, value_text) 
-                        VALUES ('delete', old.rowid, old.key, CASE 
-                            WHEN old.value_type = 'text' THEN old.value
-                            ELSE ''
-                        END);
-                    END
-                ''')
-                
-                conn.execute('''
-                    CREATE TRIGGER IF NOT EXISTS kv_store_au AFTER UPDATE ON kv_store BEGIN
-                        INSERT INTO kv_fts(kv_fts, rowid, key, value_text) 
-                        VALUES ('delete', old.rowid, old.key, CASE 
-                            WHEN old.value_type = 'text' THEN old.value
-                            ELSE ''
-                        END);
-                        INSERT INTO kv_fts(rowid, key, value_text) 
-                        VALUES (new.rowid, new.key, CASE 
-                            WHEN new.value_type = 'text' THEN new.value
-                            ELSE ''
-                        END);
-                    END
-                ''')
-            
-            # Create file_versions table
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS file_versions (
-                    version_id TEXT PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    content BLOB NOT NULL,
-                    hash TEXT NOT NULL,
-                    timestamp TEXT NOT NULL,
-                    size INTEGER NOT NULL
-                )
-            ''')
-
-            # Create file_diffs table
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS file_diffs (
-                    diff_id TEXT PRIMARY KEY,
-                    file_path TEXT NOT NULL,
-                    previous_version_id TEXT,
-                    current_version_id TEXT NOT NULL,
-                    diff_content BLOB NOT NULL,
-                    diff_type TEXT NOT NULL,
-                    operation_type TEXT NOT NULL,
-                    operation_details TEXT,
-                    timestamp TEXT NOT NULL,
-                    FOREIGN KEY (previous_version_id) REFERENCES file_versions(version_id),
-                    FOREIGN KEY (current_version_id) REFERENCES file_versions(version_id)
-                )
-            ''')
-
             conn.commit()
     
     def put(self, key: str, value: Any) -> bool:
@@ -143,7 +71,7 @@ class SQLiteStorage(StorageInterface):
                 conn.commit()
                 return True
         except Exception as e:
-            print(f"Error storing key {key}: {e}")
+            logger.error(f"Error storing key {key}: {e}")
             return False
     
     def get(self, key: str) -> Optional[Any]:
@@ -166,7 +94,7 @@ class SQLiteStorage(StorageInterface):
                     return json.loads(value_blob.decode('utf-8'))
                     
         except Exception as e:
-            print(f"Error retrieving key {key}: {e}")
+            logger.error(f"Error retrieving key {key}: {e}")
             return None
     
     def delete(self, key: str) -> bool:
@@ -177,7 +105,7 @@ class SQLiteStorage(StorageInterface):
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Error deleting key {key}: {e}")
+            logger.error(f"Error deleting key {key}: {e}")
             return False
     
     def exists(self, key: str) -> bool:
@@ -190,7 +118,7 @@ class SQLiteStorage(StorageInterface):
                 )
                 return cursor.fetchone() is not None
         except Exception as e:
-            print(f"Error checking key existence {key}: {e}")
+            logger.error(f"Error checking key existence {key}: {e}")
             return False
     
     def keys(self, pattern: Optional[str] = None) -> Iterator[str]:
@@ -208,7 +136,7 @@ class SQLiteStorage(StorageInterface):
                     for row in cursor:
                         yield row[0]
         except Exception as e:
-            print(f"Error iterating keys: {e}")
+            logger.error(f"Error iterating keys: {e}")
     
     def items(self, pattern: Optional[str] = None) -> Iterator[Tuple[str, Any]]:
         """Iterate over key-value pairs, optionally filtered by pattern."""
@@ -227,27 +155,25 @@ class SQLiteStorage(StorageInterface):
                     
                     yield key, value
         except Exception as e:
-            print(f"Error iterating items: {e}")
+            logger.error(f"Error iterating items: {e}")
     
     def clear(self) -> bool:
         """Clear all data."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('DELETE FROM kv_store')
-                if self.enable_fts:
-                    conn.execute('DELETE FROM kv_fts')
                 conn.commit()
                 # Ensure tables are properly initialized after clearing
                 self._init_db()
                 return True
         except Exception as e:
-            print(f"Error clearing data: {e}")
+            logger.error(f"Error clearing data: {e}")
             # Try to reinitialize the database in case of schema issues
             try:
                 self._init_db()
                 return True
             except Exception as init_e:
-                print(f"Error reinitializing database after clear: {init_e}")
+                logger.error(f"Error reinitializing database after clear: {init_e}")
                 return False
     
     def size(self) -> int:
@@ -257,7 +183,7 @@ class SQLiteStorage(StorageInterface):
                 cursor = conn.execute('SELECT COUNT(*) FROM kv_store')
                 return cursor.fetchone()[0]
         except Exception as e:
-            print(f"Error getting size: {e}")
+            logger.error(f"Error getting size: {e}")
             return 0
     
     def close(self) -> None:
@@ -265,129 +191,18 @@ class SQLiteStorage(StorageInterface):
         # SQLite connections are managed per-operation, so no persistent connection to close
         pass
 
-    def insert_file_version(self, version_id: str, file_path: str, content: str, hash: str, timestamp: str, size: int) -> bool:
-        """Inserts a new file version into the file_versions table."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT INTO file_versions (version_id, file_path, content, hash, timestamp, size)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                ''', (version_id, file_path, content.encode('utf-8'), hash, timestamp, size))
-                conn.commit()
-                return True
-        except Exception as e:
-            print(f"Error inserting file version {version_id} for {file_path}: {e}")
-            return False
-
-    def insert_file_diff(self, diff_id: str, file_path: str, previous_version_id: Optional[str], current_version_id: str, diff_content: str, diff_type: str, operation_type: str, operation_details: Optional[str], timestamp: str) -> bool:
-        """Inserts a new file diff into the file_diffs table."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    INSERT INTO file_diffs (diff_id, file_path, previous_version_id, current_version_id, diff_content, diff_type, operation_type, operation_details, timestamp)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (diff_id, file_path, previous_version_id, current_version_id, diff_content.encode('utf-8'), diff_type, operation_type, operation_details, timestamp))
-                conn.commit()
-                return True
-        except Exception as e:
-            print(f"Error inserting file diff {diff_id} for {file_path}: {e}")
-            return False
-
-    def get_file_version(self, version_id: str) -> Optional[Dict]:
-        """Retrieves a file version by its ID."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute('SELECT * FROM file_versions WHERE version_id = ?', (version_id,))
-                row = cursor.fetchone()
-                if row:
-                    version_data = dict(row)
-                    version_data['content'] = version_data['content'].decode('utf-8')
-                    return version_data
-                return None
-        except Exception as e:
-            print(f"Error retrieving file version {version_id}: {e}")
-            return None
-
-    def get_file_diffs_for_path(self, file_path: str) -> List[Dict]:
-        """Retrieves all diffs for a given file path."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute('SELECT * FROM file_diffs WHERE file_path = ? ORDER BY timestamp ASC', (file_path,))
-                diffs = []
-                for row in cursor.fetchall():
-                    diff_data = dict(row)
-                    diff_data['diff_content'] = diff_data['diff_content'].decode('utf-8')
-                    diffs.append(diff_data)
-                return diffs
-        except Exception as e:
-            print(f"Error retrieving file diffs for {file_path}: {e}")
-            return []
-
-    def get_file_versions_for_path(self, file_path: str) -> List[Dict]:
-        """Retrieves all versions for a given file path, ordered by timestamp."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.execute('SELECT * FROM file_versions WHERE file_path = ? ORDER BY timestamp ASC', (file_path,))
-                versions = []
-                for row in cursor.fetchall():
-                    version_data = dict(row)
-                    version_data['content'] = version_data['content'].decode('utf-8')
-                    versions.append(version_data)
-                return versions
-        except Exception as e:
-            print(f"Error retrieving file versions for {file_path}: {e}")
-            return []
-    
-    def flush(self) -> bool:
-        """Flush any pending operations."""
-        # SQLite operations are immediately committed, so no buffering to flush
-        return True
-    
-    def search(self, query: str) -> List[Tuple[str, Any]]:
-        """Search using Full-Text Search (if enabled).
-        
-        Args:
-            query: Search query
-            
-        Returns:
-            List of (key, value) tuples matching the query
+    def flush(self) -> None:
         """
-        if not self.enable_fts:
-            raise NotImplementedError("FTS not enabled for this storage instance")
-        
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT kv_store.key, kv_store.value, kv_store.value_type
-                    FROM kv_fts
-                    JOIN kv_store ON kv_fts.rowid = kv_store.rowid
-                    WHERE kv_fts MATCH ?
-                    ORDER BY rank
-                ''', (query,))
-                
-                results = []
-                for row in cursor:
-                    key, value_blob, value_type = row
-                    if value_type == 'text':
-                        value = value_blob.decode('utf-8')
-                    else:
-                        value = json.loads(value_blob.decode('utf-8'))
-                    results.append((key, value))
-                
-                return results
-        except Exception as e:
-            print(f"Error searching: {e}")
-            return []
+        Flushes any pending writes to the storage.
+        For SQLite, this is generally a no-op as transactions are committed per operation.
+        """
+        pass
 
+class SQLiteFileMetadata(FileMetadataInterface):
+    """SQLite-based file metadata storage, including versions and diffs."""
 
-class SQLiteFileIndex(FileIndexInterface):
-    """SQLite-based file index with advanced query capabilities."""
-    
     def __init__(self, db_path: str):
-        """Initialize SQLite file index.
+        """Initialize SQLite file metadata storage.
         
         Args:
             db_path: Path to SQLite database file
@@ -431,38 +246,37 @@ class SQLiteFileIndex(FileIndexInterface):
                 CREATE INDEX IF NOT EXISTS idx_files_type ON files(file_type)
             ''')
             
-            # Create FTS table for file paths
+            # Create file_versions table
             conn.execute('''
-                CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
-                    file_path, content='files', content_rowid='id'
+                CREATE TABLE IF NOT EXISTS file_versions (
+                    version_id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    content BLOB NOT NULL,
+                    hash TEXT NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    size INTEGER NOT NULL
                 )
             ''')
-            
-            # Create triggers to maintain FTS index
+
+            # Create file_diffs table
             conn.execute('''
-                CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                    INSERT INTO files_fts(rowid, file_path) VALUES (new.id, new.file_path);
-                END
+                CREATE TABLE IF NOT EXISTS file_diffs (
+                    diff_id TEXT PRIMARY KEY,
+                    file_path TEXT NOT NULL,
+                    previous_version_id TEXT,
+                    current_version_id TEXT NOT NULL,
+                    diff_content BLOB NOT NULL,
+                    diff_type TEXT NOT NULL,
+                    operation_type TEXT NOT NULL,
+                    operation_details TEXT,
+                    timestamp TEXT NOT NULL,
+                    FOREIGN KEY (previous_version_id) REFERENCES file_versions(version_id),
+                    FOREIGN KEY (current_version_id) REFERENCES file_versions(version_id)
+                )
             ''')
-            
-            conn.execute('''
-                CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, file_path) 
-                    VALUES ('delete', old.id, old.file_path);
-                END
-            ''')
-            
-            conn.execute('''
-                CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                    INSERT INTO files_fts(files_fts, rowid, file_path) 
-                    VALUES ('delete', old.id, old.file_path);
-                    INSERT INTO files_fts(rowid, file_path) VALUES (new.id, new.file_path);
-                END
-            ''')
-            
             conn.commit()
     
-    def add_file(self, file_path: str, file_type: str, extension: str, 
+    def add_file(self, file_path: str, file_type: str, extension: str,
                  metadata: Optional[Dict[str, Any]] = None) -> bool:
         """Add a file to the index."""
         try:
@@ -475,7 +289,7 @@ class SQLiteFileIndex(FileIndexInterface):
                 conn.commit()
                 return True
         except Exception as e:
-            print(f"Error adding file {file_path}: {e}")
+            logger.error(f"Error adding file {file_path}: {e}")
             return False
     
     def remove_file(self, file_path: str) -> bool:
@@ -486,7 +300,7 @@ class SQLiteFileIndex(FileIndexInterface):
                 conn.commit()
                 return cursor.rowcount > 0
         except Exception as e:
-            print(f"Error removing file {file_path}: {e}")
+            logger.error(f"Error removing file {file_path}: {e}")
             return False
     
     def get_file_info(self, file_path: str) -> Optional[Dict[str, Any]]:
@@ -494,7 +308,7 @@ class SQLiteFileIndex(FileIndexInterface):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute('''
-                    SELECT file_type, extension, metadata 
+                    SELECT file_type, extension, metadata
                     FROM files WHERE file_path = ?
                 ''', (file_path,))
                 row = cursor.fetchone()
@@ -512,37 +326,8 @@ class SQLiteFileIndex(FileIndexInterface):
                     **metadata
                 }
         except Exception as e:
-            print(f"Error getting file info for {file_path}: {e}")
+            logger.error(f"Error getting file info for {file_path}: {e}")
             return None
-    
-    def find_files_by_pattern(self, pattern: str) -> List[str]:
-        """Find files matching a pattern using FTS."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT files.file_path 
-                    FROM files_fts
-                    JOIN files ON files_fts.rowid = files.id
-                    WHERE files_fts MATCH ?
-                ''', (pattern,))
-                
-                return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            print(f"Error finding files by pattern {pattern}: {e}")
-            return []
-    
-    def find_files_by_extension(self, extension: str) -> List[str]:
-        """Find files with a specific extension."""
-        try:
-            with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(
-                    'SELECT file_path FROM files WHERE extension = ?',
-                    (extension,)
-                )
-                return [row[0] for row in cursor.fetchall()]
-        except Exception as e:
-            print(f"Error finding files by extension {extension}: {e}")
-            return []
     
     def get_directory_structure(self, directory_path: str = "") -> Dict[str, Any]:
         """Get the directory structure."""
@@ -551,14 +336,14 @@ class SQLiteFileIndex(FileIndexInterface):
                 if directory_path:
                     cursor = conn.execute('''
                         SELECT file_path, file_type, extension, metadata
-                        FROM files 
+                        FROM files
                         WHERE file_path LIKE ?
                         ORDER BY file_path
                     ''', (f"{directory_path}%",))
                 else:
                     cursor = conn.execute('''
                         SELECT file_path, file_type, extension, metadata
-                        FROM files 
+                        FROM files
                         ORDER BY file_path
                     ''')
                 
@@ -591,7 +376,7 @@ class SQLiteFileIndex(FileIndexInterface):
                 
                 return structure
         except Exception as e:
-            print(f"Error getting directory structure: {e}")
+            logger.error(f"Error getting directory structure: {e}")
             return {}
     
     def get_all_files(self) -> List[Tuple[str, Dict[str, Any]]]:
@@ -619,7 +404,108 @@ class SQLiteFileIndex(FileIndexInterface):
                 
                 return files
         except Exception as e:
-            print(f"Error getting all files: {e}")
+            logger.error(f"Error getting all files: {e}")
+            return []
+    
+    def insert_file_version(self, version_id: str, file_path: str, content: str, hash: str, timestamp: str, size: int) -> bool:
+        """Inserts a new file version into the file_versions table."""
+        try:
+            sql = '''
+                INSERT INTO file_versions (version_id, file_path, content, hash, timestamp, size)
+                VALUES (?, ?, ?, ?, ?, ?)
+            '''
+            params = (version_id, file_path, content.encode('utf-8'), hash, timestamp, size)
+            logger.debug(f"Attempting to insert file version. SQL: {sql} Params: {params}")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(sql, params)
+                conn.commit()
+                logger.info(f"Successfully inserted file version: {version_id}")
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting file version {version_id} for {file_path}: {e}")
+            return False
+
+    def insert_file_diff(self, diff_id: str, file_path: str, previous_version_id: Optional[str], current_version_id: str, diff_content: str, diff_type: str, operation_type: str, operation_details: Optional[str], timestamp: str) -> bool:
+        """Inserts a new file diff into the file_diffs table."""
+        try:
+            sql = '''
+                INSERT INTO file_diffs (diff_id, file_path, previous_version_id, current_version_id, diff_content, diff_type, operation_type, operation_details, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            '''
+            params = (diff_id, file_path, previous_version_id, current_version_id, diff_content.encode('utf-8'), diff_type, operation_type, operation_details, timestamp)
+            logger.debug(f"Attempting to insert file diff. SQL: {sql} Params: {params}")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(sql, params)
+                conn.commit()
+                logger.info(f"Successfully inserted file diff: {diff_id}")
+                return True
+        except Exception as e:
+            logger.error(f"Error inserting file diff {diff_id} for {file_path}: {e}")
+            return False
+
+    def get_file_version(self, version_id: str) -> Optional[Dict]:
+        """Retrieves a file version by its ID."""
+        try:
+            sql = 'SELECT * FROM file_versions WHERE version_id = ?'
+            params = (version_id,)
+            logger.debug(f"Attempting to retrieve file version. SQL: {sql} Params: {params}")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(sql, params)
+                row = cursor.fetchone()
+                if row:
+                    version_data = dict(row)
+                    version_data['content'] = version_data['content'].decode('utf-8')
+                    logger.debug(f"Retrieved file version: {version_id}. Data: {version_data}")
+                    return version_data
+                logger.debug(f"File version {version_id} not found.")
+                return None
+        except Exception as e:
+            logger.error(f"Error retrieving file version {version_id}: {e}")
+            return None
+
+    def get_file_diffs_for_path(self, file_path: str) -> List[Dict]:
+        """Retrieves all diffs for a given file path."""
+        try:
+            # Normalize path for consistent querying
+            normalized_file_path = os.path.normpath(file_path).replace('\\', '/')
+            sql = 'SELECT * FROM file_diffs WHERE file_path LIKE ? ORDER BY timestamp ASC'
+            params = (normalized_file_path,)
+            logger.debug(f"Attempting to retrieve file diffs. SQL: {sql} Params: {params}")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(sql, params)
+                diffs = []
+                for row in cursor.fetchall():
+                    diff_data = dict(row)
+                    diff_data['diff_content'] = diff_data['diff_content'].decode('utf-8')
+                    diffs.append(diff_data)
+                logger.debug(f"Retrieved {len(diffs)} diffs for {file_path}. Data: {diffs}")
+                return diffs
+        except Exception as e:
+            logger.error(f"Error retrieving file diffs for {file_path}: {e}")
+            return []
+
+    def get_file_versions_for_path(self, file_path: str) -> List[Dict]:
+        """Retrieves all versions for a given file path, ordered by timestamp."""
+        try:
+            # Normalize path for consistent querying
+            normalized_file_path = os.path.normpath(file_path).replace('\\', '/')
+            sql = 'SELECT * FROM file_versions WHERE file_path LIKE ? ORDER BY timestamp ASC'
+            params = (normalized_file_path,)
+            logger.debug(f"Attempting to retrieve file versions. SQL: {sql} Params: {params}")
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(sql, params)
+                versions = []
+                for row in cursor.fetchall():
+                    version_data = dict(row)
+                    version_data['content'] = version_data['content'].decode('utf-8')
+                    versions.append(version_data)
+                logger.debug(f"Retrieved {len(versions)} versions for {file_path}. Data: {versions}")
+                return versions
+        except Exception as e:
+            logger.error(f"Error retrieving file versions for {file_path}: {e}")
             return []
     
     def clear(self) -> bool:
@@ -627,19 +513,20 @@ class SQLiteFileIndex(FileIndexInterface):
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute('DELETE FROM files')
-                conn.execute('DELETE FROM files_fts')
+                conn.execute('DELETE FROM file_versions')
+                conn.execute('DELETE FROM file_diffs')
                 conn.commit()
                 # Ensure tables are properly initialized after clearing
                 self._init_db()
                 return True
         except Exception as e:
-            print(f"Error clearing file index: {e}")
+            logger.error(f"Error clearing file index: {e}")
             # Try to reinitialize the database in case of schema issues
             try:
                 self._init_db()
                 return True
             except Exception as init_e:
-                print(f"Error reinitializing file index after clear: {init_e}")
+                logger.error(f"Error reinitializing file index after clear: {init_e}")
                 return False
     
     def size(self) -> int:
@@ -649,10 +536,176 @@ class SQLiteFileIndex(FileIndexInterface):
                 cursor = conn.execute('SELECT COUNT(*) FROM files')
                 return cursor.fetchone()[0]
         except Exception as e:
-            print(f"Error getting file index size: {e}")
+            logger.error(f"Error getting file index size: {e}")
             return 0
     
     def close(self) -> None:
         """Close the storage backend."""
         # SQLite connections are managed per-operation, so no persistent connection to close
         pass
+
+
+class SQLiteSearch(SearchInterface):
+    """SQLite-based search capabilities."""
+
+    def __init__(self, db_path: str, enable_fts: bool = True):
+        """Initialize SQLite search.
+        
+        Args:
+            db_path: Path to SQLite database file
+            enable_fts: Whether to enable Full-Text Search (FTS) tables.
+        """
+        self.db_path = db_path
+        self.enable_fts = enable_fts
+        self._ensure_db_directory()
+        self._init_db()
+    
+    def _ensure_db_directory(self):
+        """Ensure the directory for the database exists."""
+        db_dir = os.path.dirname(self.db_path)
+        if db_dir and not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+    
+    def _init_db(self):
+        """Initialize the database schema for search."""
+        with sqlite3.connect(self.db_path) as conn:
+            if self.enable_fts:
+                # Create FTS table for file paths
+                conn.execute('''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+                        file_path, content='files', content_rowid='id'
+                    )
+                ''')
+                
+                # Create FTS table for kv_store values (content search)
+                conn.execute('''
+                    CREATE VIRTUAL TABLE IF NOT EXISTS kv_fts USING fts5(
+                        key, value_text, content='kv_store', content_rowid='rowid'
+                    )
+                ''')
+            
+            conn.commit()
+
+    def search_content(self, query: str) -> List[Tuple[str, Any]]:
+        """Search across file content using FTS."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT kv_store.key, kv_store.value, kv_store.value_type
+                    FROM kv_fts
+                    JOIN kv_store ON kv_fts.rowid = kv_store.rowid
+                    WHERE kv_fts MATCH ?
+                    ORDER BY rank
+                ''', (query,))
+                
+                results = []
+                for row in cursor:
+                    key, value_blob, value_type = row
+                    if value_type == 'text':
+                        value = value_blob.decode('utf-8')
+                    else:
+                        value = json.loads(value_blob.decode('utf-8'))
+                    results.append((key, value))
+                
+                return results
+        except Exception as e:
+            logger.error(f"Error searching content: {e}")
+            return []
+
+    def search_file_paths(self, query: str) -> List[str]:
+        """Search across file paths using FTS."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT files.file_path
+                    FROM files_fts
+                    JOIN files ON files_fts.rowid = files.id
+                    WHERE files_fts MATCH ?
+                ''', (query,))
+                
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error searching file paths: {e}")
+            return []
+
+    def index_document(self, doc_id: str, document: Dict[str, Any]) -> bool:
+        """Index a document for search in SQLite FTS tables.
+        
+        Args:
+            doc_id: Unique identifier for the document
+            document: Document data to index
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # For SQLite, we store the document in the kv_store and update FTS
+                file_path = document.get('path', doc_id)
+                content = document.get('content', '')
+                
+                # Store in kv_store
+                conn.execute('''
+                    INSERT OR REPLACE INTO kv_store (key, value, value_type)
+                    VALUES (?, ?, 'text')
+                ''', (doc_id, content.encode('utf-8')))
+                
+                # Update FTS tables if enabled
+                if self.enable_fts:
+                    # Update content FTS
+                    conn.execute('''
+                        INSERT OR REPLACE INTO kv_fts (key, value_text)
+                        VALUES (?, ?)
+                    ''', (doc_id, content))
+                
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error indexing document {doc_id}: {e}")
+            return False
+
+    def close(self) -> None:
+        """Close the search backend."""
+        pass
+
+
+class SQLiteDAL(DALInterface):
+    """
+    SQLite implementation of the Data Access Layer (DAL) interface.
+    This class aggregates the SQLite-specific storage, metadata, and search
+    implementations.
+    """
+    def __init__(self, db_path: str, enable_fts: bool = True):
+        self._storage = SQLiteStorage(db_path)
+        self._metadata = SQLiteFileMetadata(db_path)
+        self._search = SQLiteSearch(db_path, enable_fts=enable_fts)
+
+    @property
+    def storage(self) -> StorageInterface:
+        return self._storage
+
+    @property
+    def metadata(self) -> FileMetadataInterface:
+        return self._metadata
+
+    @property
+    def search(self) -> SearchInterface:
+        return self._search
+
+    def close(self) -> None:
+        """
+        Closes all underlying SQLite storage backends.
+        """
+        self._storage.close()
+        self._metadata.close()
+        self._search.close()
+
+    def clear_all(self) -> bool:
+        """
+        Clears all data from all underlying SQLite storage backends.
+        """
+        storage_cleared = self._storage.clear()
+        metadata_cleared = self._metadata.clear()
+        # Note: SQLiteSearch does not have a clear method in the current implementation.
+        # If it had data to clear, it would need to be added here.
+        return storage_cleared and metadata_cleared

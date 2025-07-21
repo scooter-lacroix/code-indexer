@@ -3,77 +3,137 @@ import datetime
 import hashlib
 import difflib
 import os
+import logging
 from typing import Optional, List, Dict
 
 from src.code_index_mcp.incremental_indexer import IncrementalIndexer
-from src.code_index_mcp.storage.sqlite_storage import SQLiteStorage
+from src.code_index_mcp.storage.storage_interface import FileMetadataInterface
+
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class FileChangeTracker:
-    def __init__(self, sqlite_storage: SQLiteStorage, incremental_indexer: IncrementalIndexer):
-        self.sqlite_storage = sqlite_storage
+    def __init__(self, storage_backend: FileMetadataInterface, incremental_indexer: IncrementalIndexer):
+        """
+        Initialize FileChangeTracker with any storage backend that supports file versioning.
+        
+        Args:
+            storage_backend: Storage backend that implements FileMetadataInterface
+                           (insert_file_version, get_file_version, etc.)
+            incremental_indexer: IncrementalIndexer instance
+        """
+        self.storage_backend = storage_backend
         self.incremental_indexer = incremental_indexer
 
     def _capture_pre_edit_state(self, file_path: str) -> Optional[str]:
         """
         Reads the content of file_path, stores its current state as a version, and returns the content.
+        
+        Args:
+            file_path: Can be either relative or absolute path
         """
-        if os.path.exists(file_path):
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+        # Convert to absolute path for file system operations
+        if os.path.isabs(file_path):
+            full_path = file_path
+            # Try to convert to relative path for database storage
+            try:
+                # Get the base path from incremental indexer settings
+                base_path = getattr(self.incremental_indexer.settings, 'base_path', '')
+                if base_path and full_path.startswith(base_path):
+                    relative_path = os.path.relpath(full_path, base_path)
+                else:
+                    relative_path = file_path  # Use as-is if can't convert
+            except (ValueError, AttributeError):
+                relative_path = file_path  # Use as-is if conversion fails
+        else:
+            relative_path = file_path
+            # Convert to absolute path for file operations
+            base_path = getattr(self.incremental_indexer.settings, 'base_path', '')
+            if base_path:
+                full_path = os.path.join(base_path, file_path)
+            else:
+                full_path = os.path.abspath(file_path)
+        
+        if os.path.exists(full_path):
+            with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
             version_id = self._generate_version_id()
-            self._store_file_version(file_path, content, version_id)
+            logger.debug(f"Capturing pre-edit state for file_path: {full_path}, version_id: {version_id}")
+            # Store using relative path for database consistency
+            self._store_file_version(relative_path, content, version_id)
             
             # Update the incremental indexer's metadata with the current version ID
-            # We need the full path for update_file_metadata
-            full_path = os.path.abspath(file_path)
-            file_metadata = self.incremental_indexer.file_metadata.get(file_path, {})
+            file_metadata = self.incremental_indexer.file_metadata.get(relative_path, {})
             file_metadata['current_version_id'] = version_id
-            self.incremental_indexer.file_metadata[file_path] = file_metadata
+            self.incremental_indexer.file_metadata[relative_path] = file_metadata
             self.incremental_indexer.save_metadata() # Persist the metadata change
             
             return content
         return None
 
-    def _record_post_edit_state(self, file_path: str, old_content: Optional[str], new_content: str):
+    def _record_post_edit_state(self, file_path: str, old_content: Optional[str], new_content: str, operation_type: Optional[str] = None, new_file_path: Optional[str] = None):
         """
         Calculates the new content's hash, stores it as a new version, generates a diff if content changed,
         and updates the file index.
         """
+        # Convert to absolute path for file system operations
+        if os.path.isabs(file_path):
+            full_path = file_path
+            # Try to convert to relative path for database storage
+            try:
+                # Get the base path from incremental indexer settings
+                base_path = getattr(self.incremental_indexer.settings, 'base_path', '')
+                if base_path and full_path.startswith(base_path):
+                    relative_path = os.path.relpath(full_path, base_path)
+                else:
+                    relative_path = file_path  # Use as-is if can't convert
+            except (ValueError, AttributeError):
+                relative_path = file_path  # Use as-is if conversion fails
+        else:
+            relative_path = file_path
+            # Convert to absolute path for file operations
+            base_path = getattr(self.incremental_indexer.settings, 'base_path', '')
+            if base_path:
+                full_path = os.path.join(base_path, file_path)
+            else:
+                full_path = os.path.abspath(file_path)
+        
         current_version_id = self._generate_version_id()
-        self._store_file_version(file_path, new_content, current_version_id)
+        logger.debug(f"Recording post-edit state for file_path: {file_path}, current_version_id: {current_version_id}, operation_type: {operation_type}, new_file_path: {new_file_path}")
+        # Store using relative path for database consistency
+        self._store_file_version(relative_path, new_content, current_version_id)
 
-        operation_type = "edit"
+        operation_type = "edit" if operation_type is None else operation_type
         previous_version_id = None
 
         # Get previous version ID from incremental indexer's metadata
-        file_metadata = self.incremental_indexer.file_metadata.get(file_path, {})
+        file_metadata = self.incremental_indexer.file_metadata.get(relative_path, {})
         previous_version_id = file_metadata.get('current_version_id')
 
         if old_content is None:
             operation_type = "create"
-        elif not os.path.exists(file_path): # File was deleted
+        elif not os.path.exists(full_path): # File was deleted
             operation_type = "delete"
             new_content = "" # Ensure new_content is empty for diffing a deletion
 
         if old_content is not None and old_content != new_content:
             diff_id = self._generate_version_id()
-            self._store_file_diff(diff_id, file_path, previous_version_id, current_version_id, old_content, new_content, operation_type)
+            self._store_file_diff(diff_id, relative_path, previous_version_id, current_version_id, old_content, new_content, operation_type)
         elif old_content is None and new_content: # File created
             diff_id = self._generate_version_id()
-            self._store_file_diff(diff_id, file_path, None, current_version_id, "", new_content, "create")
+            self._store_file_diff(diff_id, relative_path, None, current_version_id, "", new_content, "create")
         elif old_content and not new_content and operation_type == "delete": # File deleted
             diff_id = self._generate_version_id()
-            self._store_file_diff(diff_id, file_path, previous_version_id, current_version_id, old_content, "", "delete")
+            self._store_file_diff(diff_id, relative_path, previous_version_id, current_version_id, old_content, "", "delete")
 
         # Update the incremental indexer's metadata for file_path to include the current_version_id
-        file_metadata = self.incremental_indexer.file_metadata.get(file_path, {})
+        file_metadata = self.incremental_indexer.file_metadata.get(relative_path, {})
         file_metadata['current_version_id'] = current_version_id
-        self.incremental_indexer.file_metadata[file_path] = file_metadata
+        self.incremental_indexer.file_metadata[relative_path] = file_metadata
         self.incremental_indexer.save_metadata() # Persist the metadata change
 
         # Also update the file's general metadata (mtime, size, hash) in the incremental indexer
-        full_path = os.path.abspath(file_path)
-        self.incremental_indexer.update_file_metadata(file_path, full_path)
+        self.incremental_indexer.update_file_metadata(relative_path, full_path)
 
     def _generate_version_id(self) -> str:
         """Generates a unique ID for versions."""
@@ -88,7 +148,10 @@ class FileChangeTracker:
         file_hash = self._calculate_hash(content)
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
         size = len(content.encode('utf-8'))
-        self.sqlite_storage.insert_file_version(version_id, file_path, content, file_hash, timestamp, size)
+        
+        logger.debug(f"Storing file version: version_id={version_id}, file_path={file_path}, timestamp={timestamp}")
+        # Use the storage backend interface instead of hardcoded sqlite_storage
+        self.storage_backend.insert_file_version(version_id, file_path, content, file_hash, timestamp, size)
 
     def _store_file_diff(self, diff_id: str, file_path: str, previous_version_id: Optional[str], current_version_id: str, old_content: str, new_content: str, operation_type: str, operation_details: Optional[str] = None) -> None:
         """Stores a diff in file_diffs table."""
@@ -100,19 +163,26 @@ class FileChangeTracker:
             lineterm='' # Avoid extra newlines
         ))
         timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        self.sqlite_storage.insert_file_diff(diff_id, file_path, previous_version_id, current_version_id, diff_content, "unified_diff", operation_type, operation_details, timestamp)
+        logger.debug(f"Storing file diff: diff_id={diff_id}, file_path={file_path}, previous_version_id={previous_version_id}, current_version_id={current_version_id}, operation_type={operation_type}, timestamp={timestamp}")
+        # Use the storage backend interface instead of hardcoded sqlite_storage
+        self.storage_backend.insert_file_diff(diff_id, file_path, previous_version_id, current_version_id, diff_content, "unified_diff", operation_type, operation_details, timestamp)
+
+    def flush(self):
+        """Flushes any pending changes to the underlying storage."""
+        if hasattr(self.storage_backend, 'flush'):
+            self.storage_backend.flush()
 
     def get_file_version_by_id(self, version_id: str) -> Optional[str]:
         """Retrieves a file version by its ID."""
-        version_data = self.sqlite_storage.get_file_version(version_id)
+        version_data = self.storage_backend.get_file_version(version_id)
         if version_data:
             return version_data.get('content')
         return None
 
-    def get_file_history(self, file_path: str) -> List[Dict]:
+    def get_file_history(self, full_file_path: str) -> List[Dict]:
         """Retrieves the history of changes for a given file path."""
-        versions = self.sqlite_storage.get_file_versions_for_path(file_path)
-        diffs = self.sqlite_storage.get_file_diffs_for_path(file_path)
+        versions = self.storage_backend.get_file_versions_for_path(full_file_path)
+        diffs = self.storage_backend.get_file_diffs_for_path(full_file_path)
 
         history = []
         for v in versions:
@@ -126,18 +196,18 @@ class FileChangeTracker:
         history.sort(key=lambda x: x['timestamp'])
         return history
 
-    def reconstruct_file_version(self, file_path: str, version_id: str) -> Optional[str]:
+    def reconstruct_file_version(self, full_file_path: str, version_id: str) -> Optional[str]:
         """
         Reconstructs a specific file version by applying diffs if necessary.
         """
         # 1. Try to retrieve the version directly
-        target_version_data = self.sqlite_storage.get_file_version(version_id)
+        target_version_data = self.storage_backend.get_file_version(version_id)
         if target_version_data:
             return target_version_data.get('content')
 
         # 2. If not a full version, we need to reconstruct from history
         # Get all versions and diffs for the file path, sorted by timestamp
-        history = self.get_file_history(file_path)
+        history = self.get_file_history(full_file_path)
 
         # Find the latest full version before or at the target version_id's timestamp
         base_content = None

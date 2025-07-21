@@ -184,10 +184,44 @@ class IncrementalIndexer:
             deleted_files: List of file paths that have been deleted
         """
         for file_path in deleted_files:
-            if file_path in self.file_metadata:
-                del self.file_metadata[file_path]
-                print(f"Removed metadata for deleted file: {file_path}")
+            self.remove_file_metadata(file_path)
     
+    def remove_file_metadata(self, file_path: str):
+        """
+        Remove metadata for a specific file.
+        
+        Args:
+            file_path: Relative path to the file from project root
+        """
+        if file_path in self.file_metadata:
+            del self.file_metadata[file_path]
+            print(f"Removed metadata for file: {file_path}")
+
+    def rename_file_metadata(self, old_file_path: str, new_file_path: str, full_new_path: str):
+        """
+        Rename file metadata when a file is renamed/moved.
+        
+        Args:
+            old_file_path: The old relative path of the file
+            new_file_path: The new relative path of the file
+            full_new_path: The full absolute path of the new file
+        """
+        if old_file_path in self.file_metadata:
+            metadata = self.file_metadata.pop(old_file_path)
+            # Update mtime, size, and hash for the new path
+            try:
+                stat_info = os.stat(full_new_path)
+                metadata['mtime'] = stat_info.st_mtime
+                metadata['size'] = stat_info.st_size
+                metadata['hash'] = self.get_file_hash(full_new_path) # Recalculate hash for new path
+                metadata['last_checked'] = datetime.now().isoformat()
+            except Exception as e:
+                print(f"Warning: Could not update metadata for renamed file {new_file_path}: {e}")
+            self.file_metadata[new_file_path] = metadata
+            print(f"Renamed metadata from {old_file_path} to {new_file_path}")
+        else:
+            print(f"Warning: Old file metadata not found for rename: {old_file_path}")
+        
     def clear_metadata(self):
         """
         Clear all file metadata.

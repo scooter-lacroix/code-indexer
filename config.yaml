@@ -17,6 +17,41 @@ memory_caps:
 
 preferred_search_tool: "ripgrep"
 
+# Data Access Layer (DAL) Configuration
+dal_settings:
+  # Default backend type for local development and testing
+  # Options: "sqlite_only", "dual_write_read", "postgresql_elasticsearch_only"
+  backend_type: "postgresql_elasticsearch_only"
+  
+  # PostgreSQL connection details for the 'postgresql_elasticsearch' backend
+  # These should ideally be sourced from a secure secrets management system.
+  postgresql_user: "${POSTGRES_USER:-user}"
+  postgresql_password: "${POSTGRES_PASSWORD:-password}"
+  postgresql_host: "${POSTGRES_HOST:-localhost}"
+  postgresql_port: "${POSTGRES_PORT:-5432}"
+  postgresql_database: "${POSTGRES_DB:-code_index_db}"
+  # PostgreSQL SSL arguments (optional, for client certificate authentication or enforced SSL)
+  # Example: ssl_args: {"sslmode": "require", "sslrootcert": "/path/to/ca.pem", "sslcert": "/path/to/client.crt", "sslkey": "/path/to/client.key"}
+  postgresql_ssl_args: {} # Placeholder for SSL arguments
+
+  # Elasticsearch connection details for the 'postgresql_elasticsearch' backend
+  # These should ideally be sourced from a secure secrets management system.
+  elasticsearch_hosts: ["http://localhost:9200"]
+  elasticsearch_index_name: "code_index"
+  # Elasticsearch authentication (choose one: api_key or http_auth)
+  # api_key: ["${ELASTICSEARCH_API_KEY_ID}", "${ELASTICSEARCH_API_KEY}"] # (id, api_key) tuple
+  # http_auth: ["${ELASTICSEARCH_USERNAME}", "${ELASTICSEARCH_PASSWORD}"] # (username, password) tuple
+  elasticsearch_api_key_id: "${ELASTICSEARCH_API_KEY_ID:-}"
+  elasticsearch_api_key: "${ELASTICSEARCH_API_KEY:-}"
+  elasticsearch_username: "${ELASTICSEARCH_USERNAME:-}"
+  elasticsearch_password: "${ELASTICSEARCH_PASSWORD:-}"
+  # Elasticsearch SSL/TLS settings
+  elasticsearch_use_ssl: "${ELASTICSEARCH_USE_SSL:-true}"
+  elasticsearch_verify_certs: "${ELASTICSEARCH_VERIFY_CERTS:-true}"
+  elasticsearch_ca_certs: "${ELASTICSEARCH_CA_CERTS:-}" # Path to CA certificate bundle
+  elasticsearch_client_cert: "${ELASTICSEARCH_CLIENT_CERT:-}" # Path to client certificate
+  elasticsearch_client_key: "${ELASTICSEARCH_CLIENT_KEY:-}" # Path to client key
+
 # Existing content
 
 # Code Index MCP Configuration

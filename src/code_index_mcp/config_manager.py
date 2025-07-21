@@ -6,6 +6,7 @@ including file size and directory filtering settings.
 """
 import os
 import yaml
+import re
 from typing import Dict, List, Optional, Any, Set
 from pathlib import Path
 import fnmatch
@@ -54,6 +55,8 @@ class ConfigManager:
         try:
             with open(self.config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
+            # Resolve environment variables throughout the entire config
+            config = self._resolve_env_vars_recursive(config or {})
             return config or self._get_default_config()
         except Exception as e:
             print(f"Error loading config from {self.config_path}: {e}")
@@ -102,6 +105,28 @@ class ConfigManager:
                 "max_workers": 4,
                 "cache_directory_scans": True,
                 "log_filtering_decisions": False
+            },
+            "dal_settings": {
+                "backend_type": "sqlite",
+                "postgresql_connection_string": "postgresql://user:password@localhost:5432/code_index_db",
+                "elasticsearch_hosts": ["http://localhost:9200"],
+                "elasticsearch_index_name": "code_index",
+                "postgresql_user": "user",
+                "postgresql_password": "password",
+                "postgresql_host": "localhost",
+                "postgresql_port": 5432,
+                "postgresql_database": "code_index_db",
+                "postgresql_ssl_args": {},
+                "elasticsearch_api_key_id": "",
+                "elasticsearch_api_key": "",
+                "elasticsearch_username": "",
+                "elasticsearch_password": "",
+                "elasticsearch_use_ssl": True,
+                "elasticsearch_verify_certs": True,
+                "elasticsearch_ca_certs": "",
+                "elasticsearch_client_cert": "",
+                "elasticsearch_client_key": "",
+                "sqlite_enable_fts": True # New setting for SQLite FTS
             }
         }
     
@@ -329,6 +354,52 @@ class ConfigManager:
     def get_preferred_search_tool(self) -> Optional[str]:
         """Get preferred search tool from configuration."""
         return self.get_config('preferred_search_tool')
+
+    def _resolve_env_var(self, value: Any) -> Any:
+        """Resolves environment variable placeholders in a string."""
+        if isinstance(value, str):
+            match = re.match(r'\$\{(\w+):-(.*)\}', value)
+            if match:
+                var_name, default_value = match.groups()
+                return os.getenv(var_name, default_value)
+        return value
+
+    def _resolve_env_vars_recursive(self, config: Any) -> Any:
+        """Recursively resolve environment variables throughout the configuration."""
+        if isinstance(config, dict):
+            return {key: self._resolve_env_vars_recursive(value) for key, value in config.items()}
+        elif isinstance(config, list):
+            return [self._resolve_env_vars_recursive(item) for item in config]
+        elif isinstance(config, str):
+            return self._resolve_env_var(config)
+        else:
+            return config
+
+    def get_dal_settings(self) -> Dict[str, Any]:
+        """Get DAL settings, prioritizing environment variables and resolving placeholders."""
+        dal_settings = self.get_config('dal_settings') or {}
+        
+        # Resolve environment variables for all DAL settings
+        for key, value in dal_settings.items():
+            dal_settings[key] = self._resolve_env_var(value)
+
+        # Explicitly handle type conversions after resolution
+        if 'postgresql_port' in dal_settings and isinstance(dal_settings['postgresql_port'], str):
+            try:
+                dal_settings['postgresql_port'] = int(dal_settings['postgresql_port'])
+            except ValueError:
+                pass # Keep as string if conversion fails, let downstream handle it
+
+        if 'elasticsearch_hosts' in dal_settings and isinstance(dal_settings['elasticsearch_hosts'], str):
+            dal_settings['elasticsearch_hosts'] = [h.strip() for h in dal_settings['elasticsearch_hosts'].split(',')]
+        
+        if 'elasticsearch_use_ssl' in dal_settings and isinstance(dal_settings['elasticsearch_use_ssl'], str):
+            dal_settings['elasticsearch_use_ssl'] = dal_settings['elasticsearch_use_ssl'].lower() == 'true'
+        
+        if 'elasticsearch_verify_certs' in dal_settings and isinstance(dal_settings['elasticsearch_verify_certs'], str):
+            dal_settings['elasticsearch_verify_certs'] = dal_settings['elasticsearch_verify_certs'].lower() == 'true'
+            
+        return dal_settings
     
     def reload_config(self):
         """Reload configuration from file."""

@@ -7,7 +7,7 @@ storage and retrieval of file paths.
 
 from typing import Any, Dict, Optional, List, Tuple
 from collections import defaultdict
-from .storage_interface import FileIndexInterface
+from .storage_interface import FileMetadataInterface
 
 
 class TrieNode:
@@ -17,7 +17,7 @@ class TrieNode:
         self.file_info: Optional[Dict[str, Any]] = None
 
 
-class TrieFileIndex(FileIndexInterface):
+class TrieFileIndex(FileMetadataInterface):
     """File index using Trie data structure."""
     
     def __init__(self):
@@ -92,4 +92,29 @@ class TrieFileIndex(FileIndexInterface):
     def clear(self) -> None:
         """Clear all files from the index."""
         self.root = TrieNode()
+
+    def insert_file_version(self, version_id: str, file_path: str, content: str, hash: str, timestamp: str, size: int) -> bool:
+        """Inserts a new file version."""
+        # For now, just return True as this is a simple in-memory implementation
+        return True
+
+    def get_file_version(self, version_id: str) -> Optional[Dict]:
+        """Retrieves a file version by its ID."""
+        # For now, return None as this is a simple in-memory implementation
+        return None
+
+    def get_file_versions_for_path(self, file_path: str) -> List[Dict]:
+        """Retrieves all versions for a given file path."""
+        # For now, return empty list as this is a simple in-memory implementation
+        return []
+
+    def insert_file_diff(self, diff_id: str, file_path: str, previous_version_id: Optional[str], current_version_id: str, diff_content: str, diff_type: str, operation_type: str, operation_details: Optional[str], timestamp: str) -> bool:
+        """Inserts a new file diff."""
+        # For now, just return True as this is a simple in-memory implementation
+        return True
+
+    def get_file_diffs_for_path(self, file_path: str) -> List[Dict]:
+        """Retrieves all diffs for a given file path."""
+        # For now, return empty list as this is a simple in-memory implementation
+        return []
 

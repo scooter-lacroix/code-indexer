@@ -15,9 +15,10 @@ from typing import Dict, Any, Optional, List, Tuple, Union
 from pathlib import Path
 
 from .constants import (
-    SETTINGS_DIR, CONFIG_FILE, INDEX_FILE, CACHE_FILE, METADATA_FILE
+    SETTINGS_DIR, CONFIG_FILE, INDEX_FILE, CACHE_FILE, METADATA_FILE,
+    PERSISTENT_SETTINGS_DIR
 )
-from .storage import SQLiteStorage, SQLiteFileIndex, TrieFileIndex
+from .storage import SQLiteStorage, SQLiteFileMetadata, TrieFileIndex
 from .search.base import SearchStrategy
 from .search.zoekt import ZoektStrategy
 from .search.ugrep import UgrepStrategy
@@ -82,21 +83,18 @@ class OptimizedProjectSettings:
     def _init_storage_backend(self):
         """Initialize the storage backend."""
         try:
-            # Get system temporary directory
-            system_temp = tempfile.gettempdir()
-            print(f"System temporary directory: {system_temp}")
-
-            # Create code_indexer directory
-            temp_base_dir = os.path.join(system_temp, SETTINGS_DIR)
-            if not os.path.exists(temp_base_dir):
-                os.makedirs(temp_base_dir, exist_ok=True)
-            
-            # Use hash of project path as unique identifier
+            # Use a persistent directory within the project for settings
+            # This ensures settings persist across restarts and are tied to the project
             if self.base_path:
+                # Use a hash of the base_path to create a unique subdirectory
+                # within the persistent settings directory.
                 path_hash = hashlib.md5(self.base_path.encode()).hexdigest()
-                self.settings_path = os.path.join(temp_base_dir, path_hash)
+                self.settings_path = os.path.join(self.base_path, PERSISTENT_SETTINGS_DIR, path_hash)
             else:
-                self.settings_path = os.path.join(temp_base_dir, "default")
+                # Fallback to a default persistent directory if base_path is not set
+                self.settings_path = os.path.join(os.getcwd(), PERSISTENT_SETTINGS_DIR, "default")
+            
+            print(f"OptimizedProjectSettings will store data at: {self.settings_path}")
             
             # Ensure settings directory exists
             os.makedirs(self.settings_path, exist_ok=True)
@@ -105,33 +103,45 @@ class OptimizedProjectSettings:
             if self.storage_backend == 'sqlite':
                 # SQLite storage for cache and config
                 cache_db_path = os.path.join(self.settings_path, "cache.db")
-                self.cache_storage = SQLiteStorage(cache_db_path, enable_fts=True)
+                self.cache_storage = SQLiteStorage(cache_db_path)
                 
                 # File index storage
                 if self.use_trie_index:
                     self.file_index = TrieFileIndex()
                 else:
                     index_db_path = os.path.join(self.settings_path, "index.db")
-                    self.file_index = SQLiteFileIndex(index_db_path)
+                    self.file_index = SQLiteFileMetadata(index_db_path)
                 
                 # Metadata storage
                 metadata_db_path = os.path.join(self.settings_path, "metadata.db")
-                self.metadata_storage = SQLiteStorage(metadata_db_path, enable_fts=False)
+                self.metadata_storage = SQLiteStorage(metadata_db_path)
                 
                 print(f"Initialized SQLite storage backend at: {self.settings_path}")
             else:
                 # Fallback to memory-based storage (for backward compatibility)
+                # For metadata, always use a persistent SQLite DB for file change tracking
+                # even if main storage_backend is not sqlite
+                fallback_metadata_db_path = os.path.join(self.settings_path, "fallback_metadata.db")
+                self.metadata_storage = SQLiteStorage(fallback_metadata_db_path)
+                
                 self.cache_storage = {}
                 self.file_index = {}
-                self.metadata_storage = {}
-                print(f"Using memory-based storage backend")
+                print(f"Using memory-based storage backend with persistent metadata DB at {fallback_metadata_db_path}")
                 
         except Exception as e:
             print(f"Error initializing storage backend: {e}")
-            # Fallback to memory-based storage
+            # Fallback to memory-based storage for cache and index, but try to keep metadata persistent
+            fallback_metadata_db_path = os.path.join(self.settings_path, "fallback_metadata.db")
+            try:
+                self.metadata_storage = SQLiteStorage(fallback_metadata_db_path)
+                print(f"Initialized fallback persistent metadata DB at {fallback_metadata_db_path}")
+            except Exception as metadata_e:
+                print(f"Critical Error: Could not initialize fallback metadata DB: {metadata_e}")
+                self.metadata_storage = {} # Fallback to in-memory if persistent fails
+            
             self.cache_storage = {}
             self.file_index = {}
-            self.metadata_storage = {}
+            print(f"Using memory-based storage backend due to error: {e}")
     
     def get_config_path(self) -> str:
         """Get the path to the configuration file."""
@@ -187,7 +197,7 @@ class OptimizedProjectSettings:
             print(f"Error loading config: {e}")
             return {}
     
-    def save_index(self, file_index: Union[Dict[str, Any], TrieFileIndex, SQLiteFileIndex]):
+    def save_index(self, file_index: Union[Dict[str, Any], TrieFileIndex, SQLiteFileMetadata]):
         """Save file index using the configured storage backend."""
         try:
             if self.storage_backend == 'sqlite':
@@ -198,7 +208,7 @@ class OptimizedProjectSettings:
                     with open(index_path, 'wb') as f:
                         pickle.dump(file_index, f)
                     print(f"Trie index saved to: {index_path}")
-                elif isinstance(self.file_index, SQLiteFileIndex):
+                elif isinstance(self.file_index, SQLiteFileMetadata):
                     # SQLite file index is already persisted
                     print("SQLite file index is automatically persisted")
                 else:
@@ -222,7 +232,7 @@ class OptimizedProjectSettings:
         except Exception as e:
             print(f"Error saving legacy index: {e}")
     
-    def load_index(self) -> Union[Dict[str, Any], TrieFileIndex, SQLiteFileIndex, None]:
+    def load_index(self) -> Union[Dict[str, Any], TrieFileIndex, SQLiteFileMetadata, None]:
         """Load file index using the configured storage backend."""
         if self.skip_load:
             return {} if self.storage_backend != 'sqlite' else None
