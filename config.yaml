@@ -19,9 +19,9 @@ preferred_search_tool: "ripgrep"
 
 # Data Access Layer (DAL) Configuration
 dal_settings:
-  # Default backend type for local development and testing
+  # Default backend type for dual-write/read migration phase
   # Options: "sqlite_only", "dual_write_read", "postgresql_elasticsearch_only"
-  backend_type: "postgresql_elasticsearch_only"
+  backend_type: "dual_write_read"
   
   # PostgreSQL connection details for the 'postgresql_elasticsearch' backend
   # These should ideally be sourced from a secure secrets management system.
