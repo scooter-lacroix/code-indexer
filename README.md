@@ -465,7 +465,7 @@ Search for the string "API_ENDPOINT" only in Python files.
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/username/code-index-mcp.git
+git clone https://github.com/scooter-lacroix/code-indexer.git
 cd code-index-mcp
 ```
 
