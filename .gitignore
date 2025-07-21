@@ -73,3 +73,7 @@ fix_postgresql_schema.py
 
 # Kiro IDE files
 .kiro/
+
+# Documentation files that should not be tracked
+docs/GIT_STRATEGY.md
+MULTI_BRANCH_COMPLETION_SUMMARY.md
