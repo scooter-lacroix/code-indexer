@@ -4,8 +4,8 @@ import json
 import os
 from typing import Dict, Any, List, Optional
 from elasticsearch import Elasticsearch, helpers
-from src.code_index_mcp.content_extractor import ContentExtractor # Import ContentExtractor
-from src.code_index_mcp.logger_config import logger # Import the centralized logger
+from code_index_mcp.content_extractor import ContentExtractor # Import ContentExtractor
+from code_index_mcp.logger_config import logger # Import the centralized logger
 
 # Placeholder for base_path, will be initialized in __init__
 BASE_PATH = ""

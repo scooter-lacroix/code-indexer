@@ -5,9 +5,9 @@ import time
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Literal
 from elasticsearch import Elasticsearch
-from src.code_index_mcp.content_extractor import ContentExtractor
-from src.code_index_mcp.constants import ES_INDEX_NAME
-from src.code_index_mcp.logger_config import logger # Import the centralized logger
+from .content_extractor import ContentExtractor
+from .constants import ES_INDEX_NAME
+from .logger_config import logger # Import the centralized logger
 
 IndexingOperation = Dict[str, Any]
 

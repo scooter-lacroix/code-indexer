@@ -7,12 +7,12 @@ different DAL implementations based on application settings.
 import os
 from typing import Optional, Dict, Any, List, Tuple
 
-from src.code_index_mcp.config_manager import ConfigManager
+from ..config_manager import ConfigManager
 from .storage_interface import DALInterface, StorageInterface, FileMetadataInterface, SearchInterface
 from .sqlite_storage import SQLiteDAL
 from .postgresql_storage import PostgreSQLStorage, PostgreSQLFileMetadata
 from .elasticsearch_storage import ElasticsearchSearch
-from src.code_index_mcp.logger_config import setup_logging
+from ..logger_config import setup_logging
 import logging
 
 logger = setup_logging()
