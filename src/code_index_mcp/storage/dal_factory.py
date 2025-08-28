@@ -222,7 +222,7 @@ def get_dal_instance(config: Optional[Dict[str, Any]] = None) -> DALInterface:
     # Override with environment variables if they exist
     backend_type = os.getenv("DAL_BACKEND_TYPE", dal_settings.get("backend_type", "sqlite_only")).lower()
         # Alias for SQLite: allow the shorter name "sqlite" to be accepted
-f backend_type == "sqlite":
+if backend_type == "sqlite":
             backend_type = "sqlite_only"
 
     if backend_type == "sqlite_only":
