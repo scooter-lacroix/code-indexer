@@ -201,13 +201,12 @@ class DualWriteReadSearch(SearchInterface):
         pg_es_cleared = self._pg_es_search.clear()
         return sqlite_cleared and pg_es_cleared
 
-def get_dal_instance(config: Optional[Dict[str, Any]] = None) -> DALInterface:
+def get_dal_instance() -> DALInterface:
     """
     Factory function to get the appropriate DAL instance based on configuration.
 
     Args:
-        config: A dictionary containing DAL configuration (e.g., 'backend_type', 'db_path', 'pg_conn_str', 'es_hosts').
-                If None, defaults to SQLite with a default path.
+        # No direct config argument, settings are loaded from ConfigManager and environment variables.
 
     Returns:
         An instance of a class implementing DALInterface.
@@ -222,13 +221,9 @@ def get_dal_instance(config: Optional[Dict[str, Any]] = None) -> DALInterface:
     # Override with environment variables if they exist
     backend_type = os.getenv("DAL_BACKEND_TYPE", dal_settings.get("backend_type", "sqlite_only")).lower()
         # Alias for SQLite: allow the shorter name "sqlite" to be accepted
-if backend_type == "sqlite":
-            backend_type = "sqlite_only"
+    if backend_type == "sqlite":
+        backend_type = "sqlite_only"
 
-    if backend_type == "sqlite_only":
-        # Alias for SQLite: allow the shorter name "sqlite" to be accepted
-f backend_type == "sqlite":
-            backend_type = "sqlite_only"
         db_path = dal_settings.get("db_path", os.path.join("data", "code_index.db"))
         enable_fts = dal_settings.get("sqlite_enable_fts", True)
         return SQLiteDAL(db_path, enable_fts=enable_fts)
