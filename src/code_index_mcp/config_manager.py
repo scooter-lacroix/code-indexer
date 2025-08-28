@@ -107,7 +107,7 @@ class ConfigManager:
                 "log_filtering_decisions": False
             },
             "dal_settings": {
-                "backend_type": "sqlite",
+                "backend_type": "sqlite_only",
                 "postgresql_connection_string": "postgresql://user:password@localhost:5432/code_index_db",
                 "elasticsearch_hosts": ["http://localhost:9200"],
                 "elasticsearch_index_name": "code_index",
