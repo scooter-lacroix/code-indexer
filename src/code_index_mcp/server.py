@@ -2565,8 +2565,525 @@ def cleanup_completed_operations(max_age_hours: float = 1.0) -> Dict[str, Any]:
     try:
         max_age_seconds = max_age_hours * 3600
         ops_before = len(progress_manager.get_all_operations_status())
-        
+
         progress_manager.cleanup_completed_operations(max_age_seconds)
+
+        ops_after = len(progress_manager.get_all_operations_status())
+        cleaned_up = ops_before - ops_after
+
+        return {
+            "success": True,
+            "message": f"Cleaned up {cleaned_up} completed operations",
+            "operations_before": ops_before,
+            "operations_after": ops_after,
+            "operations_cleaned": cleaned_up,
+            "max_age_hours": max_age_hours
+        }
+    except Exception as e:
+        return {
+            "error": f"Error cleaning up operations: {e}",
+            "success": False
+        }
+@mcp.tool()
+def analyze_file_with_smart_reader(file_path: str, ctx: Context,
+                                   include_content: bool = True,
+                                   include_metadata: bool = True,
+                                   include_errors: bool = True,
+                                   include_chunks: bool = False,
+                                   chunk_size: int = 4*1024*1024) -> Dict[str, Any]:
+    """
+    Analyze a file using the SmartFileReader with comprehensive capabilities.
+
+    This tool provides direct access to the SmartFileReader's advanced features:
+    - Intelligent reading strategy selection based on file characteristics
+    - Error detection and reporting
+    - Memory-efficient chunked reading for large files
+    - Comprehensive file metadata extraction
+    - File health analysis and corruption detection
+
+    Args:
+        file_path: Path to the file to analyze (relative to project root)
+        include_content: Whether to include file content in the response
+        include_metadata: Whether to include file metadata
+        include_errors: Whether to include error detection results
+        include_chunks: Whether to read file in chunks (for very large files)
+        chunk_size: Size of chunks when reading in chunks (default: 4MB)
+
+    Returns:
+        Comprehensive file analysis including content, metadata, errors, and reading strategy information
+    """
+    base_path = ctx.request_context.lifespan_context.base_path
+
+    # Check if base_path is set
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    # Normalize the file path and ensure it's relative to base_path
+    norm_path = os.path.normpath(file_path)
+    if norm_path.startswith('..'):
+        return {"error": f"Invalid file path: {file_path}"}
+
+    # Ensure the path is relative to base_path
+    if os.path.isabs(norm_path):
+        # If absolute path is provided, make it relative to base_path
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
+
+    # Check if file exists
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {file_path}"}
+
+    try:
+        # Initialize SmartFileReader
+        smart_reader = SmartFileReader(base_path)
+
+        # Build response with requested components
+        result = {
+            "file_path": norm_path,
+            "full_path": full_path,
+            "exists": True,
+            "file_size": os.path.getsize(full_path),
+            "last_modified": os.path.getmtime(full_path),
+        }
+
+        # Get file information (strategy selection, etc.)
+        file_info = smart_reader.get_file_info(full_path)
+        if file_info:
+            result["file_info"] = {
+                "strategy_used": str(file_info.get('strategy_used', 'unknown')),
+                "file_size_category": str(file_info.get('file_size_category', 'unknown')),
+                "is_binary": file_info.get('is_binary', False),
+                "encoding": file_info.get('encoding', 'unknown'),
+                "estimated_read_time_ms": file_info.get('estimated_read_time_ms', 0),
+                "memory_efficiency_score": file_info.get('memory_efficiency_score', 0.0),
+            }
+
+        # Include content if requested
+        if include_content:
+            if include_chunks:
+                # Read in chunks for memory efficiency
+                chunks = []
+                for chunk in smart_reader.read_in_chunks(full_path, chunk_size):
+                    chunks.append(chunk)
+                result["content_chunks"] = chunks
+                result["total_chunks"] = len(chunks)
+            else:
+                # Read entire content
+                content = smart_reader.read_content(full_path)
+                if content is not None:
+                    result["content"] = content
+                    result["content_length"] = len(content)
+                else:
+                    result["content_error"] = "Unable to read file content"
+
+        # Include metadata if requested
+        if include_metadata:
+            metadata = smart_reader.read_metadata(full_path)
+            if metadata:
+                result["metadata"] = metadata
+
+        # Include error detection if requested
+        if include_errors:
+            errors = smart_reader.detect_errors(full_path)
+            if errors:
+                result["errors"] = errors
+
+        # Add file extension for context
+        _, ext = os.path.splitext(norm_path)
+        result["extension"] = ext
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error analyzing file {full_path} with SmartFileReader: {e}", exc_info=True)
+        return {"error": f"Error analyzing file: {e}"}
+
+
+@mcp.tool()
+def read_file_chunks(file_path: str, ctx: Context, chunk_size: int = 4*1024*1024,
+                     max_chunks: Optional[int] = None) -> Dict[str, Any]:
+    """
+    Read a large file in chunks using SmartFileReader for memory efficiency.
+
+    This tool is specifically designed for handling very large files that cannot
+    be loaded entirely into memory. It uses the SmartFileReader's chunked reading
+    capabilities with automatic strategy selection.
+
+    Args:
+        file_path: Path to the file to read (relative to project root)
+        chunk_size: Size of each chunk in bytes (default: 4MB)
+        max_chunks: Maximum number of chunks to return (None for all chunks)
+
+    Returns:
+        File chunks with metadata about the reading process
+    """
+    base_path = ctx.request_context.lifespan_context.base_path
+
+    # Check if base_path is set
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    # Normalize the file path
+    norm_path = os.path.normpath(file_path)
+    if norm_path.startswith('..'):
+        return {"error": f"Invalid file path: {file_path}"}
+
+    if os.path.isabs(norm_path):
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
+
+    # Check if file exists
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {file_path}"}
+
+    try:
+        # Initialize SmartFileReader
+        smart_reader = SmartFileReader(base_path)
+
+        # Get file information first
+        file_info = smart_reader.get_file_info(full_path)
+
+        # Read chunks
+        chunks = []
+        chunk_count = 0
+
+        for chunk in smart_reader.read_in_chunks(full_path, chunk_size):
+            chunks.append(chunk)
+            chunk_count += 1
+
+            # Stop if we've reached the maximum number of chunks
+            if max_chunks and chunk_count >= max_chunks:
+                break
+
+        # Calculate total size from chunks
+        total_size = sum(len(chunk) for chunk in chunks)
+
+        result = {
+            "file_path": norm_path,
+            "full_path": full_path,
+            "file_size": os.path.getsize(full_path),
+            "chunk_size": chunk_size,
+            "chunks_read": chunk_count,
+            "total_size_read": total_size,
+            "is_complete": chunk_count * chunk_size >= os.path.getsize(full_path),
+        }
+
+        # Include file info if available
+        if file_info:
+            result["file_info"] = {
+                "strategy_used": str(file_info.get('strategy_used', 'unknown')),
+                "file_size_category": str(file_info.get('file_size_category', 'unknown')),
+                "is_binary": file_info.get('is_binary', False),
+                "encoding": file_info.get('encoding', 'unknown'),
+            }
+
+        # Include chunks in response
+        result["chunks"] = chunks
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error reading file chunks for {full_path}: {e}", exc_info=True)
+        return {"error": f"Error reading file chunks: {e}"}
+
+
+@mcp.tool()
+def detect_file_errors(file_path: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Detect and analyze errors in a file using SmartFileReader's error detection capabilities.
+
+    This tool provides detailed error analysis including:
+    - Syntax errors in code files
+    - Malformed content detection
+    - Encoding issues
+    - File corruption detection
+    - Line-by-line error reporting
+
+    Args:
+        file_path: Path to the file to analyze (relative to project root)
+
+    Returns:
+        Comprehensive error analysis with detailed error information
+    """
+    base_path = ctx.request_context.lifespan_context.base_path
+
+    # Check if base_path is set
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    # Normalize the file path
+    norm_path = os.path.normpath(file_path)
+    if norm_path.startswith('..'):
+        return {"error": f"Invalid file path: {file_path}"}
+
+    if os.path.isabs(norm_path):
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
+
+    # Check if file exists
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {file_path}"}
+
+    try:
+        # Initialize SmartFileReader
+        smart_reader = SmartFileReader(base_path)
+
+        # Detect errors
+        errors = smart_reader.detect_errors(full_path)
+
+        result = {
+            "file_path": norm_path,
+            "full_path": full_path,
+            "file_exists": True,
+            "file_size": os.path.getsize(full_path),
+        }
+
+        # Add file extension for context
+        _, ext = os.path.splitext(norm_path)
+        result["extension"] = ext
+
+        # Include error analysis
+        if errors:
+            result["error_analysis"] = errors
+            result["has_errors"] = errors.get('has_errors', False)
+            result["error_count"] = len(errors.get('errors', []))
+            result["error_types"] = list(set(error.get('error_type', 'unknown') for error in errors.get('errors', [])))
+
+            # Provide summary
+            if result["has_errors"]:
+                result["summary"] = f"Found {result['error_count']} errors of types: {', '.join(result['error_types'])}"
+            else:
+                result["summary"] = "No errors detected in file"
+        else:
+            result["error_analysis"] = None
+            result["has_errors"] = False
+            result["error_count"] = 0
+            result["error_types"] = []
+            result["summary"] = "No error analysis available"
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error detecting errors in file {full_path}: {e}", exc_info=True)
+        return {"error": f"Error detecting file errors: {e}"}
+
+
+@mcp.tool()
+def get_file_metadata(file_path: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Get comprehensive metadata for a file using SmartFileReader.
+
+    This tool provides detailed file metadata including:
+    - File system metadata (timestamps, permissions, ownership)
+    - File characteristics (size, encoding, type)
+    - Reading strategy information
+    - Memory efficiency metrics
+
+    Args:
+        file_path: Path to the file to analyze (relative to project root)
+
+    Returns:
+        Comprehensive file metadata
+    """
+    base_path = ctx.request_context.lifespan_context.base_path
+
+    # Check if base_path is set
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    # Normalize the file path
+    norm_path = os.path.normpath(file_path)
+    if norm_path.startswith('..'):
+        return {"error": f"Invalid file path: {file_path}"}
+
+    if os.path.isabs(norm_path):
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
+
+    # Check if file exists
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {file_path}"}
+
+    try:
+        # Initialize SmartFileReader
+        smart_reader = SmartFileReader(base_path)
+
+        # Get metadata
+        metadata = smart_reader.read_metadata(full_path)
+
+        # Get file information
+        file_info = smart_reader.get_file_info(full_path)
+
+        result = {
+            "file_path": norm_path,
+            "full_path": full_path,
+            "exists": True,
+        }
+
+        # Add file extension
+        _, ext = os.path.splitext(norm_path)
+        result["extension"] = ext
+
+        # Include metadata if available
+        if metadata:
+            result["metadata"] = metadata
+        else:
+            result["metadata"] = None
+
+        # Include file information if available
+        if file_info:
+            result["file_info"] = {
+                "strategy_used": str(file_info.get('strategy_used', 'unknown')),
+                "file_size_category": str(file_info.get('file_size_category', 'unknown')),
+                "is_binary": file_info.get('is_binary', False),
+                "encoding": file_info.get('encoding', 'unknown'),
+                "estimated_read_time_ms": file_info.get('estimated_read_time_ms', 0),
+                "memory_efficiency_score": file_info.get('memory_efficiency_score', 0.0),
+            }
+
+        # Add basic file stats
+        stat_info = os.stat(full_path)
+        result["basic_stats"] = {
+            "size_bytes": stat_info.st_size,
+            "modified_time": stat_info.st_mtime,
+            "created_time": stat_info.st_ctime,
+            "accessed_time": stat_info.st_atime,
+            "is_regular_file": os.path.isfile(full_path),
+            "is_directory": os.path.isdir(full_path),
+            "is_symlink": os.path.islink(full_path),
+        }
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error getting metadata for file {full_path}: {e}", exc_info=True)
+        return {"error": f"Error getting file metadata: {e}"}
+
+
+@mcp.tool()
+def compare_file_reading_strategies(file_path: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Compare different file reading strategies for a given file.
+
+    This tool demonstrates how SmartFileReader automatically selects the optimal
+    reading strategy based on file characteristics and provides information about
+    why each strategy would be chosen.
+
+    Args:
+        file_path: Path to the file to analyze (relative to project root)
+
+    Returns:
+        Comparison of reading strategies with recommendations
+    """
+    base_path = ctx.request_context.lifespan_context.base_path
+
+    # Check if base_path is set
+    if not base_path:
+        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
+
+    # Normalize the file path
+    norm_path = os.path.normpath(file_path)
+    if norm_path.startswith('..'):
+        return {"error": f"Invalid file path: {file_path}"}
+
+    if os.path.isabs(norm_path):
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
+
+    # Check if file exists
+    if not os.path.exists(full_path):
+        return {"error": f"File not found: {file_path}"}
+
+    try:
+        # Get file size for analysis
+        file_size = os.path.getsize(full_path)
+
+        # Determine file size category
+        if file_size < 10 * 1024 * 1024:  # < 10MB
+            size_category = "small"
+            recommended_strategy = "lazy_loading"
+        elif file_size < 100 * 1024 * 1024:  # < 100MB
+            size_category = "medium"
+            recommended_strategy = "chunked_reading"
+        else:  # >= 100MB
+            size_category = "large"
+            recommended_strategy = "memory_mapped"
+
+        # Strategy descriptions
+        strategies = {
+            "lazy_loading": {
+                "description": "Load content on-demand with caching",
+                "best_for": "Small to medium files (< 10MB)",
+                "memory_usage": "Low - only loads when needed",
+                "speed": "Fast for repeated access",
+                "use_case": "Most common files in codebases"
+            },
+            "chunked_reading": {
+                "description": "Read file in configurable chunks",
+                "best_for": "Medium to large files (10MB - 100MB)",
+                "memory_usage": "Medium - processes in chunks",
+                "speed": "Good for streaming processing",
+                "use_case": "Large log files, data files"
+            },
+            "memory_mapped": {
+                "description": "Map file directly to memory",
+                "best_for": "Very large files (> 100MB)",
+                "memory_usage": "High - maps entire file",
+                "speed": "Very fast for random access",
+                "use_case": "Large binary files, databases"
+            }
+        }
+
+        result = {
+            "file_path": norm_path,
+            "full_path": full_path,
+            "file_size_bytes": file_size,
+            "file_size_mb": file_size / (1024 * 1024),
+            "size_category": size_category,
+            "recommended_strategy": recommended_strategy,
+            "strategies": strategies,
+            "recommendation_reason": f"File size of {file_size:,} bytes ({file_size/(1024*1024):.2f} MB) falls in the {size_category} category"
+        }
+
+        # Add performance estimates
+        if recommended_strategy == "lazy_loading":
+            result["estimated_memory_mb"] = file_size / (1024 * 1024)
+            result["estimated_load_time_ms"] = file_size / (1024 * 1024) * 10  # Rough estimate
+        elif recommended_strategy == "chunked_reading":
+            result["estimated_memory_mb"] = 4  # 4MB chunks
+            result["estimated_load_time_ms"] = file_size / (4 * 1024 * 1024) * 50  # Rough estimate
+        else:  # memory_mapped
+            result["estimated_memory_mb"] = file_size / (1024 * 1024)
+            result["estimated_load_time_ms"] = 100  # Very fast mapping
+
+        return result
+
+    except Exception as e:
+        logger.error(f"Error comparing reading strategies for {full_path}: {e}", exc_info=True)
+        return {"error": f"Error comparing reading strategies: {e}"}
+
+
+# ----- PROGRESS TRACKING TOOLS -----
         
         ops_after = len(progress_manager.get_all_operations_status())
         cleaned_up = ops_before - ops_after
