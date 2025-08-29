@@ -15,6 +15,7 @@ charset-normalizer>=3.4.0
 cryptography>=45.0.0
 pycparser>=2.22
 # Core Python utilities
+psutil>=5.9.0 # Added for memory profiling
 six>=1.17.0
 python-dateutil>=2.9.0
 urllib3>=2.5.0

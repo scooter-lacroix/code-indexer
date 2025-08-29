@@ -1,4 +1,5 @@
-"""
+      "args": [
+        "git+https://github.com/scooter-lacroix/code-indexer.git""""
 Factory for Data Access Layer (DAL) instances.
 This module provides a central point for creating and configuring
 different DAL implementations based on application settings.
@@ -220,10 +221,8 @@ def get_dal_instance() -> DALInterface:
 
     # Override with environment variables if they exist
     backend_type = os.getenv("DAL_BACKEND_TYPE", dal_settings.get("backend_type", "sqlite_only")).lower()
-        # Alias for SQLite: allow the shorter name "sqlite" to be accepted
-    if backend_type == "sqlite":
-        backend_type = "sqlite_only"
-
+    logger.debug(f"Determined DAL backend type: '{backend_type}' (repr: {repr(backend_type)})")
+    if backend_type in ["sqlite_only", "sqlite"]:
         db_path = dal_settings.get("db_path", os.path.join("data", "code_index.db"))
         enable_fts = dal_settings.get("sqlite_enable_fts", True)
         return SQLiteDAL(db_path, enable_fts=enable_fts)

@@ -155,15 +155,25 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     incremental_indexer = IncrementalIndexer(settings)
     file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
 
-    # Initialize Elasticsearch client
-    try:
-        es_client = Elasticsearch(hosts=[{"host": ES_HOST, "port": ES_PORT, "scheme": "http"}])
-        # Test connection
-        if not es_client.ping():
-            logger.warning(f"Could not connect to Elasticsearch at {ES_HOST}:{ES_PORT}. Real-time indexing will be disabled.")
-            es_client = None # Set to None if connection fails
-        else:
-            logger.info(f"Connected to Elasticsearch at {ES_HOST}:{ES_PORT}")
+    # Initialize Elasticsearch client with retry logic
+    max_retries = 10
+    retry_delay_seconds = 5
+    es_connected = False
+    for i in range(max_retries):
+        try:
+            es_client = Elasticsearch(hosts=[{"host": ES_HOST, "port": ES_PORT, "scheme": "http"}])
+            if es_client.ping():
+                logger.info(f"Connected to Elasticsearch at {ES_HOST}:{ES_PORT} after {i+1} attempts.")
+                es_connected = True
+                break
+            else:
+                logger.warning(f"Could not connect to Elasticsearch at {ES_HOST}:{ES_PORT} (attempt {i+1}/{max_retries}). Retrying in {retry_delay_seconds} seconds.")
+        except Exception as e:
+            logger.warning(f"Error connecting to Elasticsearch (attempt {i+1}/{max_retries}): {e}. Retrying in {retry_delay_seconds} seconds.")
+        await asyncio.sleep(retry_delay_seconds) # Use asyncio.sleep for async context
+
+    if es_connected:
+        try:
             # Initialize RabbitMQ producer and consumer only if ES is connected
             rabbitmq_producer = RabbitMQProducer(
                 host=RABBITMQ_HOST,
@@ -183,8 +193,14 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
             realtime_indexer = RealtimeIndexer(es_client, base_path_from_config, rabbitmq_producer, rabbitmq_consumer)
             realtime_indexer.start() # Start the consumer worker thread
             logger.info("RealtimeIndexer (RabbitMQ) started.")
-    except Exception as e:
-        logger.error(f"Error initializing Elasticsearch or RabbitMQ client: {e}. Real-time indexing will be disabled.")
+        except Exception as e:
+            logger.error(f"Error initializing RabbitMQ client: {e}. Real-time indexing will be disabled.")
+            rabbitmq_producer = None
+            rabbitmq_consumer = None
+            realtime_indexer = None
+            # Keep es_client as it was successfully connected
+    else:
+        logger.error(f"Could not connect to Elasticsearch after {max_retries} attempts. Real-time indexing will be disabled.")
         es_client = None
         rabbitmq_producer = None
         rabbitmq_consumer = None
