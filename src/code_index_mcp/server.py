@@ -772,31 +772,35 @@ async def search_code_advanced(
 
     # Normalize the search pattern
     normalized_pattern, is_regex = SearchPatternTranslator.normalize_pattern(pattern, fuzzy)
+    logger.info(f"SEARCH_DEBUG: Pattern normalization - original: '{pattern}', normalized: '{normalized_pattern}', is_regex: {is_regex}, fuzzy: {fuzzy}")
     logger.debug(f"Normalized pattern: '{normalized_pattern}', is_regex: {is_regex}")
 
     # Get search backend with validation
     search_backend = SearchBackendSelector.get_search_backend(dal)
+    logger.info(f"SEARCH_DEBUG: Search backend selection - backend: {search_backend}, dal: {dal}")
 
     if search_backend:
         # Get backend capabilities and health status
         backend_capabilities = SearchBackendSelector.get_backend_capabilities(search_backend)
         backend_health = degradation_manager.get_backend_status(search_backend)
         backend_type = backend_health.get("backend_type", backend_capabilities.get("backend_type", "Unknown"))
+        logger.info(f"SEARCH_DEBUG: Backend analysis - type: {backend_type}, capabilities: {backend_capabilities}, health: {backend_health}")
 
         # Check if backend supports the requested features
         if fuzzy and not backend_capabilities.get("supports_regex", False):
-            logger.warning(f"{backend_type} backend doesn't support regex patterns, will use literal search")
+            logger.warning(f"SEARCH_DEBUG: {backend_type} backend doesn't support regex patterns, will use literal search")
             # Adjust pattern for backend limitations
             normalized_pattern, is_regex = SearchPatternTranslator.normalize_pattern(pattern, False)
+            logger.info(f"SEARCH_DEBUG: Pattern adjusted for backend limitations - new pattern: '{normalized_pattern}', is_regex: {is_regex}")
 
         if not backend_health.get("healthy", False):
-            logger.warning(f"{backend_type} backend is unhealthy: {backend_health.get('reason', 'Unknown reason')}")
+            logger.warning(f"SEARCH_DEBUG: {backend_type} backend is unhealthy: {backend_health.get('reason', 'Unknown reason')}")
             degradation_message = degradation_manager.get_degradation_message(
                 backend_type, backend_health.get('reason', 'Unknown reason')
             )
-            logger.info(f"Graceful degradation: {degradation_message}")
+            logger.info(f"SEARCH_DEBUG: Graceful degradation: {degradation_message}")
         else:
-            logger.info(f"Using healthy {backend_type} backend for search with pattern: '{normalized_pattern}'")
+            logger.info(f"SEARCH_DEBUG: Using healthy {backend_type} backend for search with pattern: '{normalized_pattern}'")
 
         # Implement enhanced retry logic with backend-specific handling
         max_retries = 3
@@ -868,10 +872,12 @@ async def search_code_advanced(
                                     raise
 
                         # Process and standardize results with enhanced error handling
+                        logger.info(f"SEARCH_DEBUG: Raw results from {backend_type}: {len(results_list) if results_list else 0} items")
                         standardized_results = SearchResultProcessor.standardize_results(results_list, backend_type)
+                        logger.info(f"SEARCH_DEBUG: Standardized results from {backend_type}: {len(standardized_results)} items")
 
                         if not standardized_results:
-                            logger.info(f"No results found with {backend_type} backend")
+                            logger.info(f"SEARCH_DEBUG: No results found with {backend_type} backend")
                             # Don't treat empty results as an error, just log and continue
 
                         # Convert to the expected format for pagination
@@ -969,12 +975,13 @@ async def search_code_advanced(
         logger.info("No database search backend available, falling back to command-line tools")
 
     # Fallback to command-line search tools
-    logger.info(f"Using command-line search tools for pattern: '{normalized_pattern}'")
+    logger.info(f"SEARCH_DEBUG: Using command-line search tools for pattern: '{normalized_pattern}'")
 
     # Get all available strategies in priority order for fallback
     all_strategies = settings.available_strategies
+    logger.info(f"SEARCH_DEBUG: Total available strategies: {len(all_strategies) if all_strategies else 0}")
     if not all_strategies:
-        logger.error("No search strategies available - this indicates a configuration issue")
+        logger.error("SEARCH_DEBUG: No search strategies available - this indicates a configuration issue")
         return {"error": "No search strategies available. This is unexpected."}
 
     # Filter out database strategies since we already tried them
@@ -983,13 +990,14 @@ async def search_code_advanced(
         strategy for strategy in all_strategies
         if strategy.name.lower() in ['zoekt', 'ugrep', 'ripgrep', 'ag', 'grep', 'basic']
     ]
+    logger.info(f"SEARCH_DEBUG: Command-line strategies: {[s.name for s in command_line_strategies]}")
 
     if not command_line_strategies:
-        logger.warning("No command-line search strategies available, falling back to basic search")
+        logger.warning("SEARCH_DEBUG: No command-line search strategies available, falling back to basic search")
         command_line_strategies = [strategy for strategy in all_strategies if strategy.name.lower() == 'basic']
 
     if not command_line_strategies:
-        logger.error("No suitable search strategies found")
+        logger.error("SEARCH_DEBUG: No suitable search strategies found")
         return {"error": "No suitable search strategies available."}
 
     # Prioritize zoekt for Python files since it works well with them
@@ -998,14 +1006,14 @@ async def search_code_advanced(
         zoekt_strategy = next((s for s in command_line_strategies if s.name.lower() == 'zoekt'), None)
         if zoekt_strategy:
             strategy = zoekt_strategy
-            logger.info(f"Prioritizing zoekt for Python file search: {file_pattern}")
+            logger.info(f"SEARCH_DEBUG: Prioritizing zoekt for Python file search: {file_pattern}")
         else:
             strategy = command_line_strategies[0]
     else:
         strategy = command_line_strategies[0]  # Start with the highest priority command-line strategy
 
-    logger.info(f"Using search strategy: {strategy.name} (first of {len(command_line_strategies)} available)")
-    logger.debug(f"Available command-line strategies: {[s.name for s in command_line_strategies]}")
+    logger.info(f"SEARCH_DEBUG: Using search strategy: {strategy.name} (first of {len(command_line_strategies)} available)")
+    logger.debug(f"SEARCH_DEBUG: Available command-line strategies: {[s.name for s in command_line_strategies]}")
 
     # Try each command-line strategy in order until one succeeds
     last_error = None
@@ -1039,6 +1047,7 @@ async def search_code_advanced(
 
                     # Count results for metrics
                     total_matches = sum(len(matches) for matches in results.values())
+                    logger.info(f"SEARCH_DEBUG: Command-line search results - strategy: {strategy.name}, files_searched: {len(results)}, total_matches: {total_matches}")
                     operation.metadata.update({
                         "files_searched": len(results),
                         "total_matches": total_matches,
@@ -1047,17 +1056,17 @@ async def search_code_advanced(
 
                     paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
                     lazy_content_manager.cache_search_result(query_key, paginated_results)
-                    logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
+                    logger.info(f"SEARCH_DEBUG: Search successful with {strategy.name}. Cached result for query: {query_key}")
 
                     # Log successful search
                     if performance_monitor:
                         performance_monitor.log_structured("info", "Search completed successfully",
-                                                         pattern=normalized_pattern,
-                                                         strategy=strategy.name,
-                                                         files_searched=len(results),
-                                                         total_matches=total_matches,
-                                                         duration_ms=operation.duration_ms,
-                                                         attempt=strategy_index + 1)
+                                                          pattern=normalized_pattern,
+                                                          strategy=strategy.name,
+                                                          files_searched=len(results),
+                                                          total_matches=total_matches,
+                                                          duration_ms=operation.duration_ms,
+                                                          attempt=strategy_index + 1)
                     return paginated_results
 
                 except Exception as e:
