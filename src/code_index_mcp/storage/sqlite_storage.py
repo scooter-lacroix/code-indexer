@@ -469,18 +469,55 @@ class SQLiteFileMetadata(FileMetadataInterface):
         try:
             # Normalize path for consistent querying
             normalized_file_path = os.path.normpath(file_path).replace('\\', '/')
-            sql = 'SELECT * FROM file_diffs WHERE file_path LIKE ? ORDER BY timestamp ASC'
-            params = (normalized_file_path,)
-            logger.debug(f"Attempting to retrieve file diffs. SQL: {sql} Params: {params}")
+
+            # Try multiple path variations to handle normalization inconsistencies
+            search_paths = [normalized_file_path]
+
+            # Add alternative path formats
+            if normalized_file_path.startswith('/'):
+                search_paths.append(normalized_file_path[1:])  # Remove leading slash
+            else:
+                search_paths.append('/' + normalized_file_path)  # Add leading slash
+
+            # Try exact match first, then LIKE patterns
+            sql_exact = 'SELECT * FROM file_diffs WHERE file_path = ? ORDER BY timestamp ASC'
+            sql_like = 'SELECT * FROM file_diffs WHERE file_path LIKE ? ORDER BY timestamp ASC'
+
+            diffs = []
+
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.execute(sql, params)
-                diffs = []
-                for row in cursor.fetchall():
-                    diff_data = dict(row)
-                    diff_data['diff_content'] = diff_data['diff_content'].decode('utf-8')
-                    diffs.append(diff_data)
-                logger.debug(f"Retrieved {len(diffs)} diffs for {file_path}. Data: {diffs}")
+
+                # Try exact matches first
+                for search_path in search_paths:
+                    cursor = conn.execute(sql_exact, (search_path,))
+                    path_diffs = []
+                    for row in cursor.fetchall():
+                        diff_data = dict(row)
+                        diff_data['diff_content'] = diff_data['diff_content'].decode('utf-8')
+                        path_diffs.append(diff_data)
+
+                    if path_diffs:
+                        diffs.extend(path_diffs)
+                        logger.debug(f"Found {len(path_diffs)} diffs with exact match for {search_path}")
+                        break
+
+                # If no exact matches, try LIKE patterns for partial matches
+                if not diffs:
+                    for search_path in search_paths:
+                        cursor = conn.execute(sql_like, (f"%{search_path}%",))
+                        path_diffs = []
+                        for row in cursor.fetchall():
+                            diff_data = dict(row)
+                            diff_data['diff_content'] = diff_data['diff_content'].decode('utf-8')
+                            path_diffs.append(diff_data)
+
+                        if path_diffs:
+                            diffs.extend(path_diffs)
+                            logger.debug(f"Found {len(path_diffs)} diffs with LIKE match for {search_path}")
+                            break
+
+                logger.debug(f"Retrieved {len(diffs)} diffs for {file_path}")
                 return diffs
         except Exception as e:
             logger.error(f"Error retrieving file diffs for {file_path}: {e}")
@@ -491,18 +528,55 @@ class SQLiteFileMetadata(FileMetadataInterface):
         try:
             # Normalize path for consistent querying
             normalized_file_path = os.path.normpath(file_path).replace('\\', '/')
-            sql = 'SELECT * FROM file_versions WHERE file_path LIKE ? ORDER BY timestamp ASC'
-            params = (normalized_file_path,)
-            logger.debug(f"Attempting to retrieve file versions. SQL: {sql} Params: {params}")
+
+            # Try multiple path variations to handle normalization inconsistencies
+            search_paths = [normalized_file_path]
+
+            # Add alternative path formats
+            if normalized_file_path.startswith('/'):
+                search_paths.append(normalized_file_path[1:])  # Remove leading slash
+            else:
+                search_paths.append('/' + normalized_file_path)  # Add leading slash
+
+            # Try exact match first, then LIKE patterns
+            sql_exact = 'SELECT * FROM file_versions WHERE file_path = ? ORDER BY timestamp ASC'
+            sql_like = 'SELECT * FROM file_versions WHERE file_path LIKE ? ORDER BY timestamp ASC'
+
+            versions = []
+
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.execute(sql, params)
-                versions = []
-                for row in cursor.fetchall():
-                    version_data = dict(row)
-                    version_data['content'] = version_data['content'].decode('utf-8')
-                    versions.append(version_data)
-                logger.debug(f"Retrieved {len(versions)} versions for {file_path}. Data: {versions}")
+
+                # Try exact matches first
+                for search_path in search_paths:
+                    cursor = conn.execute(sql_exact, (search_path,))
+                    path_versions = []
+                    for row in cursor.fetchall():
+                        version_data = dict(row)
+                        version_data['content'] = version_data['content'].decode('utf-8')
+                        path_versions.append(version_data)
+
+                    if path_versions:
+                        versions.extend(path_versions)
+                        logger.debug(f"Found {len(path_versions)} versions with exact match for {search_path}")
+                        break
+
+                # If no exact matches, try LIKE patterns for partial matches
+                if not versions:
+                    for search_path in search_paths:
+                        cursor = conn.execute(sql_like, (f"%{search_path}%",))
+                        path_versions = []
+                        for row in cursor.fetchall():
+                            version_data = dict(row)
+                            version_data['content'] = version_data['content'].decode('utf-8')
+                            path_versions.append(version_data)
+
+                        if path_versions:
+                            versions.extend(path_versions)
+                            logger.debug(f"Found {len(path_versions)} versions with LIKE match for {search_path}")
+                            break
+
+                logger.debug(f"Retrieved {len(versions)} versions for {file_path}")
                 return versions
         except Exception as e:
             logger.error(f"Error retrieving file versions for {file_path}: {e}")
@@ -586,31 +660,257 @@ class SQLiteSearch(SearchInterface):
             
             conn.commit()
 
-    def search_content(self, query: str) -> List[Tuple[str, Any]]:
-        """Search across file content using FTS."""
+    def _validate_fts_tables(self) -> Dict[str, Any]:
+        """Validate that FTS tables exist and are properly structured."""
+        validation_result = {
+            "tables_exist": False,
+            "tables_have_data": False,
+            "data_consistent": False,
+            "needs_repair": False,
+            "error": None
+        }
+
         try:
             with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute('''
-                    SELECT kv_store.key, kv_store.value, kv_store.value_type
-                    FROM kv_fts
-                    JOIN kv_store ON kv_fts.rowid = kv_store.rowid
-                    WHERE kv_fts MATCH ?
-                    ORDER BY rank
-                ''', (query,))
-                
-                results = []
-                for row in cursor:
-                    key, value_blob, value_type = row
-                    if value_type == 'text':
-                        value = value_blob.decode('utf-8')
-                    else:
-                        value = json.loads(value_blob.decode('utf-8'))
-                    results.append((key, value))
-                
-                return results
+                # Check if FTS tables exist
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('kv_fts', 'files_fts')")
+                existing_tables = [row[0] for row in cursor.fetchall()]
+
+                if 'kv_fts' not in existing_tables or 'files_fts' not in existing_tables:
+                    logger.warning("FTS tables missing, need to recreate them")
+                    validation_result["needs_repair"] = True
+                    validation_result["error"] = "FTS tables missing"
+                    return validation_result
+
+                validation_result["tables_exist"] = True
+
+                # Check if FTS tables have data
+                cursor = conn.execute("SELECT COUNT(*) FROM kv_fts")
+                kv_count = cursor.fetchone()[0]
+
+                cursor = conn.execute("SELECT COUNT(*) FROM files_fts")
+                files_count = cursor.fetchone()[0]
+
+                # Check data consistency
+                cursor = conn.execute("SELECT COUNT(*) FROM kv_store")
+                kv_store_count = cursor.fetchone()[0]
+
+                cursor = conn.execute("SELECT COUNT(*) FROM files")
+                files_table_count = cursor.fetchone()[0]
+
+                validation_result["tables_have_data"] = kv_count > 0 or files_count > 0
+                validation_result["data_consistent"] = (kv_count == kv_store_count and files_count == files_table_count)
+
+                if not validation_result["data_consistent"]:
+                    logger.warning(f"FTS data inconsistency detected. kv_store: {kv_store_count}, kv_fts: {kv_count}, files: {files_table_count}, files_fts: {files_count}")
+                    validation_result["needs_repair"] = True
+                    validation_result["error"] = "FTS data inconsistency"
+
+                logger.debug(f"FTS validation: kv_fts has {kv_count}/{kv_store_count} entries, files_fts has {files_count}/{files_table_count} entries")
+                return validation_result
+
         except Exception as e:
-            logger.error(f"Error searching content: {e}")
+            logger.error(f"Error validating FTS tables: {e}")
+            validation_result["error"] = str(e)
+            validation_result["needs_repair"] = True
+            return validation_result
+
+    def _repair_fts_tables(self) -> Dict[str, Any]:
+        """Repair FTS tables by rebuilding them from existing data."""
+        repair_result = {
+            "success": False,
+            "kv_fts_repaired": False,
+            "files_fts_repaired": False,
+            "error": None
+        }
+
+        try:
+            logger.info("Attempting to repair FTS tables")
+            with sqlite3.connect(self.db_path) as conn:
+                # First, ensure FTS tables exist
+                self._init_db()
+
+                # Repair kv_fts from kv_store data
+                try:
+                    conn.execute("DELETE FROM kv_fts")
+                    conn.execute('''
+                        INSERT OR IGNORE INTO kv_fts (rowid, key, value_text)
+                        SELECT rowid, key, CASE
+                            WHEN value_type = 'text' THEN CAST(value AS TEXT)
+                            ELSE json_extract(CAST(value AS TEXT), '$')
+                        END
+                        FROM kv_store
+                        WHERE value IS NOT NULL
+                    ''')
+                    repair_result["kv_fts_repaired"] = True
+                    logger.debug("kv_fts table repaired")
+                except Exception as e:
+                    logger.error(f"Error repairing kv_fts: {e}")
+                    repair_result["error"] = f"kv_fts repair failed: {e}"
+
+                # Repair files_fts from files table data
+                try:
+                    conn.execute("DELETE FROM files_fts")
+                    conn.execute('''
+                        INSERT OR IGNORE INTO files_fts (rowid, file_path)
+                        SELECT id, file_path
+                        FROM files
+                        WHERE file_path IS NOT NULL
+                    ''')
+                    repair_result["files_fts_repaired"] = True
+                    logger.debug("files_fts table repaired")
+                except Exception as e:
+                    logger.error(f"Error repairing files_fts: {e}")
+                    if repair_result["error"]:
+                        repair_result["error"] += f"; files_fts repair failed: {e}"
+                    else:
+                        repair_result["error"] = f"files_fts repair failed: {e}"
+
+                conn.commit()
+
+                repair_result["success"] = repair_result["kv_fts_repaired"] or repair_result["files_fts_repaired"]
+
+                if repair_result["success"]:
+                    logger.info("FTS tables repair completed")
+                else:
+                    logger.error("FTS tables repair failed completely")
+
+                return repair_result
+
+        except Exception as e:
+            logger.error(f"Error during FTS table repair: {e}")
+            repair_result["error"] = str(e)
+            return repair_result
+
+    def _ensure_fts_integrity(self) -> bool:
+        """Ensure FTS tables are healthy and repair if necessary."""
+        try:
+            validation = self._validate_fts_tables()
+
+            if validation["needs_repair"]:
+                logger.info("FTS tables need repair, attempting automatic repair")
+                repair_result = self._repair_fts_tables()
+
+                if repair_result["success"]:
+                    logger.info("FTS tables successfully repaired")
+                    return True
+                else:
+                    logger.error(f"FTS table repair failed: {repair_result['error']}")
+                    return False
+            else:
+                logger.debug("FTS tables are healthy")
+                return True
+
+        except Exception as e:
+            logger.error(f"Error ensuring FTS integrity: {e}")
+            return False
+
+    def search_content(self, query: str, is_regex: bool = False) -> List[Tuple[str, Any]]:
+        """Search across file content using FTS with improved error handling."""
+        logger.debug(f"SQLite search_content called with query='{query}', is_regex={is_regex}")
+
+        # Ensure FTS integrity before searching
+        if not self._ensure_fts_integrity():
+            logger.error("FTS integrity check failed, cannot perform search")
             return []
+
+        # Validate and prepare the search query
+        search_query = self._prepare_search_query(query, is_regex)
+        if search_query is None:
+            logger.error(f"Failed to prepare search query for: {query}")
+            return []
+
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if is_regex:
+                    # For regex patterns, use REGEXP operator
+                    cursor = conn.execute('''
+                        SELECT kv_store.key, kv_store.value, kv_store.value_type
+                        FROM kv_fts
+                        JOIN kv_store ON kv_fts.rowid = kv_store.rowid
+                        WHERE kv_fts.value_text REGEXP ?
+                        ORDER BY rank
+                    ''', (search_query,))
+                else:
+                    # Standard FTS search with MATCH
+                    cursor = conn.execute('''
+                        SELECT kv_store.key, kv_store.value, kv_store.value_type
+                        FROM kv_fts
+                        JOIN kv_store ON kv_fts.rowid = kv_store.rowid
+                        WHERE kv_fts MATCH ?
+                        ORDER BY rank
+                    ''', (search_query,))
+
+                results = []
+                row_count = 0
+                for row in cursor:
+                    row_count += 1
+                    key, value_blob, value_type = row
+
+                    try:
+                        if value_type == 'text':
+                            value = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
+                        else:
+                            # Handle JSON data safely
+                            json_str = value_blob.decode('utf-8') if isinstance(value_blob, bytes) else str(value_blob)
+                            value = json.loads(json_str)
+
+                        results.append((key, value))
+                    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                        logger.warning(f"Error decoding result for key {key}: {e}")
+                        continue
+
+                logger.debug(f"SQLite search returned {len(results)} results (processed {row_count} rows)")
+                if results:
+                    logger.debug(f"First result key: {results[0][0]}")
+                return results
+
+        except sqlite3.Error as e:
+            logger.error(f"SQLite error during search: {e}")
+            # Try to repair FTS tables if database error occurs
+            if self._repair_fts_tables()["success"]:
+                logger.info("Retrying search after FTS repair due to database error")
+                return self.search_content(query, is_regex)
+            return []
+        except Exception as e:
+            logger.error(f"Unexpected error during search: {e}")
+            return []
+
+    def _prepare_search_query(self, query: str, is_regex: bool) -> Optional[str]:
+        """Prepare and validate search query for SQLite FTS."""
+        if not query or not query.strip():
+            return None
+
+        try:
+            if is_regex:
+                # For regex, validate the pattern
+                import re
+                re.compile(query, re.MULTILINE | re.IGNORECASE)
+                return query
+            else:
+                # For FTS MATCH, ensure proper escaping
+                # SQLite FTS has specific requirements for MATCH queries
+                return self._escape_fts_query(query)
+        except re.error as e:
+            logger.error(f"Invalid regex pattern '{query}': {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error preparing search query '{query}': {e}")
+            return None
+
+    def _escape_fts_query(self, query: str) -> str:
+        """Escape special characters for SQLite FTS MATCH queries."""
+        if not query:
+            return query
+
+        # SQLite FTS special characters that need escaping
+        # We need to handle quotes and other special characters
+        escaped = query.replace('"', '""')  # Double quotes need to be doubled
+
+        # Handle other special characters that might cause issues
+        escaped = escaped.replace('\n', ' ').replace('\r', ' ').replace('\t', ' ')
+
+        return escaped.strip()
 
     def search_file_paths(self, query: str) -> List[str]:
         """Search across file paths using FTS."""

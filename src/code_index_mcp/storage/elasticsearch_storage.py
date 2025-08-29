@@ -216,7 +216,7 @@ class ElasticsearchSearch(SearchInterface):
 
     def _translate_sqlite_pattern_to_es_query(self, pattern: str, field: str) -> Dict[str, Any]:
         """
-        Translates SQLite LIKE/GLOB patterns to Elasticsearch Query DSL.
+        Translates SQLite LIKE/GLOB patterns to Elasticsearch Query DSL with improved handling.
 
         Args:
             pattern: The SQLite LIKE or GLOB pattern.
@@ -225,63 +225,81 @@ class ElasticsearchSearch(SearchInterface):
         Returns:
             A dictionary representing the Elasticsearch query DSL.
         """
+        logger.debug(f"Translating SQLite pattern '{pattern}' to ES query for field '{field}'")
+
+        if not pattern or not pattern.strip():
+            logger.warning("Empty pattern provided, returning match_all")
+            return {"match_all": {}}
+
         try:
+            # Handle exact matches (no wildcards)
+            if '%' not in pattern and '_' not in pattern and '*' not in pattern and '?' not in pattern:
+                logger.debug(f"Using term query for exact match: '{pattern}'")
+                return {"term": {field: pattern}}
+
             # Handle SQL LIKE patterns
             if '%' in pattern or '_' in pattern:
+                logger.debug(f"Detected LIKE pattern with wildcards: {pattern}")
+
                 # Convert SQL LIKE wildcards to Elasticsearch wildcards
                 # % -> * (any sequence of characters)
                 # _ -> ? (any single character)
                 es_wildcard_pattern = pattern.replace('%', '*').replace('_', '?')
+                logger.debug(f"Converted to wildcard pattern: {es_wildcard_pattern}")
 
                 # If pattern starts with '%' and ends with '%', it's a contains search
-                if pattern.startswith('%') and pattern.endswith('%') and len(pattern) > 1:
+                if pattern.startswith('%') and pattern.endswith('%') and len(pattern) > 2:
                     term = pattern[1:-1]
-                    # Use match query for full-text search if it's a simple contains
-                    return {"match": {field: term}}
-                elif pattern.endswith('%'):
+                    logger.debug(f"Using match_phrase query for contains pattern, term: '{term}'")
+                    # Use match_phrase for better phrase matching
+                    return {"match_phrase": {field: term}}
+                elif pattern.endswith('%') and not pattern.startswith('%'):
                     # Use prefix query for 'starts with'
-                    return {"prefix": {field: es_wildcard_pattern[:-1]}}
-                elif pattern.startswith('%'):
-                    # Use wildcard query for 'ends with' or general wildcards
-                    return {"wildcard": {field: es_wildcard_pattern}}
+                    prefix_term = pattern[:-1]
+                    logger.debug(f"Using prefix query for starts-with pattern, term: '{prefix_term}'")
+                    return {"prefix": {field: prefix_term}}
+                elif pattern.startswith('%') and not pattern.endswith('%'):
+                    # Use wildcard query for 'ends with'
+                    wildcard_pattern = '*' + pattern[1:]
+                    logger.debug(f"Using wildcard query for ends-with pattern: {wildcard_pattern}")
+                    return {"wildcard": {field: {"value": wildcard_pattern, "case_insensitive": True}}}
                 else:
                     # General wildcard query for patterns with % or _ in the middle
-                    return {"wildcard": {field: es_wildcard_pattern}}
-            
-            # Handle SQLite GLOB patterns (which are essentially regex)
-            # Elasticsearch regexp query uses Java-style regex, which is mostly compatible
-            # with Python's re, but some differences exist.
-            # For simplicity, we'll directly use the pattern as a regexp.
-            # Escaping special regex characters might be needed for literal matches,
-            # but for GLOB-like behavior, direct translation is often sufficient.
-            # SQLite GLOB: * matches any sequence, ? matches any single character.
-            # Equivalent regex: .* for *, . for ?
-            # We need to escape other regex special characters if they are meant literally.
-            
-            # First, escape all regex special characters
-            escaped_pattern = re.escape(pattern)
-            
-            # Then, convert GLOB wildcards back to regex wildcards
-            # The order is important: escape first, then unescape and convert GLOB wildcards
-            es_regexp_pattern = escaped_pattern.replace(r'\*', '.*').replace(r'\?', '.')
+                    logger.debug(f"Using wildcard query for general pattern: {es_wildcard_pattern}")
+                    return {"wildcard": {field: {"value": es_wildcard_pattern, "case_insensitive": True}}}
 
-            return {"regexp": {field: es_regexp_pattern}}
+            # Handle GLOB patterns or regex patterns
+            logger.debug(f"Detected GLOB/regex pattern: {pattern}")
+
+            # Check if it's a simple GLOB pattern
+            if '*' in pattern or '?' in pattern:
+                # Convert GLOB to regex
+                glob_pattern = pattern.replace('.', r'\.').replace('*', '.*').replace('?', '.')
+                logger.debug(f"Converted GLOB to regex: {glob_pattern}")
+                return {"regexp": {field: {"value": glob_pattern, "case_insensitive": True}}}
+            else:
+                # Assume it's already a regex pattern
+                logger.debug(f"Using regexp query for pattern: {pattern}")
+                return {"regexp": {field: {"value": pattern, "case_insensitive": True}}}
+
         except Exception as e:
             logger.error(f"Error translating SQLite pattern '{pattern}' to ES query for field '{field}': {e}")
-            # Fallback to a match query or raise an error depending on desired behavior
-            return {"match_all": {}} # Fallback to match_all or a simple match query
+            # Fallback to a simple match query
+            logger.warning(f"Falling back to match query due to translation error")
+            return {"match": {field: pattern}}
 
 
     def search_content(self, query: str, is_sqlite_pattern: bool = False,
-                       fuzziness: Optional[str] = None,
-                       content_boost: float = 1.0, file_path_boost: float = 1.0,
-                       highlight_pre_tags: Optional[List[str]] = None,
-                       highlight_post_tags: Optional[List[str]] = None) -> List[Tuple[str, Any]]:
+                        fuzziness: Optional[str] = None,
+                        content_boost: float = 1.0, file_path_boost: float = 1.0,
+                        highlight_pre_tags: Optional[List[str]] = None,
+                        highlight_post_tags: Optional[List[str]] = None) -> List[Tuple[str, Any]]:
         """
         Search across file content using Elasticsearch with advanced features.
         Can handle both direct queries and SQLite-style patterns.
         """
         results = []
+        logger.debug(f"Elasticsearch search_content called with query='{query}', is_sqlite_pattern={is_sqlite_pattern}")
         try:
             # Removed highlight settings for simplification
             # highlight_settings = {
@@ -296,13 +314,16 @@ class ElasticsearchSearch(SearchInterface):
             #     highlight_settings["post_tags"] = highlight_post_tags
 
             if is_sqlite_pattern:
+                logger.debug(f"Translating SQLite pattern '{query}' to Elasticsearch query")
                 es_query_dsl = self._translate_sqlite_pattern_to_es_query(query, "content")
+                logger.debug(f"Translated query DSL: {es_query_dsl}")
                 body = {
                     "query": es_query_dsl
                     # "highlight": highlight_settings # Removed for simplification
                 }
             else:
                 # Simplified to a basic match query on 'content' field
+                logger.debug(f"Using direct match query for '{query}'")
                 body = {
                     "query": {
                         "match": {
@@ -311,6 +332,8 @@ class ElasticsearchSearch(SearchInterface):
                     }
                     # "highlight": highlight_settings # Removed for simplification
                 }
+
+            logger.debug(f"Elasticsearch search body: {body}")
             
             response = self.es.search(index=self.index_name, body=body)
             logger.debug(f"Elasticsearch search response: {response}")

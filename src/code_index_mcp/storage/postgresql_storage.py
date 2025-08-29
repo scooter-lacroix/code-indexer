@@ -361,10 +361,12 @@ class PostgreSQLFileMetadata(FileMetadataInterface):
 
     def get_file_versions_for_path(self, file_path: str) -> List[Dict]:
         """Retrieves all versions for a given file path from PostgreSQL."""
+        logger.debug(f"PostgreSQL get_file_versions_for_path called with file_path: {file_path}")
         try:
             with self.Session() as session:
                 versions = session.query(FileVersion).filter_by(file_path=file_path).order_by(FileVersion.timestamp).all()
-                return [
+                logger.debug(f"Found {len(versions)} versions for path {file_path}")
+                result = [
                     {
                         "version_id": v.id,
                         "file_path": v.file_path,
@@ -374,6 +376,9 @@ class PostgreSQLFileMetadata(FileMetadataInterface):
                         "size": v.size
                     } for v in versions
                 ]
+                if versions:
+                    logger.debug(f"Sample version data: version_id={versions[0].id}, timestamp={versions[0].timestamp}")
+                return result
         except SQLAlchemyError as e:
             logger.error(f"Error getting file versions for path {file_path}: {e}")
             return []
@@ -424,10 +429,12 @@ class PostgreSQLFileMetadata(FileMetadataInterface):
 
     def get_file_diffs_for_path(self, file_path: str) -> List[Dict]:
         """Retrieves all diffs for a given file path from PostgreSQL."""
+        logger.debug(f"PostgreSQL get_file_diffs_for_path called with file_path: {file_path}")
         try:
             with self.Session() as session:
                 diffs = session.query(FileDiff).filter_by(file_path=file_path).order_by(FileDiff.timestamp).all()
-                return [
+                logger.debug(f"Found {len(diffs)} diffs for path {file_path}")
+                result = [
                     {
                         "diff_id": d.id,
                         "file_path": d.file_path,
@@ -440,6 +447,9 @@ class PostgreSQLFileMetadata(FileMetadataInterface):
                         "timestamp": d.timestamp.isoformat()
                     } for d in diffs
                 ]
+                if diffs:
+                    logger.debug(f"Sample diff data: diff_id={diffs[0].id}, operation_type={diffs[0].operation_type}")
+                return result
         except SQLAlchemyError as e:
             logger.error(f"Error getting file diffs for path {file_path}: {e}")
             return []

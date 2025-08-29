@@ -16,6 +16,7 @@ import tempfile
 import subprocess
 import time
 import asyncio
+import re
 from datetime import datetime # Import datetime
 from .lazy_loader import LazyContentManager
 from mcp.server.fastmcp import FastMCP, Context, Image
@@ -47,6 +48,11 @@ from .storage.dal_factory import get_dal_instance
 from .storage.storage_interface import DALInterface, SearchInterface # Import DALInterface and SearchInterface
 from .logger_config import logger # Import the centralized logger
 from .file_reader import SmartFileReader, ReadingStrategy, FileSizeCategory # Import SmartFileReader and enums
+from .search_utils import (
+    SearchBackendSelector, SearchErrorHandler, SearchPatternTranslator,
+    SearchResultProcessor, SearchMonitor, search_monitor,
+    BackendHealthChecker, GracefulDegradationManager, degradation_manager
+) # Import search utilities
 
 # Create the MCP server
 mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
@@ -155,6 +161,7 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     # Initialize IncrementalIndexer and FileChangeTracker
     incremental_indexer = IncrementalIndexer(settings)
     file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
+    logger.info("FileChangeTracker initialized with DAL metadata backend")
 
     # Initialize Elasticsearch client with retry logic
     max_retries = 10
@@ -508,31 +515,89 @@ def set_project_path(path: str, ctx: Context) -> str:
             ctx.request_context.lifespan_context.rabbitmq_consumer = None
             ctx.request_context.lifespan_context.realtime_indexer = None
 
-        # Initialize memory profiler with configuration from settings
+        # Initialize memory profiler with comprehensive error handling and recovery
         try:
+            logger.info("Initializing memory profiler with configuration...")
+
+            # Load configuration with fallback
             config_manager = ConfigManager()
-            config_data = config_manager.load_config()
-            memory_limits = create_memory_config_from_yaml(config_data)
-            
+            try:
+                config_data = config_manager.load_config()
+                logger.debug("Configuration loaded successfully")
+            except Exception as config_error:
+                logger.warning(f"Could not load configuration, using defaults: {config_error}")
+                config_data = {}
+
+            # Create memory limits with validation
+            try:
+                memory_limits = create_memory_config_from_yaml(config_data)
+                logger.debug(f"Memory limits created: {memory_limits}")
+            except Exception as limits_error:
+                logger.warning(f"Could not create memory limits from config, using defaults: {limits_error}")
+                memory_limits = MemoryLimits()  # Use default limits
+
             # Stop existing profiler if running
             if memory_profiler:
-                memory_profiler.stop_monitoring()
-            
-            # Create new memory profiler
-            memory_profiler = MemoryProfiler(memory_limits)
-            
-            # Create memory-aware manager
-            memory_aware_manager = MemoryAwareLazyContentManager(memory_profiler, lazy_content_manager)
-            
-            # Start monitoring if enabled
-            if config_data.get('memory', {}).get('enable_monitoring', True):
-                interval = config_data.get('memory', {}).get('monitoring_interval', 30.0)
-                memory_profiler.start_monitoring(interval)
-                logger.info(f"Memory monitoring started with {interval}s interval")
-            
-            logger.info(f"Memory profiler initialized: {memory_limits}")
+                try:
+                    memory_profiler.stop_monitoring()
+                    logger.debug("Existing memory profiler stopped")
+                except Exception as stop_error:
+                    logger.warning(f"Could not stop existing profiler cleanly: {stop_error}")
+
+            # Create new memory profiler with error recovery
+            try:
+                memory_profiler = MemoryProfiler(memory_limits)
+                logger.info("Memory profiler created successfully")
+
+                # Validate profiler functionality
+                test_snapshot = memory_profiler.take_snapshot()
+                if test_snapshot and hasattr(test_snapshot, 'process_memory_mb'):
+                    logger.debug("Memory profiler validation successful")
+                else:
+                    raise ValueError("Profiler created but snapshot test failed")
+
+            except Exception as profiler_error:
+                logger.error(f"Failed to create memory profiler: {profiler_error}")
+                # Try with default limits as fallback
+                try:
+                    memory_profiler = MemoryProfiler(MemoryLimits())
+                    logger.warning("Memory profiler created with default limits as fallback")
+                except Exception as fallback_error:
+                    logger.error(f"Failed to create memory profiler even with defaults: {fallback_error}")
+                    memory_profiler = None
+                    raise fallback_error
+
+            # Create memory-aware manager if profiler is available
+            if memory_profiler:
+                try:
+                    memory_aware_manager = MemoryAwareLazyContentManager(memory_profiler, lazy_content_manager)
+                    logger.info("Memory-aware manager created successfully")
+                except Exception as manager_error:
+                    logger.warning(f"Could not create memory-aware manager: {manager_error}")
+                    memory_aware_manager = None
+
+                # Start monitoring if enabled and profiler is healthy
+                monitoring_enabled = config_data.get('memory', {}).get('enable_monitoring', True)
+                if monitoring_enabled:
+                    try:
+                        interval = config_data.get('memory', {}).get('monitoring_interval', 30.0)
+                        memory_profiler.start_monitoring(interval)
+                        logger.info(f"Memory monitoring started with {interval}s interval")
+                    except Exception as monitoring_error:
+                        logger.warning(f"Could not start memory monitoring: {monitoring_error}")
+                        logger.info("Memory profiler will work without continuous monitoring")
+            else:
+                memory_aware_manager = None
+                logger.warning("Memory profiler not available - memory-aware manager not created")
+
+            logger.info(f"Memory profiler initialization completed: {memory_limits}")
+
         except Exception as e:
-            logger.warning(f"Could not initialize memory profiler: {e}")
+            logger.error(f"Memory profiler initialization failed: {e}")
+            # Ensure globals are in a safe state
+            memory_profiler = None
+            memory_aware_manager = None
+            logger.warning("Memory profiling will be unavailable - server will continue with reduced functionality")
         
         # Initialize performance monitor with configuration from settings
         try:
@@ -648,28 +713,27 @@ async def search_code_advanced(
     page_size: int = 20
 ) -> Dict[str, Any]:
     """
-    Search for a code pattern in the project using an advanced, fast tool.
-    
-    This tool automatically selects the best available command-line search tool
-    (like ugrep, ripgrep, ag, or grep) for maximum performance.
-    
+    Search for a code pattern in the project using an advanced, fast tool with improved backend selection and error handling.
+
+    This tool automatically selects the best available search backend (Elasticsearch, SQLite FTS, or command-line tools)
+    with robust fallback mechanisms and comprehensive error handling.
+
     Args:
         pattern: The search pattern (can be a regex if fuzzy=True).
         case_sensitive: Whether the search should be case-sensitive.
         context_lines: Number of lines to show before and after the match.
         file_pattern: A glob pattern to filter files to search in (e.g., "*.py").
         fuzzy: If True, treats the pattern as a regular expression.
-               If False, performs a literal/fixed-string search.
-               For 'ugrep', this enables fuzzy matching features.
+                If False, performs a literal/fixed-string search.
         fuzziness_level: Elasticsearch fuzziness level (e.g., "AUTO", "0", "1", "2").
-                         Only applicable when using Elasticsearch backend.
+                          Only applicable when using Elasticsearch backend.
         content_boost: Boosting factor for content field. Only applicable when using Elasticsearch backend.
         filepath_boost: Boosting factor for file_path field. Only applicable when using Elasticsearch backend.
         highlight_pre_tag: HTML tag to prepend to highlighted terms. Only applicable when using Elasticsearch backend.
         highlight_post_tag: HTML tag to append to highlighted terms. Only applicable when using Elasticsearch backend.
         page: Page number for paginated results.
         page_size: Number of results per page.
-               
+
     Returns:
         A dictionary containing the search results or an error message.
     """
@@ -678,346 +742,358 @@ async def search_code_advanced(
         return {"error": "Project path not set. Please use set_project_path first."}
 
     settings = ctx.request_context.lifespan_context.settings
-    dal = ctx.request_context.lifespan_context.dal # Get DAL instance from context
-    
+    dal = ctx.request_context.lifespan_context.dal
+
     # Ensure performance monitor is initialized
     ensure_performance_monitor()
 
     # Use global lazy_content_manager for now
     global lazy_content_manager
-    
+
     # Create query key for caching
     query_key = "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}".format(
         pattern, case_sensitive, context_lines, file_pattern, fuzzy,
         fuzziness_level, content_boost, filepath_boost, highlight_pre_tag, highlight_post_tag, page
     )
+
+    # Check cache first
     cached_result = lazy_content_manager.get_cached_search_result(query_key)
     if cached_result:
         logger.info(f"Returning cached result for query: {query_key}")
-        # Log cache hit
         if performance_monitor:
             performance_monitor.increment_counter("search_cache_hits_total")
             performance_monitor.log_structured("info", "Search cache hit", pattern=pattern, query_key=query_key)
         return cached_result
-    
+
     # Log cache miss
     if performance_monitor:
         performance_monitor.increment_counter("search_cache_misses_total")
 
-    # Check if DAL's search backend is ElasticsearchSearch and if a pattern is provided
-    if dal and isinstance(dal.search, SearchInterface):
-        if pattern:
-            # Check if this is Elasticsearch search (has additional parameters)
-            if hasattr(dal.search, 'search_content') and 'elasticsearch' in str(type(dal.search)).lower():
-                logger.info("Using Elasticsearch for content search.")
-                try:
-                    if performance_monitor:
-                        with performance_monitor.time_operation("search",
-                                                               pattern=pattern,
-                                                               strategy="Elasticsearch_Content",
-                                                               file_pattern=file_pattern,
-                                                               case_sensitive=case_sensitive,
-                                                               fuzzy=fuzzy,
-                                                               fuzziness_level=fuzziness_level,
-                                                               content_boost=content_boost,
-                                                               filepath_boost=filepath_boost) as operation:
+    # Normalize the search pattern
+    normalized_pattern, is_regex = SearchPatternTranslator.normalize_pattern(pattern, fuzzy)
+    logger.debug(f"Normalized pattern: '{normalized_pattern}', is_regex: {is_regex}")
 
-                            results_list = dal.search.search_content(
-                                query=pattern,
-                                is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
-                                fuzziness=fuzziness_level,
-                                content_boost=content_boost,
-                                file_path_boost=filepath_boost,
-                                highlight_pre_tags=[highlight_pre_tag],
-                                highlight_post_tags=[highlight_post_tag]
-                            )
+    # Get search backend with validation
+    search_backend = SearchBackendSelector.get_search_backend(dal)
 
-                            results_dict = {}
-                            logger.debug(f"Processing results_list with {len(results_list)} items")
-                            for i, result_item in enumerate(results_list):
-                                logger.debug(f"Result item {i}: type={type(result_item)}, value={result_item}")
-                                try:
-                                    file_path, result_doc = result_item
-                                    if file_path not in results_dict:
-                                        results_dict[file_path] = []
-                                except ValueError as e:
-                                    logger.error(f"Error unpacking result item {i}: {e}, item: {result_item}")
-                                    raise
-                                content_highlights = result_doc.get('highlight', {}).get('content', [])
-                                file_path_highlights = result_doc.get('highlight', {}).get('file_path', [])
+    if search_backend:
+        # Get backend capabilities and health status
+        backend_capabilities = SearchBackendSelector.get_backend_capabilities(search_backend)
+        backend_health = degradation_manager.get_backend_status(search_backend)
+        backend_type = backend_health.get("backend_type", backend_capabilities.get("backend_type", "Unknown"))
 
-                                combined_highlights = content_highlights + file_path_highlights
+        # Check if backend supports the requested features
+        if fuzzy and not backend_capabilities.get("supports_regex", False):
+            logger.warning(f"{backend_type} backend doesn't support regex patterns, will use literal search")
+            # Adjust pattern for backend limitations
+            normalized_pattern, is_regex = SearchPatternTranslator.normalize_pattern(pattern, False)
 
-                                if combined_highlights:
-                                    for highlight_text in combined_highlights:
-                                        results_dict[file_path].append({
-                                            "line": 0, # Placeholder, ES doesn't provide line numbers directly
-                                            "text": highlight_text,
-                                            "start": 0, # Placeholder
-                                            "end": 0 # Placeholder
-                                        })
-                                else:
-                                    results_dict[file_path].append({
-                                        "line": 0,
-                                        "text": result_doc.get('content', 'No content available'),
-                                        "start": 0,
-                                        "end": 0
-                                    })
+        if not backend_health.get("healthy", False):
+            logger.warning(f"{backend_type} backend is unhealthy: {backend_health.get('reason', 'Unknown reason')}")
+            degradation_message = degradation_manager.get_degradation_message(
+                backend_type, backend_health.get('reason', 'Unknown reason')
+            )
+            logger.info(f"Graceful degradation: {degradation_message}")
+        else:
+            logger.info(f"Using healthy {backend_type} backend for search with pattern: '{normalized_pattern}'")
 
-                            total_matches = len(results_list)
-                            operation.metadata.update({
-                                "files_searched": len(results_dict),
-                                "total_matches": total_matches
-                            })
+        # Implement enhanced retry logic with backend-specific handling
+        max_retries = 3
+        retry_delay = 0.5  # seconds
+        search_successful = False
 
-                            # Debug: Log the structure of results_dict
-                            logger.debug(f"results_dict structure: {list(results_dict.keys())[:3]}")  # First 3 keys
-                            for file_path, matches in list(results_dict.items())[:1]:  # First file
-                                logger.debug(f"File: {file_path}, matches type: {type(matches)}, first match: {matches[0] if matches else 'None'}")
+        for attempt in range(max_retries + 1):
+            operation_id = search_monitor.log_search_start(
+                normalized_pattern, backend_type,
+                attempt=attempt + 1, max_retries=max_retries
+            )
 
-                            paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
-                            lazy_content_manager.cache_search_result(query_key, paginated_results)
-                            logger.info(f"Search successful with Elasticsearch. Cached result for query: {query_key}")
-
-                            performance_monitor.log_structured("info", "Search completed successfully",
-                                                               pattern=pattern,
-                                                               strategy="Elasticsearch_Content",
-                                                               files_searched=len(results_dict),
-                                                               total_matches=total_matches,
-                                                               duration_ms=operation.duration_ms)
-                            return paginated_results
-                except Exception as e:
-                    error_message = f"Error during Elasticsearch content search: {e}"
-                    logger.error(error_message)
-                    if performance_monitor:
-                        performance_monitor.log_structured("error", "Elasticsearch content search failed",
-                                                           pattern=pattern,
-                                                           error=str(e))
-                        performance_monitor.increment_counter("search_errors_total")
-                    return {"error": error_message}
-            else:
-                # This is SQLite search - use simple query parameter only
-                logger.info("Using SQLite for content search.")
-                try:
-                    if performance_monitor:
-                        with performance_monitor.time_operation("search",
-                                                               pattern=pattern,
-                                                               strategy="SQLite_Content",
-                                                               file_pattern=file_pattern,
-                                                               case_sensitive=case_sensitive,
-                                                               fuzzy=fuzzy) as operation:
-
-                            results_list = dal.search.search_content(query=pattern)
-
-                            results_dict = {}
-                            for file_path, content in results_list:
-                                if file_path not in results_dict:
-                                    results_dict[file_path] = []
-                                results_dict[file_path].append({
-                                    "line": 0,  # SQLite doesn't provide line numbers
-                                    "text": content,
-                                    "start": 0,
-                                    "end": 0
-                                })
-
-                            total_matches = len(results_list)
-                            operation.metadata.update({
-                                "files_searched": len(results_dict),
-                                "total_matches": total_matches
-                            })
-
-                            paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
-                            lazy_content_manager.cache_search_result(query_key, paginated_results)
-                            logger.info(f"Search successful with SQLite. Cached result for query: {query_key}")
-
-                            performance_monitor.log_structured("info", "Search completed successfully",
-                                                               pattern=pattern,
-                                                               strategy="SQLite_Content",
-                                                               files_searched=len(results_dict),
-                                                               total_matches=total_matches,
-                                                               duration_ms=operation.duration_ms)
-                            return paginated_results
-                except Exception as e:
-                    error_message = f"Error during SQLite content search: {e}"
-                    logger.error(error_message)
-                    if performance_monitor:
-                        performance_monitor.log_structured("error", "SQLite content search failed",
-                                                           pattern=pattern,
-                                                           error=str(e))
-                        performance_monitor.increment_counter("search_errors_total")
-                    return {"error": error_message}
-        elif file_pattern:
-            logger.info("Using Elasticsearch for file path search.")
             try:
                 if performance_monitor:
                     with performance_monitor.time_operation("search",
-                                                           pattern=file_pattern,
-                                                           strategy="Elasticsearch_FilePath",
-                                                           file_pattern=file_pattern,
-                                                           fuzziness_level=fuzziness_level,
-                                                           filepath_boost=filepath_boost) as operation:
-                        
-                        paths = dal.search.search_file_paths(
-                            query=file_pattern,
-                            is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
-                            fuzziness=fuzziness_level,
-                            file_path_boost=filepath_boost,
-                            highlight_pre_tags=[highlight_pre_tag],
-                            highlight_post_tags=[highlight_post_tag]
-                        )
-                        
-                        results_dict = {}
-                        for path in paths:
-                            results_dict[path] = [{
-                                "line": 0, # No specific line for file path match
-                                "text": path,
-                                "start": 0,
-                                "end": 0
-                            }]
+                                                          pattern=normalized_pattern,
+                                                          strategy=f"{backend_type}_Content",
+                                                          file_pattern=file_pattern,
+                                                          case_sensitive=case_sensitive,
+                                                          fuzzy=fuzzy,
+                                                          fuzziness_level=fuzziness_level,
+                                                          content_boost=content_boost,
+                                                          filepath_boost=filepath_boost) as operation:
 
-                        total_matches = len(paths)
+                        # Perform the search based on backend type with enhanced parameter handling
+                        if SearchBackendSelector.is_elasticsearch_backend(search_backend):
+                            # Elasticsearch-specific parameters
+                            search_params = {
+                                "query": normalized_pattern,
+                                "is_sqlite_pattern": is_regex,
+                            }
+
+                            # Add optional Elasticsearch-specific parameters
+                            if fuzziness_level and backend_capabilities.get("supports_fuzzy", False):
+                                search_params["fuzziness"] = fuzziness_level
+                            if backend_capabilities.get("supports_highlighting", False):
+                                search_params.update({
+                                    "content_boost": content_boost,
+                                    "file_path_boost": filepath_boost,
+                                    "highlight_pre_tags": [highlight_pre_tag],
+                                    "highlight_post_tags": [highlight_post_tag]
+                                })
+
+                            results_list = search_backend.search_content(**search_params)
+
+                        elif SearchBackendSelector.is_sqlite_backend(search_backend):
+                            # SQLite-specific parameters
+                            results_list = search_backend.search_content(
+                                query=normalized_pattern,
+                                is_regex=is_regex
+                            )
+
+                        else:
+                            # Generic backend handling
+                            results_list = search_backend.search_content(
+                                query=normalized_pattern,
+                                is_regex=is_regex
+                            )
+
+                        # Process and standardize results with enhanced error handling
+                        standardized_results = SearchResultProcessor.standardize_results(results_list, backend_type)
+
+                        if not standardized_results:
+                            logger.info(f"No results found with {backend_type} backend")
+                            # Don't treat empty results as an error, just log and continue
+
+                        # Convert to the expected format for pagination
+                        results_dict = {}
+                        for result in standardized_results:
+                            file_path = result.get("file_path", "")
+                            if not file_path:
+                                continue
+
+                            if file_path not in results_dict:
+                                results_dict[file_path] = []
+
+                            results_dict[file_path].append({
+                                "line": result.get("line", 0),
+                                "text": result.get("content", ""),
+                                "start": result.get("start", 0),
+                                "end": result.get("end", 0),
+                                "score": result.get("score", 0.0)
+                            })
+
+                        total_matches = len(standardized_results)
                         operation.metadata.update({
                             "files_searched": len(results_dict),
-                            "total_matches": total_matches
+                            "total_matches": total_matches,
+                            "backend_type": backend_type,
+                            "attempt": attempt + 1,
+                            "backend_capabilities": backend_capabilities
                         })
-                        
+
+                        # Always cache results, even if empty
                         paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
                         lazy_content_manager.cache_search_result(query_key, paginated_results)
-                        logger.info(f"Search successful with Elasticsearch file path search. Cached result for query: {query_key}")
-                        
-                        performance_monitor.log_structured("info", "Search completed successfully",
-                                                          pattern=file_pattern,
-                                                          strategy="Elasticsearch_FilePath",
-                                                          files_searched=len(results_dict),
-                                                          total_matches=total_matches,
-                                                          duration_ms=operation.duration_ms)
-                        return paginated_results
-            except Exception as e:
-                error_message = f"Error during Elasticsearch file path search: {e}"
-                logger.error(error_message)
-                if performance_monitor:
-                    performance_monitor.log_structured("error", "Elasticsearch file path search failed",
-                                                      pattern=file_pattern,
-                                                      error=str(e))
-                    performance_monitor.increment_counter("search_errors_total")
-                return {"error": error_message}
-        else:
-            return {"error": "No search pattern or file pattern provided for Elasticsearch search."}
-    else:
-        logger.info("Elasticsearch search not available or DAL not configured for it. Falling back to command-line tools.")
-        # Get all available strategies in priority order for fallback
-        all_strategies = settings.available_strategies
-        if not all_strategies:
-            return {"error": "No search strategies available. This is unexpected."}
-        
-        strategy = all_strategies[0]  # Start with the highest priority strategy
-        logger.info(f"Using search strategy: {strategy.name}")
 
-        # Try each strategy in order until one succeeds
-        last_error = None
-        
-        for strategy_index, strategy in enumerate(all_strategies):
-            logger.info(f"Trying search strategy {strategy_index + 1}/{len(all_strategies)}: {strategy.name}")
-            
-            # Use performance monitoring context manager for timing
-            if performance_monitor:
-                with performance_monitor.time_operation("search",
-                                                       pattern=pattern,
-                                                       strategy=strategy.name,
-                                                       file_pattern=file_pattern,
-                                                       case_sensitive=case_sensitive,
-                                                       fuzzy=fuzzy,
-                                                       attempt=strategy_index + 1) as operation:
-                    try:
-                        # Use async search with progress callback
-                        def progress_callback(progress: float):
-                            logger.debug(f"Search progress ({strategy.name}): {progress:.1%}")
-                        
-                        results = await strategy.search_async(
-                            pattern=pattern,
-                            base_path=base_path,
-                            case_sensitive=case_sensitive,
-                            context_lines=context_lines,
-                            file_pattern=file_pattern,
-                            fuzzy=fuzzy,
-                            progress_callback=progress_callback
-                        )
-                        
-                        # Count results for metrics
-                        total_matches = sum(len(matches) for matches in results.values())
-                        operation.metadata.update({
-                            "files_searched": len(results),
-                            "total_matches": total_matches
-                        })
-                        
-                        paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
-                        lazy_content_manager.cache_search_result(query_key, paginated_results)
-                        logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
-                        
                         # Log successful search
-                        performance_monitor.log_structured("info", "Search completed successfully",
-                                                          pattern=pattern,
-                                                          strategy=strategy.name,
-                                                          files_searched=len(results),
-                                                          total_matches=total_matches,
-                                                          duration_ms=operation.duration_ms,
-                                                          attempt=strategy_index + 1)
+                        search_monitor.log_search_success(
+                            operation_id, total_matches,
+                            backend_type=backend_type,
+                            files_searched=len(results_dict),
+                            attempt=attempt + 1
+                        )
+
+                        logger.info(f"Search successful with {backend_type} (attempt {attempt + 1}). Found {total_matches} matches. Cached result for query: {query_key}")
+
+                        if performance_monitor:
+                            performance_monitor.log_structured("info", "Search completed successfully",
+                                                              pattern=normalized_pattern,
+                                                              strategy=f"{backend_type}_Content",
+                                                              files_searched=len(results_dict),
+                                                              total_matches=total_matches,
+                                                              duration_ms=operation.duration_ms,
+                                                              backend_type=backend_type,
+                                                              attempt=attempt + 1)
+                        search_successful = True
                         return paginated_results
-                    except Exception as e:
-                        last_error = e
-                        # Log search error but continue to next strategy
-                        performance_monitor.log_structured("warning", "Search strategy failed, trying next",
-                                                          pattern=pattern,
-                                                          strategy=strategy.name,
-                                                          error=str(e),
-                                                          attempt=strategy_index + 1)
-                        performance_monitor.increment_counter("search_strategy_failures_total")
-                        
-                        # If this isn't the last strategy, continue to the next one
-                        if strategy_index < len(all_strategies) - 1:
-                            logger.warning(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
-                            continue
-                        else:
-                            # This was the last strategy, return error
-                            performance_monitor.log_structured("error", "All search strategies failed",
-                                                              pattern=pattern,
-                                                              error=str(e),
-                                                              total_attempts=len(all_strategies))
-                            performance_monitor.increment_counter("search_errors_total")
-                            return {"error": f"All search strategies failed. Last error from '{strategy.name}': {e}"}
-            else:
-                # Fallback without monitoring - same logic but without performance tracking
+
+            except Exception as e:
+                # Log the failure with more context
+                search_monitor.log_search_failure(
+                    operation_id, e,
+                    backend_type=backend_type,
+                    attempt=attempt + 1
+                )
+
+                error_details = SearchErrorHandler.handle_search_error(e, backend_type, f"content search (attempt {attempt + 1})")
+
+                # Check if this is a recoverable error
+                if SearchResultProcessor._is_recoverable_error(e, backend_type):
+                    # If this isn't the last attempt, wait and retry
+                    if attempt < max_retries:
+                        logger.warning(f"{backend_type} search failed (attempt {attempt + 1}/{max_retries + 1}), retrying in {retry_delay}s: {e}")
+                        import asyncio
+                        await asyncio.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                        continue
+                    else:
+                        logger.warning(f"{backend_type} search failed after {max_retries + 1} attempts, attempting fallback to command-line tools")
+                else:
+                    # Non-recoverable error, skip retries
+                    logger.error(f"Non-recoverable error with {backend_type}, skipping retries: {e}")
+                    break
+
+                if performance_monitor:
+                    performance_monitor.increment_counter("search_backend_failures_total")
+                    performance_monitor.log_structured("warning", f"{backend_type} search failed, trying fallback",
+                                                      pattern=normalized_pattern,
+                                                      error=str(e),
+                                                      backend_type=backend_type,
+                                                      attempt=attempt + 1)
+                break  # Exit retry loop and fall back to command-line tools
+
+        # If we get here, all database backend attempts failed
+        if not search_successful:
+            logger.warning(f"All {backend_type} backend attempts failed, falling back to command-line tools")
+    else:
+        logger.info("No database search backend available, falling back to command-line tools")
+
+    # Fallback to command-line search tools
+    logger.info(f"Using command-line search tools for pattern: '{normalized_pattern}'")
+
+    # Get all available strategies in priority order for fallback
+    all_strategies = settings.available_strategies
+    if not all_strategies:
+        logger.error("No search strategies available - this indicates a configuration issue")
+        return {"error": "No search strategies available. This is unexpected."}
+
+    strategy = all_strategies[0]  # Start with the highest priority strategy
+    logger.info(f"Using search strategy: {strategy.name} (first of {len(all_strategies)} available)")
+    logger.debug(f"Available strategies: {[s.name for s in all_strategies]}")
+
+    # Try each strategy in order until one succeeds
+    last_error = None
+
+    for strategy_index, strategy in enumerate(all_strategies):
+        logger.info(f"Trying search strategy {strategy_index + 1}/{len(all_strategies)}: {strategy.name}")
+
+        # Use performance monitoring context manager for timing
+        if performance_monitor:
+            with performance_monitor.time_operation("search",
+                                                 pattern=normalized_pattern,
+                                                 strategy=strategy.name,
+                                                 file_pattern=file_pattern,
+                                                 case_sensitive=case_sensitive,
+                                                 fuzzy=fuzzy,
+                                                 attempt=strategy_index + 1) as operation:
                 try:
                     # Use async search with progress callback
                     def progress_callback(progress: float):
                         logger.debug(f"Search progress ({strategy.name}): {progress:.1%}")
-                    
+
                     results = await strategy.search_async(
-                        pattern=pattern,
+                        pattern=normalized_pattern,
                         base_path=base_path,
                         case_sensitive=case_sensitive,
                         context_lines=context_lines,
                         file_pattern=file_pattern,
-                        fuzzy=fuzzy,
+                        fuzzy=is_regex,  # Use normalized regex flag
                         progress_callback=progress_callback
                     )
-                    
+
+                    # Count results for metrics
+                    total_matches = sum(len(matches) for matches in results.values())
+                    operation.metadata.update({
+                        "files_searched": len(results),
+                        "total_matches": total_matches,
+                        "strategy": strategy.name
+                    })
+
                     paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
                     lazy_content_manager.cache_search_result(query_key, paginated_results)
                     logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
+
+                    # Log successful search
+                    if performance_monitor:
+                        performance_monitor.log_structured("info", "Search completed successfully",
+                                                         pattern=normalized_pattern,
+                                                         strategy=strategy.name,
+                                                         files_searched=len(results),
+                                                         total_matches=total_matches,
+                                                         duration_ms=operation.duration_ms,
+                                                         attempt=strategy_index + 1)
                     return paginated_results
+
                 except Exception as e:
                     last_error = e
+                    # Log search error but continue to next strategy
+                    if performance_monitor:
+                        performance_monitor.log_structured("warning", "Search strategy failed, trying next",
+                                                         pattern=normalized_pattern,
+                                                         strategy=strategy.name,
+                                                         error=str(e),
+                                                         attempt=strategy_index + 1)
+                        performance_monitor.increment_counter("search_strategy_failures_total")
+
                     # If this isn't the last strategy, continue to the next one
                     if strategy_index < len(all_strategies) - 1:
                         logger.warning(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
                         continue
                     else:
-                        # This was the last strategy, return error
-                        return {"error": f"All search strategies failed. Last error from '{strategy.name}': {e}"}
-        
-        # This should never be reached, but just in case
-        return {"error": f"Unexpected error: no strategies were attempted. Last error: {last_error}"}
+                        # This was the last strategy, return comprehensive error
+                        if performance_monitor:
+                            performance_monitor.log_structured("error", "All search strategies failed",
+                                                             pattern=normalized_pattern,
+                                                             error=str(e),
+                                                             total_attempts=len(all_strategies))
+                            performance_monitor.increment_counter("search_errors_total")
+
+                        return {
+                            "error": f"All search strategies failed. Last error from '{strategy.name}': {e}",
+                            "attempted_strategies": [s.name for s in all_strategies],
+                            "total_attempts": len(all_strategies),
+                            "backend_type": "command_line_fallback"
+                        }
+        else:
+            # Fallback without monitoring - same logic but without performance tracking
+            try:
+                # Use async search with progress callback
+                def progress_callback(progress: float):
+                    logger.debug(f"Search progress ({strategy.name}): {progress:.1%}")
+
+                results = await strategy.search_async(
+                    pattern=normalized_pattern,
+                    base_path=base_path,
+                    case_sensitive=case_sensitive,
+                    context_lines=context_lines,
+                    file_pattern=file_pattern,
+                    fuzzy=is_regex,  # Use normalized regex flag
+                    progress_callback=progress_callback
+                )
+
+                paginated_results = lazy_content_manager.paginate_results(results, page, page_size)
+                lazy_content_manager.cache_search_result(query_key, paginated_results)
+                logger.info(f"Search successful with {strategy.name}. Cached result for query: {query_key}")
+                return paginated_results
+
+            except Exception as e:
+                last_error = e
+                # If this isn't the last strategy, continue to the next one
+                if strategy_index < len(all_strategies) - 1:
+                    logger.warning(f"Search failed with {strategy.name}: {e}. Trying next strategy...")
+                    continue
+                else:
+                    # This was the last strategy, return error
+                    return {
+                        "error": f"All search strategies failed. Last error from '{strategy.name}': {e}",
+                        "attempted_strategies": [s.name for s in all_strategies],
+                        "total_attempts": len(all_strategies),
+                        "backend_type": "command_line_fallback"
+                    }
+
+    # This should never be reached, but just in case
+    return {
+        "error": f"Unexpected error: no strategies were attempted. Last error: {last_error}",
+        "backend_type": "unknown"
+    }
 @mcp.tool()
 def find_files(pattern: str, ctx: Context) -> List[str]:
     """Find files in the project matching a specific glob pattern."""
@@ -1638,99 +1714,238 @@ async def write_to_file(path: str, content: str, line_count: int, ctx: Context) 
         return {"success": False, "error": f"Error writing to file '{path}': {e}"}
 
 @mcp.tool()
-async def apply_diff(args: List[Dict[str, Any]], ctx: Context) -> Dict[str, Any]:
+def apply_diff(path: str, search: str, replace: str, ctx: Context,
+               start_line: Optional[int] = None, end_line: Optional[int] = None,
+               use_regex: bool = False, ignore_case: bool = False) -> Dict[str, Any]:
     """
-    Apply targeted modifications to one or more files by searching for specific sections of content and replacing them.
-    This tool supports both single-file and multi-file operations.
+    Apply targeted modifications to a file by searching for specific text and replacing it.
+
+    This tool provides a simple and intuitive API for file modifications with support for:
+    - Literal text search and replace
+    - Regular expression patterns
+    - Case-insensitive matching
+    - Line range restrictions
+    - File change tracking and versioning
+    - Real-time indexing integration
+    - Comprehensive error handling and rollback
+
+    Args:
+        path: Path to the file to modify (relative to project root)
+        search: The text or pattern to search for
+        replace: The text to replace matches with
+        start_line: Optional starting line number for restricted replacement (1-based)
+        end_line: Optional ending line number for restricted replacement (1-based)
+        use_regex: Whether to treat search as a regular expression pattern
+        ignore_case: Whether to perform case-insensitive matching
+
+    Returns:
+        A dictionary containing the operation result with success status and details
+
+    Examples:
+        # Simple text replacement
+        apply_diff("src/main.py", "old_function()", "new_function()")
+
+        # Regex replacement with line range
+        apply_diff("config.json", r'"version": "\d+\.\d+\.\d+"', '"version": "2.0.0"',
+                   use_regex=True, start_line=1, end_line=10)
+
+        # Case-insensitive replacement
+        apply_diff("README.md", "todo", "TODO", ignore_case=True)
     """
     base_path = ctx.request_context.lifespan_context.base_path
     file_change_tracker = ctx.request_context.lifespan_context.file_change_tracker
+    settings = ctx.request_context.lifespan_context.settings
+    dal_instance = ctx.request_context.lifespan_context.dal
 
+    # Validate project path is set
     if not base_path:
         return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
 
-    results = []
-    for file_arg in args:
-        file_path = file_arg.get('path')
-        diffs = file_arg.get('diff')
+    # Validate required parameters
+    if not path:
+        return {"error": "File path is required."}
 
-        if not file_path or not diffs:
-            results.append({"path": file_path, "success": False, "error": "Invalid arguments: 'path' and 'diff' are required."})
-            continue
+    if search is None:
+        return {"error": "Search text/pattern is required."}
 
-        full_path = os.path.join(base_path, file_path)
+    # Validate line range parameters
+    if start_line is not None and start_line < 1:
+        return {"error": "start_line must be a positive integer (1-based)."}
 
-        if not os.path.exists(full_path):
-            results.append({"path": file_path, "success": False, "error": f"File not found: {file_path}"})
-            continue
+    if end_line is not None and end_line < 1:
+        return {"error": "end_line must be a positive integer (1-based)."}
 
-        try:
-            with open(full_path, 'r', encoding='utf-8') as f:
-                original_content = f.read()
-            
-            # Capture pre-edit state
-            old_content = file_change_tracker._capture_pre_edit_state(full_path)
+    if start_line is not None and end_line is not None and start_line > end_line:
+        return {"error": "start_line cannot be greater than end_line."}
 
-            modified_content = original_content
-            
-            for diff_block in diffs:
-                content_block = diff_block.get('content')
-                start_line = diff_block.get('start_line')
+    # Construct full path and validate
+    full_path = os.path.join(base_path, path)
 
-                if not content_block or start_line is None:
-                    results.append({"path": file_path, "success": False, "error": "Invalid diff block: 'content' and 'start_line' are required."})
-                    continue
+    if not os.path.exists(full_path):
+        return {"success": False, "error": f"File not found: {path}"}
 
-                # Parse the diff block
-                parts = content_block.split('=======')
-                if len(parts) != 2:
-                    results.append({"path": file_path, "success": False, "error": "Invalid diff format. Must contain exactly one '=======' separator."})
-                    continue
-                
-                search_block_raw = parts[0].replace('<<<<<<< SEARCH\n', '').strip()
-                replace_block_raw = parts[1].replace('>>>>>>> REPLACE', '').strip()
+    if not os.path.isfile(full_path):
+        return {"success": False, "error": f"Path is not a file: {path}"}
 
-                # Reconstruct the original lines to find the exact match
-                original_lines = modified_content.splitlines()
-                
-                # Adjust start_line to be 0-indexed for list slicing
-                start_idx = start_line - 1
-                
-                # Determine the end index of the search block
-                search_block_lines = search_block_raw.splitlines()
-                end_idx = start_idx + len(search_block_lines)
+    # Create backup for rollback
+    backup_path = None
+    try:
+        # Create a temporary backup file
+        import tempfile
+        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.backup') as backup_file:
+            with open(full_path, 'r', encoding='utf-8') as original_file:
+                backup_file.write(original_file.read())
+            backup_path = backup_file.name
 
-                # Extract the actual content to be searched from the file based on line numbers
-                content_to_search = "\n".join(original_lines[start_idx:end_idx])
+        # Ensure file is added to metadata store before version tracking
+        file_extension = os.path.splitext(path)[1]
+        file_type = "file"
+        dal_instance.metadata.add_file(path, file_type, file_extension)
 
-                # Perform the replacement
-                if content_to_search == search_block_raw:
-                    # Replace the lines in the list
-                    new_lines = original_lines[:start_idx] + replace_block_raw.splitlines() + original_lines[end_idx:]
-                    modified_content = "\n".join(new_lines)
+        # Read file content
+        with open(full_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        # Capture pre-edit state (use relative path for consistency)
+        old_content = file_change_tracker._capture_pre_edit_state(path)
+
+        # Initialize replacement tracking
+        modified_lines = []
+        replacements_made = 0
+        lines_modified = []
+
+        # Set up regex flags
+        flags = 0
+        if ignore_case:
+            flags |= re.IGNORECASE
+
+        # Process each line
+        for i, line_content in enumerate(lines):
+            line_num = i + 1
+
+            # Check if line is within specified range
+            if (start_line is None or line_num >= start_line) and \
+               (end_line is None or line_num <= end_line):
+
+                original_line = line_content
+                if use_regex:
+                    # Use regex substitution
+                    new_line_content, count = re.subn(search, replace, line_content, flags=flags)
                 else:
-                    results.append({"path": file_path, "success": False, "error": f"Search block mismatch for file '{file_path}' at line {start_line}. Expected:\n---\n{search_block_raw}\n---\nFound:\n---\n{content_to_search}\n---"})
-                    continue # Continue to next diff block for this file
+                    # Use simple string replacement
+                    new_line_content = line_content.replace(search, replace)
+                    count = (len(line_content) - len(new_line_content)) // max(1, len(search))
 
-            with open(full_path, 'w', encoding='utf-8') as f:
-                f.write(modified_content)
-            
-            # Record post-edit state for versioning
-            file_change_tracker._record_post_edit_state(full_path, old_content, modified_content)
-            file_change_tracker.flush()
+                if count > 0:
+                    lines_modified.append(line_num)
 
-            # Enqueue for real-time indexing if RealtimeIndexer is available
-            realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
-            if realtime_indexer:
-                realtime_indexer.enqueue_change(file_path, "update")
-                results.append({"path": file_path, "success": True, "message": f"File '{file_path}' modified successfully and enqueued for update."})
+                replacements_made += count
+                modified_lines.append(new_line_content)
             else:
-                results.append({"path": file_path, "success": True, "message": f"File '{file_path}' modified successfully (real-time indexing not active)."})
+                modified_lines.append(line_content)
 
-        except Exception as e:
-            results.append({"path": file_path, "success": False, "error": f"Error applying diff to file '{file_path}': {e}"})
-    
-    return {"results": results}
+        # Check if any replacements were made
+        if replacements_made == 0:
+            # Clean up backup file
+            if backup_path and os.path.exists(backup_path):
+                os.unlink(backup_path)
+            return {
+                "success": False,
+                "error": f"No occurrences of '{search}' found in the specified range.",
+                "replacements_made": 0,
+                "search_pattern": search,
+                "use_regex": use_regex,
+                "ignore_case": ignore_case
+            }
+
+        # Write modified content back to file
+        modified_content = "".join(modified_lines)
+        with open(full_path, 'w', encoding='utf-8') as f:
+            f.write(modified_content)
+
+        # Record post-edit state (use relative path for consistency)
+        file_change_tracker._record_post_edit_state(path, old_content, modified_content, operation_type="apply_diff")
+        file_change_tracker.flush()
+
+        # Update incremental indexer
+        indexer = IncrementalIndexer(settings)
+        indexer.update_file_metadata(path, full_path)
+        indexer.save_metadata()
+
+        # Enqueue for real-time indexing if available
+        realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
+        if realtime_indexer:
+            realtime_indexer.enqueue_change(path, "update")
+            message = f"Successfully replaced {replacements_made} occurrence(s) in '{path}' and enqueued for update."
+        else:
+            message = f"Successfully replaced {replacements_made} occurrence(s) in '{path}' (real-time indexing not active)."
+
+        # Clean up backup file on success
+        if backup_path and os.path.exists(backup_path):
+            os.unlink(backup_path)
+
+        return {
+            "success": True,
+            "message": message,
+            "replacements_made": replacements_made,
+            "lines_modified": lines_modified,
+            "file_path": path,
+            "search_pattern": search,
+            "use_regex": use_regex,
+            "ignore_case": ignore_case,
+            "line_range": {
+                "start": start_line,
+                "end": end_line
+            } if start_line or end_line else None
+        }
+
+    except re.error as e:
+        # Rollback on regex error
+        _rollback_file(full_path, backup_path)
+        return {"success": False, "error": f"Invalid regular expression: {e}"}
+    except UnicodeDecodeError as e:
+        # Rollback on encoding error
+        _rollback_file(full_path, backup_path)
+        return {"success": False, "error": f"File encoding error: {e}"}
+    except PermissionError as e:
+        # Rollback on permission error
+        _rollback_file(full_path, backup_path)
+        return {"success": False, "error": f"Permission denied: {e}"}
+    except Exception as e:
+        # Rollback on any other error
+        _rollback_file(full_path, backup_path)
+        logger.error(f"Error applying diff to file '{path}': {e}", exc_info=True)
+        return {"success": False, "error": f"Error applying diff to file '{path}': {e}"}
+
+
+def _rollback_file(original_path: str, backup_path: str) -> bool:
+    """
+    Rollback a file to its backup state.
+
+    Args:
+        original_path: Path to the original file
+        backup_path: Path to the backup file
+
+    Returns:
+        True if rollback was successful, False otherwise
+    """
+    if not backup_path or not os.path.exists(backup_path):
+        return False
+
+    try:
+        with open(backup_path, 'r', encoding='utf-8') as backup_file:
+            backup_content = backup_file.read()
+
+        with open(original_path, 'w', encoding='utf-8') as original_file:
+            original_file.write(backup_content)
+
+        # Clean up backup file
+        os.unlink(backup_path)
+        logger.info(f"Successfully rolled back file: {original_path}")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to rollback file {original_path}: {e}")
+        return False
 
 @mcp.tool()
 async def insert_content(path: str, line: int, content: str, ctx: Context) -> Dict[str, Any]:
@@ -2008,22 +2223,85 @@ def get_file_history(file_path: str, ctx: Context) -> Dict[str, Any]:
     """Retrieves the history of changes for a given file path."""
     base_path = ctx.request_context.lifespan_context.base_path
     file_change_tracker = ctx.request_context.lifespan_context.file_change_tracker
+    dal_instance = ctx.request_context.lifespan_context.dal
 
     if not base_path:
         return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
 
-    full_path = os.path.join(base_path, file_path)
+    # Normalize the file path
+    norm_path = os.path.normpath(file_path)
+
+    # Check for path traversal attempts
+    if "..\\" in norm_path or "../" in norm_path or norm_path.startswith(".."):
+        return {"error": f"Invalid file path: {file_path} (directory traversal not allowed)"}
+
+    # Ensure the path is relative to base_path
+    if os.path.isabs(norm_path):
+        # If absolute path is provided, make it relative to base_path
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
+    full_path = os.path.join(base_path, norm_path)
 
     if not os.path.exists(full_path):
         return {"success": False, "error": f"File not found: {file_path}"}
 
     try:
-        # Use relative path for consistency with storage
-        history = file_change_tracker.get_file_history(file_path)
-        return {"success": True, "file_path": file_path, "history": history}
+        logger.info(f"Processing get_file_history for file: {norm_path}")
+
+        # Ensure file is registered in metadata store before querying history
+        file_extension = os.path.splitext(norm_path)[1]
+        file_type = "file"
+        logger.debug(f"Attempting to register file {norm_path} with extension {file_extension}")
+        registration_success = dal_instance.metadata.add_file(norm_path, file_type, file_extension)
+
+        if not registration_success:
+            logger.warning(f"Failed to register file {norm_path} in metadata store")
+        else:
+            logger.debug(f"Successfully registered file {norm_path}")
+
+        # Create initial version if this is the first time accessing history for this file
+        # This ensures we have at least one version to show in the history
+        file_info = dal_instance.metadata.get_file_info(norm_path)
+        logger.debug(f"File info for {norm_path}: {file_info}")
+
+        if file_info:
+            # Check if file has any versions
+            existing_versions = dal_instance.metadata.get_file_versions_for_path(norm_path)
+            logger.debug(f"Existing versions for {norm_path}: {len(existing_versions)} found")
+
+            if not existing_versions:
+                # Create initial version
+                logger.info(f"Creating initial version for file {norm_path}")
+                old_content = file_change_tracker._capture_pre_edit_state(norm_path)
+                if old_content is not None:
+                    # Read current content
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        current_content = f.read()
+
+                    logger.debug(f"Captured content for initial version, length: {len(current_content)}")
+                    # Record initial version
+                    file_change_tracker._record_post_edit_state(norm_path, None, current_content, operation_type="initial_version")
+                    file_change_tracker.flush()
+                    logger.info(f"Created initial version for {norm_path}")
+                else:
+                    logger.warning(f"Failed to capture pre-edit state for {norm_path}")
+            else:
+                logger.debug(f"File {norm_path} already has {len(existing_versions)} versions")
+        else:
+            logger.warning(f"File {norm_path} is not registered in metadata store")
+
+        # Use normalized relative path for consistency with storage
+        logger.debug(f"Retrieving history for {norm_path}")
+        history = file_change_tracker.get_file_history(norm_path)
+        logger.info(f"Retrieved {len(history)} history items for {norm_path}")
+
+        return {"success": True, "file_path": norm_path, "history": history}
     except Exception as e:
-        logger.error(f"Error retrieving file history for '{file_path}': {e}", exc_info=True)
-        return {"success": False, "error": f"Error retrieving file history for '{file_path}': {e}"}
+        logger.error(f"Error retrieving file history for '{norm_path}': {e}", exc_info=True)
+        return {"success": False, "error": f"Error retrieving file history for '{norm_path}': {e}"}
 
 @mcp.tool()
 def get_settings_info(ctx: Context) -> Dict[str, Any]:
@@ -2277,30 +2555,357 @@ def get_incremental_indexing_stats(ctx: Context) -> Dict[str, Any]:
 
 @mcp.tool()
 def get_memory_profile() -> Dict[str, Any]:
-    """Get comprehensive memory profiling statistics."""
-    global memory_profiler, lazy_content_manager
-    
-    if memory_profiler is None:
-        return {
-            "error": "Memory profiler not initialized. Please set a project path first.",
-            "initialized": False
+    """
+    Get comprehensive memory profiling statistics with robust error handling and defensive programming.
+
+    This function provides detailed memory usage information including:
+    - Current memory snapshot with process and heap statistics
+    - Memory limits and violations with actionable recommendations
+    - Content manager statistics with timeout protection
+    - Performance metrics and monitoring status
+    - Comprehensive error handling, diagnostics, and graceful degradation
+    - Initialization validation and recovery mechanisms
+
+    Returns:
+        Dictionary containing memory profile data or error information with recovery suggestions
+    """
+    import time
+    import psutil
+    import gc
+    import signal
+    from contextlib import contextmanager
+    from typing import Optional, Dict, Any
+
+    global memory_profiler, lazy_content_manager, memory_aware_manager, _current_project_path
+
+    # Initialize result structure with comprehensive metadata
+    result = {
+        "timestamp": time.time(),
+        "request_id": f"memory_profile_{int(time.time() * 1000)}",
+        "diagnostics": {},
+        "warnings": [],
+        "errors": [],
+        "initialization_status": {},
+        "recovery_actions": []
+    }
+
+    def add_diagnostic(key: str, value: Any, level: str = "info"):
+        """Add diagnostic information to the result."""
+        result["diagnostics"][key] = {
+            "value": value,
+            "level": level,
+            "timestamp": time.time()
         }
-    
+
+    def add_warning(message: str, details: Optional[Dict] = None):
+        """Add a warning to the result."""
+        warning = {
+            "message": message,
+            "timestamp": time.time(),
+            "severity": "warning"
+        }
+        if details:
+            warning["details"] = details
+        result["warnings"].append(warning)
+        logger.warning(f"Memory profile warning: {message}")
+
+    def add_error(message: str, exception: Optional[Exception] = None, details: Optional[Dict] = None):
+        """Add an error to the result."""
+        error = {
+            "message": message,
+            "timestamp": time.time(),
+            "severity": "error"
+        }
+        if exception:
+            error["exception_type"] = type(exception).__name__
+            error["exception_message"] = str(exception)
+        if details:
+            error["details"] = details
+        result["errors"].append(error)
+        logger.error(f"Memory profile error: {message}", exc_info=exception)
+
+    def add_recovery_action(action: str, priority: str = "medium", details: Optional[Dict] = None):
+        """Add a recovery action to the result."""
+        recovery = {
+            "action": action,
+            "priority": priority,
+            "timestamp": time.time()
+        }
+        if details:
+            recovery["details"] = details
+        result["recovery_actions"].append(recovery)
+
+    @contextmanager
+    def timeout_context(seconds: float):
+        """Context manager for timeout handling."""
+        def timeout_handler(signum, frame):
+            raise TimeoutError(f"Operation timed out after {seconds} seconds")
+
+        signal.signal(signal.SIGALRM, timeout_handler)
+        signal.alarm(int(seconds))
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+
+    def safe_get_memory_stats(manager, timeout_seconds: float = 5.0):
+        """Safely get memory stats with timeout and error handling."""
+        if manager is None:
+            return {
+                "loaded_files": 0,
+                "query_cache_size": 0,
+                "total_managed_files": 0,
+                "manager_unavailable": True
+            }
+
+        try:
+            with timeout_context(timeout_seconds):
+                stats = manager.get_memory_stats()
+                if stats is None:
+                    raise ValueError("Memory stats returned None")
+                return stats
+        except TimeoutError as e:
+            add_warning("Content stats collection timed out", {
+                "timeout_seconds": timeout_seconds,
+                "impact": "Using fallback statistics",
+                "recovery": "Consider increasing timeout or checking manager health"
+            })
+            return {
+                "loaded_files": 0,
+                "query_cache_size": 0,
+                "total_managed_files": 0,
+                "collection_timeout": True
+            }
+        except Exception as e:
+            add_error("Failed to collect content statistics", e, {
+                "impact": "Content statistics unavailable",
+                "fallback": "Using default values"
+            })
+            return {
+                "loaded_files": 0,
+                "query_cache_size": 0,
+                "total_managed_files": 0,
+                "collection_error": str(e)
+            }
+
+    def validate_initialization():
+        """Comprehensive initialization validation."""
+        init_status = {}
+
+        # Check project path
+        if not _current_project_path:
+            init_status["project_path"] = False
+            add_error("Project path not set", details={
+                "global_project_path": _current_project_path,
+                "suggestion": "Use set_project_path to configure a project directory first"
+            })
+            add_recovery_action("Call set_project_path with a valid project directory", "high")
+        else:
+            init_status["project_path"] = True
+            add_diagnostic("project_path", _current_project_path)
+
+        # Check lazy content manager
+        if lazy_content_manager is None:
+            init_status["lazy_content_manager"] = False
+            add_warning("Lazy content manager not initialized", {
+                "impact": "Content statistics will be unavailable",
+                "recovery": "Manager should be initialized during server startup"
+            })
+            add_recovery_action("Ensure LazyContentManager is properly initialized", "medium")
+        else:
+            init_status["lazy_content_manager"] = True
+            add_diagnostic("lazy_content_manager", "available")
+
+        # Check memory profiler
+        if memory_profiler is None:
+            init_status["memory_profiler"] = False
+            add_error("Memory profiler not initialized", details={
+                "profiler_status": "None",
+                "suggestion": "Memory profiler should be initialized during set_project_path"
+            })
+            add_recovery_action("Re-initialize memory profiler in set_project_path", "high")
+        else:
+            init_status["memory_profiler"] = True
+            add_diagnostic("memory_profiler", "available")
+
+        # Check memory-aware manager
+        if memory_aware_manager is None:
+            init_status["memory_aware_manager"] = False
+            add_warning("Memory-aware manager not initialized", {
+                "impact": "Automatic memory management may not work properly",
+                "recovery": "Manager should be created during profiler initialization"
+            })
+            add_recovery_action("Create MemoryAwareLazyContentManager during initialization", "low")
+        else:
+            init_status["memory_aware_manager"] = True
+            add_diagnostic("memory_aware_manager", "available")
+
+        result["initialization_status"] = init_status
+        return all(init_status.values())
+
+    def collect_system_info():
+        """Collect system-level information safely."""
+        add_diagnostic("system_info_collection", "starting")
+
+        try:
+            system_memory = psutil.virtual_memory()
+            system_stats = {
+                "total_mb": system_memory.total / 1024 / 1024,
+                "available_mb": system_memory.available / 1024 / 1024,
+                "used_mb": system_memory.used / 1024 / 1024,
+                "percentage": system_memory.percent
+            }
+            add_diagnostic("system_memory", system_stats, "success")
+
+            # Get CPU info
+            cpu_percent = psutil.cpu_percent(interval=0.1)
+            add_diagnostic("cpu_usage", f"{cpu_percent}%", "info")
+
+            return system_stats
+        except Exception as e:
+            add_warning("Could not collect system information", {
+                "error": str(e),
+                "impact": "System metrics unavailable"
+            })
+            return None
+
     try:
-        # Get current memory stats from lazy content manager
-        content_stats = lazy_content_manager.get_memory_stats()
-        
-        # Take a memory snapshot with current stats
-        snapshot = memory_profiler.take_snapshot(
-            loaded_files=content_stats['loaded_files'],
-            cached_queries=content_stats['query_cache_size']
-        )
-        
-        # Get comprehensive profiler stats
-        profiler_stats = memory_profiler.get_stats()
-        
-        return {
-            "initialized": True,
+        logger.info("Starting comprehensive memory profile collection")
+
+        # Step 1: Validate initialization comprehensively
+        add_diagnostic("initialization_validation", "starting")
+        initialization_ok = validate_initialization()
+
+        if not initialization_ok:
+            result["status"] = "initialization_failed"
+            result["collection_duration_ms"] = (time.time() - result["timestamp"]) * 1000
+            return result
+
+        # Step 2: Collect system information
+        system_info = collect_system_info()
+
+        # Step 3: Collect content manager statistics safely
+        add_diagnostic("content_stats_collection", "starting")
+        content_stats = safe_get_memory_stats(lazy_content_manager)
+
+        # Step 4: Take memory snapshot with comprehensive error handling
+        add_diagnostic("snapshot_collection", "starting")
+
+        try:
+            snapshot = memory_profiler.take_snapshot(
+                loaded_files=content_stats.get('loaded_files', 0),
+                cached_queries=content_stats.get('query_cache_size', 0)
+            )
+            add_diagnostic("snapshot", "successful", "success")
+
+        except psutil.NoSuchProcess as e:
+            add_error("Process monitoring failed - process may have ended", e, {
+                "impact": "Memory statistics unavailable",
+                "suggestion": "Restart the server",
+                "recovery": "Check if server process is still running"
+            })
+            add_recovery_action("Restart the MCP server", "high")
+            result["status"] = "process_error"
+            result["collection_duration_ms"] = (time.time() - result["timestamp"]) * 1000
+            return result
+
+        except psutil.AccessDenied as e:
+            add_error("Access denied for memory monitoring", e, {
+                "impact": "Limited memory statistics available",
+                "suggestion": "Check system permissions",
+                "recovery": "Run server with appropriate permissions or check psutil access"
+            })
+            add_recovery_action("Check system permissions for process monitoring", "high")
+
+            # Create minimal snapshot for partial functionality
+            snapshot = type('MinimalSnapshot', (), {
+                'timestamp': time.time(),
+                'process_memory_mb': 0.0,
+                'heap_size_mb': 0.0,
+                'peak_memory_mb': 0.0,
+                'gc_objects': 0,
+                'gc_collections': (0, 0, 0),
+                'active_threads': threading.active_count() if 'threading' in globals() else 0,
+                'loaded_files': content_stats.get('loaded_files', 0),
+                'cached_queries': content_stats.get('query_cache_size', 0)
+            })()
+
+        except Exception as e:
+            add_error("Failed to take memory snapshot", e, {
+                "impact": "Memory snapshot unavailable",
+                "recovery": "Check memory profiler health and psutil installation"
+            })
+            add_recovery_action("Verify memory profiler and psutil are working correctly", "high")
+            result["status"] = "snapshot_error"
+            result["collection_duration_ms"] = (time.time() - result["timestamp"]) * 1000
+            return result
+
+        # Step 5: Get comprehensive profiler statistics
+        add_diagnostic("profiler_stats_collection", "starting")
+
+        try:
+            profiler_stats = memory_profiler.get_stats()
+            add_diagnostic("profiler_stats", "collected", "success")
+
+        except Exception as e:
+            add_error("Failed to collect profiler statistics", e, {
+                "impact": "Detailed profiler stats unavailable",
+                "recovery": "Check profiler internal state"
+            })
+            add_recovery_action("Investigate memory profiler internal state", "medium")
+            profiler_stats = {
+                "error": "Collection failed",
+                "partial_data": True
+            }
+
+        # Step 6: Check for memory limit violations with recommendations
+        add_diagnostic("limit_violations_check", "starting")
+
+        try:
+            violations = memory_profiler.check_limits(snapshot)
+            violation_count = sum(1 for v in violations.values() if v)
+
+            if violation_count > 0:
+                violation_details = []
+                recommendations = []
+
+                if violations.get('soft_limit', False):
+                    violation_details.append("Soft memory limit exceeded")
+                    recommendations.append("Consider triggering garbage collection")
+                    add_recovery_action("Trigger manual garbage collection", "medium")
+
+                if violations.get('hard_limit', False):
+                    violation_details.append("Hard memory limit exceeded")
+                    recommendations.append("Immediate action required - consider restarting")
+                    add_recovery_action("Restart server or increase memory limits", "high")
+
+                if violations.get('max_loaded_files', False):
+                    violation_details.append("Maximum loaded files exceeded")
+                    recommendations.append("Unload unused files from memory")
+                    add_recovery_action("Unload least recently used files", "medium")
+
+                if violations.get('max_cached_queries', False):
+                    violation_details.append("Maximum cached queries exceeded")
+                    recommendations.append("Clear query cache")
+                    add_recovery_action("Clear query cache to free memory", "low")
+
+                add_warning(f"Memory limit violations detected: {violation_count}", {
+                    "violations": violations,
+                    "violation_details": violation_details,
+                    "recommendations": recommendations
+                })
+
+            add_diagnostic("limit_violations", violations)
+
+        except Exception as e:
+            add_warning("Could not check memory limit violations", {
+                "error": str(e),
+                "impact": "Violation status unknown"
+            })
+
+        # Step 7: Build final result with comprehensive data
+        result.update({
+            "status": "success",
             "current_snapshot": {
                 "timestamp": snapshot.timestamp,
                 "process_memory_mb": snapshot.process_memory_mb,
@@ -2313,13 +2918,58 @@ def get_memory_profile() -> Dict[str, Any]:
                 "cached_queries": snapshot.cached_queries
             },
             "profiler_stats": profiler_stats,
-            "content_manager_stats": content_stats
+            "content_manager_stats": content_stats,
+            "system_info": system_info,
+            "project_path": _current_project_path,
+            "collection_duration_ms": (time.time() - result["timestamp"]) * 1000
+        })
+
+        # Step 8: Generate comprehensive summary and recommendations
+        warning_count = len(result["warnings"])
+        error_count = len(result["errors"])
+
+        result["summary"] = {
+            "total_warnings": warning_count,
+            "total_errors": error_count,
+            "data_completeness": "full" if error_count == 0 else "partial" if warning_count == 0 else "degraded",
+            "recommendations": [],
+            "health_score": max(0, 100 - (error_count * 20) - (warning_count * 5))
         }
+
+        # Add intelligent recommendations based on findings
+        if error_count > 0:
+            result["summary"]["recommendations"].append("Review error details and address underlying issues")
+        if warning_count > 0:
+            result["summary"]["recommendations"].append("Review warnings for potential optimizations")
+
+        # Memory-specific recommendations
+        if snapshot.process_memory_mb > (memory_profiler.limits.hard_limit_mb * 0.9):
+            result["summary"]["recommendations"].append("Critical: Memory usage near hard limit - immediate action required")
+            add_recovery_action("Reduce memory usage or increase limits immediately", "critical")
+        elif snapshot.process_memory_mb > (memory_profiler.limits.soft_limit_mb * 0.9):
+            result["summary"]["recommendations"].append("High memory usage - consider cleanup")
+            add_recovery_action("Trigger memory cleanup to prevent hard limit violation", "medium")
+
+        # Performance recommendations
+        if result["collection_duration_ms"] > 1000:  # Over 1 second
+            result["summary"]["recommendations"].append("Slow collection detected - investigate performance bottlenecks")
+
+        logger.info(f"Memory profile collection completed successfully in {result['collection_duration_ms']:.2f}ms")
+        return result
+
     except Exception as e:
-        return {
-            "error": f"Error getting memory profile: {e}",
-            "initialized": True
-        }
+        # Catch-all exception handler for unexpected errors
+        add_error("Unexpected error during memory profile collection", e, {
+            "impact": "Memory profile collection failed completely",
+            "suggestion": "Check server logs for detailed error information"
+        })
+        add_recovery_action("Check server logs and restart if necessary", "high")
+
+        result["status"] = "unexpected_error"
+        result["collection_duration_ms"] = (time.time() - result["timestamp"]) * 1000
+
+        logger.error("Unexpected error in get_memory_profile", exc_info=True)
+        return result
 
 @mcp.tool()
 def trigger_memory_cleanup() -> Dict[str, Any]:
