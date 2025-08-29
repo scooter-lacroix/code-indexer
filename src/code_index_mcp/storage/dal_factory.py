@@ -1,5 +1,4 @@
-      "args": [
-        "git+https://github.com/scooter-lacroix/code-indexer.git""""
+"""
 Factory for Data Access Layer (DAL) instances.
 This module provides a central point for creating and configuring
 different DAL implementations based on application settings.
