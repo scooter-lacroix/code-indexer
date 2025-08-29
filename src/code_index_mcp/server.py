@@ -16,6 +16,7 @@ import tempfile
 import subprocess
 import time
 import asyncio
+import threading
 import re
 from datetime import datetime # Import datetime
 from .lazy_loader import LazyContentManager
@@ -825,7 +826,7 @@ async def search_code_advanced(
                             # Elasticsearch-specific parameters
                             search_params = {
                                 "query": normalized_pattern,
-                                "is_sqlite_pattern": is_regex,
+                                "is_sqlite_pattern": is_regex,  # Elasticsearch expects is_sqlite_pattern
                             }
 
                             # Add optional Elasticsearch-specific parameters
@@ -842,18 +843,29 @@ async def search_code_advanced(
                             results_list = search_backend.search_content(**search_params)
 
                         elif SearchBackendSelector.is_sqlite_backend(search_backend):
-                            # SQLite-specific parameters
+                            # SQLite-specific parameters - SQLite expects is_regex
                             results_list = search_backend.search_content(
                                 query=normalized_pattern,
                                 is_regex=is_regex
                             )
 
                         else:
-                            # Generic backend handling
-                            results_list = search_backend.search_content(
-                                query=normalized_pattern,
-                                is_regex=is_regex
-                            )
+                            # Generic backend handling - try is_regex first, fall back to is_sqlite_pattern
+                            try:
+                                results_list = search_backend.search_content(
+                                    query=normalized_pattern,
+                                    is_regex=is_regex
+                                )
+                            except TypeError as e:
+                                if "is_regex" in str(e):
+                                    # Fallback to is_sqlite_pattern for backends that expect it
+                                    logger.debug(f"Backend doesn't support is_regex, trying is_sqlite_pattern: {e}")
+                                    results_list = search_backend.search_content(
+                                        query=normalized_pattern,
+                                        is_sqlite_pattern=is_regex
+                                    )
+                                else:
+                                    raise
 
                         # Process and standardize results with enhanced error handling
                         standardized_results = SearchResultProcessor.standardize_results(results_list, backend_type)
@@ -965,14 +977,40 @@ async def search_code_advanced(
         logger.error("No search strategies available - this indicates a configuration issue")
         return {"error": "No search strategies available. This is unexpected."}
 
-    strategy = all_strategies[0]  # Start with the highest priority strategy
-    logger.info(f"Using search strategy: {strategy.name} (first of {len(all_strategies)} available)")
-    logger.debug(f"Available strategies: {[s.name for s in all_strategies]}")
+    # Filter out database strategies since we already tried them
+    # Only use command-line based strategies (zoekt, ugrep, ripgrep, ag, grep, basic)
+    command_line_strategies = [
+        strategy for strategy in all_strategies
+        if strategy.name.lower() in ['zoekt', 'ugrep', 'ripgrep', 'ag', 'grep', 'basic']
+    ]
 
-    # Try each strategy in order until one succeeds
+    if not command_line_strategies:
+        logger.warning("No command-line search strategies available, falling back to basic search")
+        command_line_strategies = [strategy for strategy in all_strategies if strategy.name.lower() == 'basic']
+
+    if not command_line_strategies:
+        logger.error("No suitable search strategies found")
+        return {"error": "No suitable search strategies available."}
+
+    # Prioritize zoekt for Python files since it works well with them
+    if file_pattern and ('*.py' in file_pattern or file_pattern.endswith('.py')):
+        # Try to find zoekt first for Python files
+        zoekt_strategy = next((s for s in command_line_strategies if s.name.lower() == 'zoekt'), None)
+        if zoekt_strategy:
+            strategy = zoekt_strategy
+            logger.info(f"Prioritizing zoekt for Python file search: {file_pattern}")
+        else:
+            strategy = command_line_strategies[0]
+    else:
+        strategy = command_line_strategies[0]  # Start with the highest priority command-line strategy
+
+    logger.info(f"Using search strategy: {strategy.name} (first of {len(command_line_strategies)} available)")
+    logger.debug(f"Available command-line strategies: {[s.name for s in command_line_strategies]}")
+
+    # Try each command-line strategy in order until one succeeds
     last_error = None
 
-    for strategy_index, strategy in enumerate(all_strategies):
+    for strategy_index, strategy in enumerate(command_line_strategies):
         logger.info(f"Trying search strategy {strategy_index + 1}/{len(all_strategies)}: {strategy.name}")
 
         # Use performance monitoring context manager for timing
@@ -2825,7 +2863,7 @@ def get_memory_profile() -> Dict[str, Any]:
                 'peak_memory_mb': 0.0,
                 'gc_objects': 0,
                 'gc_collections': (0, 0, 0),
-                'active_threads': threading.active_count() if 'threading' in globals() else 0,
+                'active_threads': threading.active_count(),
                 'loaded_files': content_stats.get('loaded_files', 0),
                 'cached_queries': content_stats.get('query_cache_size', 0)
             })()
