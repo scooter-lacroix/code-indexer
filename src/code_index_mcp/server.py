@@ -46,6 +46,7 @@ from .constants import (
 from .storage.dal_factory import get_dal_instance
 from .storage.storage_interface import DALInterface, SearchInterface # Import DALInterface and SearchInterface
 from .logger_config import logger # Import the centralized logger
+from .file_reader import SmartFileReader, ReadingStrategy, FileSizeCategory # Import SmartFileReader and enums
 
 # Create the MCP server
 mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
@@ -311,15 +312,21 @@ def get_config() -> str:
 
 @mcp.resource("files://{file_path}")
 def get_file_content(file_path: str) -> str:
-    """Get the content of a specific file using lazy loading."""
-    ctx = mcp.get_context()
+    """Get the content of a specific file using enhanced SmartFileReader."""
+    # Handle both MCP context and direct calls
+    try:
+        ctx = mcp.get_context()
+        # Get the base path from context
+        base_path = ctx.request_context.lifespan_context.base_path
 
-    # Get the base path from context
-    base_path = ctx.request_context.lifespan_context.base_path
-
-    # Check if base_path is set
-    if not base_path:
-        return "Error: Project path not set. Please use set_project_path to set a project directory first."
+        # Check if base_path is set
+        if not base_path:
+            return "Error: Project path not set. Please use set_project_path to set a project directory first."
+    except Exception:
+        # Fallback for non-MCP calls - use global project path
+        base_path = _current_project_path
+        if not base_path:
+            return "Error: Project path not set. Please use set_project_path to set a project directory first."
 
     # Handle absolute paths (especially Windows paths starting with drive letters)
     if os.path.isabs(file_path) or (len(file_path) > 1 and file_path[1] == ':'):
@@ -341,14 +348,18 @@ def get_file_content(file_path: str) -> str:
     if not real_full_path.startswith(real_base_path):
         return f"Error: Access denied. File path must be within project directory."
 
-    # Use LazyContentManager to load content
-    lazy_content = lazy_content_manager.get_file_content(full_path)
-    content = lazy_content.content
-
-    if content is None:
-        return f"Error reading file: Unable to decode or access"
-
-    return content
+    try:
+        # Use SmartFileReader for enhanced content loading with better error handling
+        smart_reader = SmartFileReader(base_path)
+        content = smart_reader.read_content(full_path)
+        
+        if content is None:
+            return f"Error reading file: Unable to decode or access"
+        
+        return content
+    except Exception as e:
+        logger.error(f"Error reading file {full_path}: {e}", exc_info=True)
+        return f"Error reading file: {e}"
 
 @mcp.resource("structure://project")
 def get_project_structure() -> str:
@@ -979,10 +990,13 @@ def find_files(pattern: str, ctx: Context) -> List[str]:
 @mcp.tool()
 def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
     """
-    Get a summary of a specific file using lazy loading, including:
-    - Line count
+    Get a comprehensive summary of a specific file using SmartFileReader, including:
+    - Line count and basic file information
     - Function/class definitions (for supported languages)
     - Import statements
+    - Error detection and file health analysis
+    - File metadata and comprehensive file information
+    - Reading strategy information
     - Basic complexity metrics
     """
     base_path = ctx.request_context.lifespan_context.base_path
@@ -991,17 +1005,36 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
     if not base_path:
         return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
 
-    # Normalize the file path
+    # Normalize the file path and ensure it's relative to base_path
     norm_path = os.path.normpath(file_path)
     if norm_path.startswith('..'):
         return {"error": f"Invalid file path: {file_path}"}
 
+    # Ensure the path is relative to base_path
+    if os.path.isabs(norm_path):
+        # If absolute path is provided, make it relative to base_path
+        try:
+            norm_path = os.path.relpath(norm_path, base_path)
+        except ValueError:
+            return {"error": f"File path is not within project directory: {file_path}"}
+
     full_path = os.path.join(base_path, norm_path)
 
     try:
-        # Get file content using lazy loading
-        lazy_content = lazy_content_manager.get_file_content(full_path)
-        content = lazy_content.content
+        # Initialize SmartFileReader for enhanced file analysis
+        smart_reader = SmartFileReader(base_path)
+        
+        # Get comprehensive file information
+        file_info = smart_reader.get_file_info(full_path)
+        
+        # Get file metadata
+        metadata = smart_reader.read_metadata(full_path)
+        
+        # Detect errors in the file
+        errors_result = smart_reader.detect_errors(full_path)
+        
+        # Get file content using SmartFileReader (enhanced lazy loading)
+        content = smart_reader.read_content(full_path)
         
         if content is None:
             return {"error": "Unable to read file content"}
@@ -1013,14 +1046,93 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
         # File extension for language-specific analysis
         _, ext = os.path.splitext(norm_path)
 
+        # Start building enhanced summary
         summary = {
             "file_path": norm_path,
             "line_count": line_count,
             "size_bytes": os.path.getsize(full_path),
             "extension": ext,
+            # Add comprehensive file information
+            "file_info": {
+                # Handle strategy_used field with proper type checking
+                "strategy_used": (
+                    str(file_info) if isinstance(file_info, (ReadingStrategy, FileSizeCategory))
+                    else (
+                        str(file_info.get('strategy_used', 'unknown'))
+                        if isinstance(file_info, dict)
+                        else (
+                            getattr(file_info, 'strategy_used', 'unknown').value
+                            if hasattr(getattr(file_info, 'strategy_used', 'unknown'), 'value')
+                            else str(getattr(file_info, 'strategy_used', 'unknown'))
+                        )
+                    )
+                ),
+                # Handle file_size_category field with proper type checking
+                "file_size_category": (
+                    str(file_info) if isinstance(file_info, (ReadingStrategy, FileSizeCategory))
+                    else (
+                        str(file_info.get('file_size_category', 'unknown'))
+                        if isinstance(file_info, dict)
+                        else (
+                            getattr(file_info, 'file_size_category', 'unknown').value
+                            if hasattr(getattr(file_info, 'file_size_category', 'unknown'), 'value')
+                            else str(getattr(file_info, 'file_size_category', 'unknown'))
+                        )
+                    )
+                ),
+                # Handle other fields with proper type checking
+                "is_binary": (
+                    file_info.get('is_binary', False)
+                    if isinstance(file_info, dict)
+                    else getattr(file_info, 'is_binary', False)
+                ),
+                "encoding": (
+                    file_info.get('encoding', 'unknown')
+                    if isinstance(file_info, dict)
+                    else getattr(file_info, 'encoding', 'unknown')
+                ),
+                "estimated_read_time_ms": (
+                    file_info.get('estimated_read_time_ms', 0)
+                    if isinstance(file_info, dict)
+                    else getattr(file_info, 'estimated_read_time_ms', 0)
+                ),
+                "memory_efficiency_score": (
+                    file_info.get('memory_efficiency_score', 0.0)
+                    if isinstance(file_info, dict)
+                    else getattr(file_info, 'memory_efficiency_score', 0.0)
+                ),
+            },
+            # Add file metadata - handle dict returns properly
+            "metadata": {
+                "last_modified": metadata.get('last_modified', None) if isinstance(metadata, dict) else (metadata.last_modified.isoformat() if metadata and hasattr(metadata, 'last_modified') and metadata.last_modified else None),
+                "created": metadata.get('created', None) if isinstance(metadata, dict) else (metadata.created.isoformat() if metadata and hasattr(metadata, 'created') and metadata.created else None),
+                "accessed": metadata.get('accessed', None) if isinstance(metadata, dict) else (metadata.accessed.isoformat() if metadata and hasattr(metadata, 'accessed') and metadata.accessed else None),
+                "is_symlink": metadata.get('is_symlink', False) if isinstance(metadata, dict) else getattr(metadata, 'is_symlink', False),
+                "is_hidden": metadata.get('is_hidden', False) if isinstance(metadata, dict) else getattr(metadata, 'is_hidden', False),
+                "owner": metadata.get('owner', None) if isinstance(metadata, dict) else getattr(metadata, 'owner', None),
+                "group": metadata.get('group', None) if isinstance(metadata, dict) else getattr(metadata, 'group', None),
+                "permissions": metadata.get('permissions', None) if isinstance(metadata, dict) else getattr(metadata, 'permissions', None),
+                "inode": metadata.get('inode', None) if isinstance(metadata, dict) else getattr(metadata, 'inode', None),
+            } if metadata else None,
+            # Add error detection results - handle dict returns properly
+            "errors": {
+                "has_errors": errors_result.get('has_errors', False) if isinstance(errors_result, dict) else getattr(errors_result, 'has_errors', False),
+                "error_count": len(errors_result.get('errors', [])) if isinstance(errors_result, dict) else (len(errors_result.errors) if hasattr(errors_result, 'errors') and errors_result.errors else 0),
+                "error_types": list(set(error.get('error_type', 'unknown') for error in errors_result.get('errors', []))) if isinstance(errors_result, dict) else (list(set(error.error_type for error in errors_result.errors)) if hasattr(errors_result, 'errors') and errors_result.errors else []),
+                "errors": [
+                    {
+                        "error_type": error.get('error_type', 'unknown') if isinstance(error, dict) else getattr(error, 'error_type', 'unknown'),
+                        "severity": error.get('severity', 'error') if isinstance(error, dict) else (error.severity.value if hasattr(error, 'severity') and hasattr(error.severity, 'value') else str(getattr(error, 'severity', 'error'))),
+                        "message": error.get('message', '') if isinstance(error, dict) else getattr(error, 'message', ''),
+                        "line_number": error.get('line_number', None) if isinstance(error, dict) else getattr(error, 'line_number', None),
+                        "column_number": error.get('column_number', None) if isinstance(error, dict) else getattr(error, 'column_number', None),
+                    }
+                    for error in (errors_result.get('errors', []) if isinstance(errors_result, dict) else (errors_result.errors if hasattr(errors_result, 'errors') else []))
+                ],
+            } if errors_result else None,
         }
 
-        # Language-specific analysis
+        # Language-specific analysis (enhanced with SmartFileReader insights)
         if ext == '.py':
             # Python analysis
             imports = []
@@ -1055,6 +1167,12 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
                 "import_count": len(imports),
                 "class_count": len(classes),
                 "function_count": len(functions),
+                # Add Python-specific complexity metrics
+                "complexity_metrics": {
+                    "cyclomatic_complexity_estimate": len(functions) + len(classes),  # Simple estimate
+                    "nesting_level_max": _estimate_max_nesting_level(lines),
+                    "has_docstrings": _has_docstrings(lines),
+                }
             })
 
         elif ext in ['.js', '.jsx', '.ts', '.tsx']:
@@ -1095,11 +1213,59 @@ def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
                 "import_count": len(imports),
                 "class_count": len(classes),
                 "function_count": len(functions),
+                # Add JavaScript/TypeScript-specific complexity metrics
+                "complexity_metrics": {
+                    "arrow_functions": len([f for f in functions if '=>' in f.get('content', '')]),
+                    "async_functions": len([f for f in functions if 'async ' in f.get('content', '')]),
+                    "has_es6_imports": len(imports) > 0 and any('import' in imp for imp in imports),
+                }
             })
+
+        # Add general file analysis
+        summary["general_analysis"] = {
+            "non_empty_lines": len([line for line in lines if line.strip()]),
+            "comment_lines": len([line for line in lines if line.strip().startswith('#') or line.strip().startswith('//') or line.strip().startswith('/*')]),
+            "blank_lines": len([line for line in lines if not line.strip()]),
+            "average_line_length": sum(len(line) for line in lines) / max(len(lines), 1),
+        }
 
         return summary
     except Exception as e:
+        logger.error(f"Error analyzing file {full_path}: {e}", exc_info=True)
         return {"error": f"Error analyzing file: {e}"}
+
+
+def _estimate_max_nesting_level(lines: List[str]) -> int:
+    """Estimate maximum nesting level in code."""
+    max_level = 0
+    current_level = 0
+    
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith(('#', '//', '/*')):
+            continue
+            
+        # Count opening brackets
+        current_level += stripped.count('{') + stripped.count('(') + stripped.count('[')
+        # Count closing brackets
+        current_level -= stripped.count('}') + stripped.count(')') + stripped.count(']')
+        
+        max_level = max(max_level, current_level)
+    
+    return max_level
+
+
+def _has_docstrings(lines: List[str]) -> bool:
+    """Check if file contains docstrings."""
+    in_docstring = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('"""') or stripped.startswith("'''"):
+            if not in_docstring:
+                in_docstring = True
+            else:
+                return True
+    return False
 
 @mcp.tool()
 async def refresh_index(ctx: Context) -> Dict[str, Any]:
@@ -2736,9 +2902,12 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                 # Index content into Elasticsearch
                                 if dal_instance and dal_instance.search:
                                     try:
-                                        lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
-                                        if lazy_content_obj:
-                                            content = lazy_content_obj.content
+                                        # Use SmartFileReader for enhanced content loading with better error handling
+                                        smart_reader = SmartFileReader()
+                                        content_result = smart_reader.read_content(full_file_path)
+                                        
+                                        if content_result.content:
+                                            content = content_result.content
                                             logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
                                             doc_id = file_path # Use file_path as doc_id
                                             document = {
@@ -2757,7 +2926,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                             else:
                                                 logger.error(f"Failed to index {file_path} into Elasticsearch. Indexing method returned False.")
                                         else:
-                                            logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path}, skipping Elasticsearch indexing.")
+                                            logger.warning(f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing.")
                                     except Exception as es_e:
                                         logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
                     
@@ -2811,8 +2980,11 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                         # Index content into Elasticsearch (sequential fallback)
                         if dal_instance and dal_instance.search:
                             try:
-                                lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
-                                content = lazy_content_obj.content
+                                # Use SmartFileReader for enhanced content loading with better error handling
+                                smart_reader = SmartFileReader()
+                                content_result = smart_reader.read_content(full_file_path)
+                                
+                                content = content_result.content
                                 if content is not None:
                                     logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
                                     doc_id = file_path # Use file_path as doc_id
@@ -2832,7 +3004,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                     else:
                                         logger.error(f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False.")
                                 else:
-                                    logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path} (sequential), skipping Elasticsearch indexing.")
+                                    logger.warning(f"SmartFileReader returned None content for {full_file_path} (sequential), skipping Elasticsearch indexing.")
                             except Exception as es_e:
                                 logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
                         
@@ -3121,9 +3293,12 @@ def _index_project(base_path: str) -> int:
                             # Index content into Elasticsearch
                             if dal_instance and dal_instance.search:
                                 try:
-                                    lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
-                                    if lazy_content_obj:
-                                        content = lazy_content_obj.content
+                                    # Use SmartFileReader for enhanced content loading with better error handling
+                                    smart_reader = SmartFileReader(base_path)
+                                    content_result = smart_reader.read_content(full_file_path)
+                                    
+                                    if content_result.content:
+                                        content = content_result.content
                                         logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
                                         doc_id = file_path # Use file_path as doc_id
                                         document = {
@@ -3142,7 +3317,7 @@ def _index_project(base_path: str) -> int:
                                         else:
                                             logger.error(f"Failed to index {file_path} into Elasticsearch. Indexing method returned False.")
                                     else:
-                                        logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path}, skipping Elasticsearch indexing.")
+                                        logger.warning(f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing.")
                                 except Exception as es_e:
                                     logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
                     else:
@@ -3243,8 +3418,11 @@ def _index_project(base_path: str) -> int:
                                 # Index content into Elasticsearch (sequential fallback)
                                 if dal_instance and dal_instance.search:
                                     try:
-                                        lazy_content_obj = lazy_content_manager.get_file_content(full_file_path)
-                                        content = lazy_content_obj.content
+                                        # Use SmartFileReader for enhanced content loading with better error handling
+                                        smart_reader = SmartFileReader(base_path)
+                                        content_result = smart_reader.read_content(full_file_path)
+                                        
+                                        content = content_result.content
                                         if content is not None:
                                             logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
                                             doc_id = file_path # Use file_path as doc_id
@@ -3262,7 +3440,7 @@ def _index_project(base_path: str) -> int:
                                             else:
                                                 logger.error(f"Failed to index {file_path} into Elasticsearch (sequential). Indexing method returned False.")
                                         else:
-                                            logger.warning(f"lazy_content_manager.get_file_content returned None for {full_file_path} (sequential), skipping Elasticsearch indexing.")
+                                            logger.warning(f"SmartFileReader returned None content for {full_file_path} (sequential), skipping Elasticsearch indexing.")
                                     except Exception as es_e:
                                         logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
                         

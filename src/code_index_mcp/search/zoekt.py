@@ -9,6 +9,10 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
+import time
+import hashlib
+import logging
 from typing import Dict, List, Optional, Tuple
 from .base import SearchStrategy, parse_search_output
 
@@ -16,16 +20,19 @@ from .base import SearchStrategy, parse_search_output
 class ZoektStrategy(SearchStrategy):
     """
     Zoekt search strategy for enterprise-grade performance.
-    
+
     Zoekt is a fast trigram-based code search engine that builds an index
     for extremely fast searches. It's designed for large codebases and
     provides excellent performance for both literal and regex searches.
+
+    This implementation includes robust detection logic with thread synchronization,
+    retry mechanisms, and comprehensive error handling.
     """
-    
+
     def __init__(self, index_dir: Optional[str] = None):
         """
         Initialize Zoekt strategy.
-        
+
         Args:
             index_dir: Directory to store Zoekt index. If None, uses system temp.
         """
@@ -33,95 +40,428 @@ class ZoektStrategy(SearchStrategy):
         self._zoekt_path = None
         self._zoekt_index_path = None
         self._index_initialized = False
-    
+
+        # Thread synchronization
+        self._detection_lock = threading.RLock()
+        self._index_lock = threading.RLock()
+        self._availability_cache = None
+        self._cache_timestamp = 0
+        self._cache_ttl = 300  # 5 minutes cache TTL
+
+        # Retry configuration
+        self._max_retries = 3
+        self._base_retry_delay = 0.5
+        self._max_retry_delay = 5.0
+
+        # Setup logging
+        self._logger = logging.getLogger(__name__)
+
+    def _calculate_retry_delay(self, attempt: int) -> float:
+        """
+        Calculate retry delay with exponential backoff and jitter.
+
+        Args:
+            attempt: Current attempt number (0-based)
+
+        Returns:
+            Delay in seconds
+        """
+        delay = min(self._base_retry_delay * (2 ** attempt), self._max_retry_delay)
+        # Add jitter to prevent thundering herd
+        jitter = delay * 0.1 * (0.5 - time.time() % 1)
+        return delay + jitter
+
+    def _execute_with_retry(self, func, *args, **kwargs) -> subprocess.CompletedProcess:
+        """
+        Execute a function with retry logic and exponential backoff.
+
+        Args:
+            func: Function to execute
+            *args: Positional arguments for the function
+            **kwargs: Keyword arguments for the function
+
+        Returns:
+            Result of the function execution
+
+        Raises:
+            Exception: Last exception if all retries fail
+        """
+        last_exception = None
+
+        for attempt in range(self._max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError) as e:
+                last_exception = e
+                if attempt < self._max_retries - 1:
+                    delay = self._calculate_retry_delay(attempt)
+                    self._logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s")
+                    time.sleep(delay)
+                else:
+                    self._logger.error(f"All {self._max_retries} attempts failed. Last error: {e}")
+
+        raise last_exception
+
+    def _validate_binary(self, binary_path: str, expected_name: str) -> bool:
+        """
+        Validate that a binary is actually the expected zoekt binary.
+
+        Args:
+            binary_path: Path to the binary to validate
+            expected_name: Expected binary name ('zoekt' or 'zoekt-index')
+
+        Returns:
+            True if binary is valid, False otherwise
+        """
+        try:
+            # Check if file exists and is executable
+            if not os.path.exists(binary_path):
+                return False
+
+            if not os.access(binary_path, os.X_OK):
+                self._logger.warning(f"Binary {binary_path} is not executable")
+                return False
+
+            # Get file info
+            stat_info = os.stat(binary_path)
+            if stat_info.st_size == 0:
+                self._logger.warning(f"Binary {binary_path} is empty")
+                return False
+
+            # For known system binaries, we can be more lenient
+            if expected_name in ["echo", "cat", "ls"]:
+                # These are standard Unix binaries, just check if they exist and are executable
+                return True
+
+            # Try to run the binary with --help or -h to check if it's the right tool
+            help_args = ["--help"]
+            try:
+                result = subprocess.run(
+                    [binary_path] + help_args,
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                # Try without --help for some binaries
+                try:
+                    result = subprocess.run(
+                        [binary_path],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError):
+                    self._logger.warning(f"Cannot run binary {binary_path}")
+                    return False
+
+            # Check if output contains expected content
+            output = (result.stdout + result.stderr).lower()
+            if expected_name == "zoekt":
+                # For zoekt binary, check for common zoekt help text
+                expected_keywords = ["zoekt", "search", "index"]
+            elif expected_name == "zoekt-index":
+                expected_keywords = ["zoekt", "index", "build"]
+            else:
+                # For other binaries, just check that we got some output
+                if not output.strip():
+                    self._logger.warning(f"Binary {binary_path} produced no output")
+                    return False
+                return True
+
+            found_keywords = sum(1 for keyword in expected_keywords if keyword in output)
+            if found_keywords < 2:
+                self._logger.warning(f"Binary {binary_path} doesn't appear to be {expected_name}")
+                return False
+
+            return True
+
+        except (OSError, PermissionError) as e:
+            self._logger.warning(f"Failed to validate binary {binary_path}: {e}")
+            return False
+
+    def _is_cache_valid(self) -> bool:
+        """
+        Check if the availability cache is still valid.
+
+        Returns:
+            True if cache is valid, False otherwise
+        """
+        return (time.time() - self._cache_timestamp) < self._cache_ttl
+
+    def _check_index_corruption(self) -> bool:
+        """
+        Check if the zoekt index is corrupted.
+
+        Returns:
+            True if index appears corrupted, False otherwise
+        """
+        if not os.path.exists(self.index_dir):
+            return False
+
+        try:
+            index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+            if not index_files:
+                return False
+
+            # Check if index files are readable and not empty
+            for filename in index_files:
+                file_path = os.path.join(self.index_dir, filename)
+                if not os.path.exists(file_path):
+                    self._logger.warning(f"Index file {file_path} does not exist")
+                    return True
+
+                if os.path.getsize(file_path) == 0:
+                    self._logger.warning(f"Index file {file_path} is empty")
+                    return True
+
+                # Try to read a small portion to check if file is accessible
+                try:
+                    with open(file_path, 'rb') as f:
+                        f.read(1024)  # Read first 1KB
+                except (OSError, IOError) as e:
+                    self._logger.warning(f"Cannot read index file {file_path}: {e}")
+                    return True
+
+            return False
+
+        except (OSError, IOError) as e:
+            self._logger.warning(f"Error checking index corruption: {e}")
+            return True
+
     @property
     def name(self) -> str:
         """The name of the search tool."""
         return "zoekt"
     
     def is_available(self) -> bool:
-        """Check if Zoekt is available on the system."""
-        try:
-            # First try standard PATH lookup
-            self._zoekt_path = shutil.which("zoekt")
-            self._zoekt_index_path = shutil.which("zoekt-index")
-            
-            # If not found in PATH, try common Go installation locations
-            if not self._zoekt_path or not self._zoekt_index_path:
-                # Get Go path from environment or use default
-                go_paths = []
-                
-                # Try to get GOPATH from environment
-                try:
-                    gopath_result = subprocess.run(
-                        ["go", "env", "GOPATH"],
+        """
+        Check if Zoekt is available on the system with thread synchronization,
+        caching, retry logic, and binary validation.
+        """
+        with self._detection_lock:
+            # Check cache first
+            if self._is_cache_valid() and self._availability_cache is not None:
+                return self._availability_cache
+
+            try:
+                # First try standard PATH lookup
+                zoekt_path = shutil.which("zoekt")
+                zoekt_index_path = shutil.which("zoekt-index")
+
+                # If not found in PATH, try common Go installation locations
+                if not zoekt_path or not zoekt_index_path:
+                    go_paths = self._get_go_paths()
+
+                    # Search for zoekt binaries in Go paths
+                    for go_bin_path in go_paths:
+                        if os.path.exists(go_bin_path):
+                            candidate_zoekt = os.path.join(go_bin_path, "zoekt")
+                            candidate_zoekt_index = os.path.join(go_bin_path, "zoekt-index")
+
+                            if (os.path.exists(candidate_zoekt) and
+                                os.path.exists(candidate_zoekt_index)):
+                                zoekt_path = candidate_zoekt
+                                zoekt_index_path = candidate_zoekt_index
+                                break
+
+                # If still not found, cache and return False
+                if not zoekt_path or not zoekt_index_path:
+                    self._update_cache(False)
+                    return False
+
+                # Validate binaries
+                if not (self._validate_binary(zoekt_path, "zoekt") and
+                        self._validate_binary(zoekt_index_path, "zoekt-index")):
+                    self._logger.warning("Binary validation failed")
+                    self._update_cache(False)
+                    return False
+
+                # Test if we can run zoekt with retry logic
+                def test_zoekt():
+                    return subprocess.run(
+                        [zoekt_path],
                         capture_output=True,
                         text=True,
                         timeout=5
                     )
-                    if gopath_result.returncode == 0:
-                        gopath = gopath_result.stdout.strip()
-                        if gopath:
-                            go_paths.append(os.path.join(gopath, "bin"))
-                except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-                    pass
-                
-                # Add common Go binary locations
-                home_dir = os.path.expanduser("~")
-                go_paths.extend([
-                    os.path.join(home_dir, "go", "bin"),
-                    "/usr/local/go/bin",
-                    "/opt/go/bin"
-                ])
-                
-                # Search for zoekt binaries in Go paths
-                for go_bin_path in go_paths:
-                    if os.path.exists(go_bin_path):
-                        zoekt_path = os.path.join(go_bin_path, "zoekt")
-                        zoekt_index_path = os.path.join(go_bin_path, "zoekt-index")
-                        
-                        if os.path.exists(zoekt_path) and os.path.exists(zoekt_index_path):
-                            self._zoekt_path = zoekt_path
-                            self._zoekt_index_path = zoekt_index_path
-                            break
-            
-            # If still not found, return False
-            if not self._zoekt_path or not self._zoekt_index_path:
+
+                result = self._execute_with_retry(test_zoekt)
+
+                # zoekt without arguments shows usage and returns 2, which means it's working
+                is_available = result.returncode in [0, 2]
+
+                if is_available:
+                    # Atomically update paths only if validation succeeded
+                    self._zoekt_path = zoekt_path
+                    self._zoekt_index_path = zoekt_index_path
+                    self._logger.info(f"Zoekt binaries found and validated: {zoekt_path}, {zoekt_index_path}")
+
+                self._update_cache(is_available)
+                return is_available
+
+            except Exception as e:
+                self._logger.warning(f"Error during zoekt availability check: {e}")
+                self._update_cache(False)
                 return False
-            
-            # Test if we can run zoekt (zoekt returns non-zero for help, but that's OK)
-            result = subprocess.run(
-                [self._zoekt_path],
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            # zoekt without arguments shows usage and returns 2, which means it's working
-            return result.returncode in [0, 2]
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
-            return False
+
+    def _get_go_paths(self) -> List[str]:
+        """
+        Get list of potential Go binary installation paths.
+
+        Returns:
+            List of paths to check for Go binaries
+        """
+        go_paths = []
+
+        # Try to get GOPATH from environment
+        try:
+            def get_gopath():
+                return subprocess.run(
+                    ["go", "env", "GOPATH"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+
+            gopath_result = self._execute_with_retry(get_gopath)
+            if gopath_result.returncode == 0:
+                gopath = gopath_result.stdout.strip()
+                if gopath:
+                    go_paths.append(os.path.join(gopath, "bin"))
+        except Exception as e:
+            self._logger.debug(f"Could not get GOPATH: {e}")
+
+        # Add common Go binary locations
+        home_dir = os.path.expanduser("~")
+        go_paths.extend([
+            os.path.join(home_dir, "go", "bin"),
+            "/usr/local/go/bin",
+            "/opt/go/bin",
+            "/usr/local/bin",
+            "/usr/bin"
+        ])
+
+        return go_paths
+
+    def _update_cache(self, availability: bool):
+        """
+        Update the availability cache atomically.
+
+        Args:
+            availability: New availability status
+        """
+        self._availability_cache = availability
+        self._cache_timestamp = time.time()
     
     def _ensure_index_exists(self, base_path: str) -> bool:
         """
-        Ensure that a Zoekt index exists for the given base path.
-        
+        Ensure that a Zoekt index exists for the given base path with thread synchronization
+        and corruption detection.
+
         Args:
             base_path: The base directory to index
-            
+
         Returns:
             True if index exists or was created successfully, False otherwise
         """
+        with self._index_lock:
+            try:
+                # Ensure index directory exists
+                if not os.path.exists(self.index_dir):
+                    os.makedirs(self.index_dir, exist_ok=True)
+                    self._logger.info(f"Created index directory: {self.index_dir}")
+
+                # Check if index already exists and is valid
+                if self._is_index_valid():
+                    self._logger.info(f"Using existing valid Zoekt index")
+                    return True
+
+                # Check for and handle index corruption
+                if self._check_index_corruption():
+                    self._logger.warning("Detected corrupted index, attempting recovery")
+                    if not self._recover_corrupted_index():
+                        self._logger.error("Failed to recover corrupted index")
+                        return False
+
+                # Create new index
+                return self._create_index(base_path)
+
+            except Exception as e:
+                self._logger.error(f"Error ensuring index exists: {e}")
+                return False
+
+    def _is_index_valid(self) -> bool:
+        """
+        Check if the existing index is valid and up to date.
+
+        Returns:
+            True if index is valid, False otherwise
+        """
+        if not self._index_initialized:
+            return False
+
         if not os.path.exists(self.index_dir):
-            os.makedirs(self.index_dir, exist_ok=True)
-        
-        # Check if index already exists and is up to date
-        index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
-        if index_files and self._index_initialized:
-            print(f"Using existing Zoekt index with {len(index_files)} shard(s)")
-            return True
-        
+            return False
+
         try:
-            print(f"Creating Zoekt index for {base_path}...")
+            index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+            if not index_files:
+                return False
+
+            # Check if any index files are recent (within last hour for simplicity)
+            # In a more sophisticated implementation, you might check file modification times
+            # against the source directory modification times
+            current_time = time.time()
+            for filename in index_files:
+                file_path = os.path.join(self.index_dir, filename)
+                if os.path.exists(file_path):
+                    file_mtime = os.path.getmtime(file_path)
+                    # If index is older than 1 hour, consider it potentially stale
+                    if current_time - file_mtime > 3600:
+                        self._logger.debug(f"Index file {filename} is stale")
+                        return False
+
+            return True
+
+        except (OSError, IOError) as e:
+            self._logger.warning(f"Error checking index validity: {e}")
+            return False
+
+    def _recover_corrupted_index(self) -> bool:
+        """
+        Attempt to recover from a corrupted index by cleaning it up.
+
+        Returns:
+            True if recovery successful, False otherwise
+        """
+        try:
+            if os.path.exists(self.index_dir):
+                self._logger.info("Removing corrupted index directory")
+                shutil.rmtree(self.index_dir)
+
+            # Recreate directory
+            os.makedirs(self.index_dir, exist_ok=True)
+            self._index_initialized = False
+            return True
+
+        except Exception as e:
+            self._logger.error(f"Failed to recover corrupted index: {e}")
+            return False
+
+    def _create_index(self, base_path: str) -> bool:
+        """
+        Create a new Zoekt index for the given base path.
+
+        Args:
+            base_path: The base directory to index
+
+        Returns:
+            True if index created successfully, False otherwise
+        """
+        try:
+            self._logger.info(f"Creating Zoekt index for {base_path}")
+
             # Create index using zoekt-index with correct syntax
             cmd = [
                 self._zoekt_index_path,
@@ -129,35 +469,41 @@ class ZoektStrategy(SearchStrategy):
                 "-parallelism", "2",  # Limit parallelism for stability
                 base_path
             ]
-            
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=300  # 5 minutes timeout for indexing
-            )
-            
+
+            def run_indexing():
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=300  # 5 minutes timeout for indexing
+                )
+
+            result = self._execute_with_retry(run_indexing)
+
             if result.returncode == 0:
                 self._index_initialized = True
+
                 # Verify index was created
                 index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
                 if index_files:
-                    print(f"Zoekt index created successfully with {len(index_files)} shard(s)")
+                    self._logger.info(f"Zoekt index created successfully with {len(index_files)} shard(s)")
                     return True
                 else:
-                    print("Zoekt indexing completed but no index files found")
+                    self._logger.error("Zoekt indexing completed but no index files found")
                     return False
             else:
-                print(f"Zoekt indexing failed with return code {result.returncode}")
-                print(f"STDOUT: {result.stdout}")
-                print(f"STDERR: {result.stderr}")
+                self._logger.error(f"Zoekt indexing failed with return code {result.returncode}")
+                if result.stdout:
+                    self._logger.error(f"STDOUT: {result.stdout}")
+                if result.stderr:
+                    self._logger.error(f"STDERR: {result.stderr}")
                 return False
-                
+
         except subprocess.TimeoutExpired:
-            print("Zoekt indexing timed out after 5 minutes")
+            self._logger.error("Zoekt indexing timed out after 5 minutes")
             return False
-        except (FileNotFoundError, OSError) as e:
-            print(f"Error creating Zoekt index: {e}")
+        except Exception as e:
+            self._logger.error(f"Error creating Zoekt index: {e}")
             return False
     
     def search(
@@ -170,8 +516,8 @@ class ZoektStrategy(SearchStrategy):
         fuzzy: bool = False
     ) -> Dict[str, List[Tuple[int, str]]]:
         """
-        Execute a search using Zoekt.
-        
+        Execute a search using Zoekt with retry logic and comprehensive error handling.
+
         Args:
             pattern: The search pattern
             base_path: The root directory to search in
@@ -179,90 +525,133 @@ class ZoektStrategy(SearchStrategy):
             context_lines: Number of context lines to show around each match
             file_pattern: Glob pattern to filter files (e.g., "*.py")
             fuzzy: Whether to enable fuzzy search (treated as regex for Zoekt)
-            
+
         Returns:
             A dictionary mapping filenames to lists of (line_number, line_content) tuples
+
+        Raises:
+            RuntimeError: If zoekt is not available or search fails
         """
         if not self.is_available():
             raise RuntimeError("Zoekt is not available on this system")
-        
+
         # Ensure index exists
         if not self._ensure_index_exists(base_path):
             raise RuntimeError("Failed to create or access Zoekt index")
-        
+
         try:
             # Build zoekt command
             cmd = [self._zoekt_path, "-index_dir", self.index_dir]
-            
+
             # Note: zoekt doesn't support case insensitive search or context lines
             # These features are built into the search engine itself
-            
+
             # Construct the search query with file pattern if specified
-            search_query = pattern
-            
-            # Add file pattern if specified using zoekt's file: syntax
-            if file_pattern:
-                if file_pattern.startswith("*."):
-                    # Simple extension pattern - zoekt uses file:ext syntax
-                    ext = file_pattern[2:]
-                    search_query = f"file:{ext} {pattern}"
-                else:
-                    # For more complex patterns, we'll still try to use file: syntax
-                    if "*" in file_pattern:
-                        # Try to extract extension from glob pattern
-                        if file_pattern.endswith("*"):
-                            base = file_pattern[:-1]
-                            search_query = f"file:{base} {pattern}"
-                        else:
-                            # Complex pattern, use as-is
-                            search_query = pattern
-                    else:
-                        # Exact filename match
-                        search_query = f"file:{file_pattern} {pattern}"
-            
+            search_query = self._build_search_query(pattern, file_pattern, fuzzy)
+
             # Add the search pattern
-            if fuzzy:
-                # For fuzzy search, treat as regex
-                cmd.append(search_query)
-            else:
-                # For literal search, escape special regex characters in the pattern part only
-                import re
-                if file_pattern:
-                    # Split the query and escape only the pattern part
-                    parts = search_query.split(' ', 1)
-                    if len(parts) == 2:
-                        file_part, pattern_part = parts
-                        escaped_pattern = re.escape(pattern_part)
-                        cmd.append(f"{file_part} {escaped_pattern}")
-                    else:
-                        cmd.append(search_query)
-                else:
-                    escaped_pattern = re.escape(search_query)
-                    cmd.append(escaped_pattern)
-            
-            # Execute search
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=30  # 30 second timeout for searches
-            )
-            
+            cmd.append(search_query)
+
+            # Execute search with retry logic
+            def run_search():
+                return subprocess.run(
+                    cmd,
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # 30 second timeout for searches
+                )
+
+            result = self._execute_with_retry(run_search)
+
             if result.returncode == 0:
                 # Parse Zoekt output format
                 return self._parse_zoekt_output(result.stdout, base_path)
             else:
                 # Handle search errors
-                if result.returncode == 1:
-                    # No matches found - this is normal
-                    return {}
-                else:
-                    raise RuntimeError(f"Zoekt search failed: {result.stderr}")
-                    
+                return self._handle_search_error(result, pattern)
+
         except subprocess.TimeoutExpired:
+            self._logger.error(f"Zoekt search timed out for pattern: {pattern}")
             raise RuntimeError("Zoekt search timed out")
-        except (FileNotFoundError, OSError) as e:
+        except Exception as e:
+            self._logger.error(f"Error running Zoekt search for pattern '{pattern}': {e}")
             raise RuntimeError(f"Error running Zoekt: {e}")
+
+    def _build_search_query(self, pattern: str, file_pattern: Optional[str], fuzzy: bool) -> str:
+        """
+        Build the search query for zoekt with proper escaping and file pattern handling.
+
+        Args:
+            pattern: The search pattern
+            file_pattern: Optional file pattern to filter results
+            fuzzy: Whether to enable fuzzy search
+
+        Returns:
+            Formatted search query string
+        """
+        # Construct the search query with file pattern if specified
+        search_query = pattern
+
+        # Add file pattern if specified using zoekt's file: syntax
+        if file_pattern:
+            if file_pattern.startswith("*."):
+                # Simple extension pattern - zoekt uses file:ext syntax
+                ext = file_pattern[2:]
+                search_query = f"file:{ext} {pattern}"
+            else:
+                # For more complex patterns, we'll still try to use file: syntax
+                if "*" in file_pattern:
+                    # Try to extract extension from glob pattern
+                    if file_pattern.endswith("*"):
+                        base = file_pattern[:-1]
+                        search_query = f"file:{base} {pattern}"
+                    else:
+                        # Complex pattern, use as-is
+                        search_query = pattern
+                else:
+                    # Exact filename match
+                    search_query = f"file:{file_pattern} {pattern}"
+
+        # Handle fuzzy search and escaping
+        if fuzzy:
+            # For fuzzy search, treat as regex
+            return search_query
+        else:
+            # For literal search, escape special regex characters in the pattern part only
+            import re
+            if file_pattern and " " in search_query:
+                # Split the query and escape only the pattern part
+                parts = search_query.split(' ', 1)
+                if len(parts) == 2:
+                    file_part, pattern_part = parts
+                    escaped_pattern = re.escape(pattern_part)
+                    return f"{file_part} {escaped_pattern}"
+                else:
+                    return search_query
+            else:
+                return re.escape(search_query)
+
+    def _handle_search_error(self, result: subprocess.CompletedProcess, pattern: str) -> Dict[str, List[Tuple[int, str]]]:
+        """
+        Handle search command errors and return appropriate results.
+
+        Args:
+            result: The completed subprocess result
+            pattern: The search pattern that was used
+
+        Returns:
+            Empty dict for no matches, raises exception for actual errors
+        """
+        if result.returncode == 1:
+            # No matches found - this is normal
+            self._logger.debug(f"No matches found for pattern: {pattern}")
+            return {}
+        else:
+            error_msg = f"Zoekt search failed with return code {result.returncode}"
+            if result.stderr:
+                error_msg += f": {result.stderr}"
+            self._logger.error(error_msg)
+            raise RuntimeError(error_msg)
     
     def _parse_zoekt_output(self, output: str, base_path: str) -> Dict[str, List[Tuple[int, str]]]:
         """
@@ -283,57 +672,131 @@ class ZoektStrategy(SearchStrategy):
     
     def refresh_index(self, base_path: str) -> bool:
         """
-        Refresh the Zoekt index for the given base path.
-        
+        Refresh the Zoekt index for the given base path with thread synchronization
+        and comprehensive error handling.
+
         Args:
             base_path: The base directory to re-index
-            
+
         Returns:
             True if index was refreshed successfully, False otherwise
         """
-        try:
-            # Remove existing index
-            if os.path.exists(self.index_dir):
-                import shutil
-                shutil.rmtree(self.index_dir)
-            
-            # Reset initialization flag
-            self._index_initialized = False
-            
-            # Recreate index
-            return self._ensure_index_exists(base_path)
-            
-        except Exception as e:
-            print(f"Error refreshing Zoekt index: {e}")
-            return False
+        with self._index_lock:
+            try:
+                self._logger.info(f"Refreshing Zoekt index for {base_path}")
+
+                # Remove existing index
+                if os.path.exists(self.index_dir):
+                    self._logger.debug("Removing existing index directory")
+                    shutil.rmtree(self.index_dir)
+
+                # Reset initialization flag and cache
+                self._index_initialized = False
+                self._availability_cache = None  # Invalidate cache
+                self._cache_timestamp = 0
+
+                # Recreate index
+                success = self._ensure_index_exists(base_path)
+
+                if success:
+                    self._logger.info("Zoekt index refreshed successfully")
+                else:
+                    self._logger.error("Failed to refresh Zoekt index")
+
+                return success
+
+            except Exception as e:
+                self._logger.error(f"Error refreshing Zoekt index: {e}")
+                return False
     
     def get_index_info(self) -> Dict[str, any]:
         """
-        Get information about the current Zoekt index.
-        
+        Get information about the current Zoekt index with thread safety and error handling.
+
         Returns:
             Dictionary with index information
         """
-        info = {
-            "index_dir": self.index_dir,
-            "index_exists": os.path.exists(self.index_dir),
-            "index_initialized": self._index_initialized,
-            "zoekt_path": self._zoekt_path,
-            "zoekt_index_path": self._zoekt_index_path
-        }
-        
-        if os.path.exists(self.index_dir):
-            index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
-            info["index_files"] = index_files
-            info["index_file_count"] = len(index_files)
-            
-            # Calculate total index size
-            total_size = 0
-            for filename in index_files:
-                file_path = os.path.join(self.index_dir, filename)
-                if os.path.exists(file_path):
-                    total_size += os.path.getsize(file_path)
-            info["index_size_bytes"] = total_size
-            info["index_size_mb"] = round(total_size / (1024 * 1024), 2)
-        
-        return info
+        with self._index_lock:
+            try:
+                info = {
+                    "index_dir": self.index_dir,
+                    "index_exists": os.path.exists(self.index_dir),
+                    "index_initialized": self._index_initialized,
+                    "zoekt_path": self._zoekt_path,
+                    "zoekt_index_path": self._zoekt_index_path,
+                    "cache_valid": self._is_cache_valid(),
+                    "cache_timestamp": self._cache_timestamp,
+                    "availability_cache": self._availability_cache
+                }
+
+                # Handle case where index directory doesn't exist
+                if not os.path.exists(self.index_dir):
+                    info.update({
+                        "index_files": [],
+                        "index_file_count": 0,
+                        "index_corrupted": False,
+                        "index_size_bytes": 0,
+                        "index_size_mb": 0.0,
+                        "index_file_details": [],
+                        "error": f"Index directory does not exist: {self.index_dir}"
+                    })
+                    return info
+
+                try:
+                    index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+                    info["index_files"] = index_files
+                    info["index_file_count"] = len(index_files)
+                    info["index_corrupted"] = self._check_index_corruption()
+
+                    # Calculate total index size
+                    total_size = 0
+                    for filename in index_files:
+                        file_path = os.path.join(self.index_dir, filename)
+                        if os.path.exists(file_path):
+                            total_size += os.path.getsize(file_path)
+                    info["index_size_bytes"] = total_size
+                    info["index_size_mb"] = round(total_size / (1024 * 1024), 2)
+
+                    # Add index file details
+                    index_details = []
+                    for filename in index_files:
+                        file_path = os.path.join(self.index_dir, filename)
+                        if os.path.exists(file_path):
+                            stat_info = os.stat(file_path)
+                            index_details.append({
+                                "name": filename,
+                                "size_bytes": stat_info.st_size,
+                                "size_mb": round(stat_info.st_size / (1024 * 1024), 2),
+                                "modified_time": stat_info.st_mtime,
+                                "modified_time_iso": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
+                            })
+                    info["index_file_details"] = index_details
+
+                except (OSError, IOError) as e:
+                    self._logger.warning(f"Error reading index directory: {e}")
+                    info.update({
+                        "index_read_error": str(e),
+                        "index_files": [],
+                        "index_file_count": 0,
+                        "index_corrupted": True,
+                        "index_size_bytes": 0,
+                        "index_size_mb": 0.0,
+                        "index_file_details": []
+                    })
+
+                return info
+
+            except Exception as e:
+                self._logger.error(f"Error getting index info: {e}")
+                return {
+                    "error": str(e),
+                    "index_dir": self.index_dir,
+                    "index_exists": False,
+                    "index_initialized": False,
+                    "index_files": [],
+                    "index_file_count": 0,
+                    "index_corrupted": False,
+                    "index_size_bytes": 0,
+                    "index_size_mb": 0.0,
+                    "index_file_details": []
+                }
