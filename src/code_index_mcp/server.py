@@ -707,92 +707,145 @@ async def search_code_advanced(
     # Check if DAL's search backend is ElasticsearchSearch and if a pattern is provided
     if dal and isinstance(dal.search, SearchInterface):
         if pattern:
-            logger.info("Using Elasticsearch for content search.")
-            try:
-                if performance_monitor:
-                    with performance_monitor.time_operation("search",
+            # Check if this is Elasticsearch search (has additional parameters)
+            if hasattr(dal.search, 'search_content') and 'elasticsearch' in str(type(dal.search)).lower():
+                logger.info("Using Elasticsearch for content search.")
+                try:
+                    if performance_monitor:
+                        with performance_monitor.time_operation("search",
+                                                               pattern=pattern,
+                                                               strategy="Elasticsearch_Content",
+                                                               file_pattern=file_pattern,
+                                                               case_sensitive=case_sensitive,
+                                                               fuzzy=fuzzy,
+                                                               fuzziness_level=fuzziness_level,
+                                                               content_boost=content_boost,
+                                                               filepath_boost=filepath_boost) as operation:
+
+                            results_list = dal.search.search_content(
+                                query=pattern,
+                                is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
+                                fuzziness=fuzziness_level,
+                                content_boost=content_boost,
+                                file_path_boost=filepath_boost,
+                                highlight_pre_tags=[highlight_pre_tag],
+                                highlight_post_tags=[highlight_post_tag]
+                            )
+
+                            results_dict = {}
+                            logger.debug(f"Processing results_list with {len(results_list)} items")
+                            for i, result_item in enumerate(results_list):
+                                logger.debug(f"Result item {i}: type={type(result_item)}, value={result_item}")
+                                try:
+                                    file_path, result_doc = result_item
+                                    if file_path not in results_dict:
+                                        results_dict[file_path] = []
+                                except ValueError as e:
+                                    logger.error(f"Error unpacking result item {i}: {e}, item: {result_item}")
+                                    raise
+                                content_highlights = result_doc.get('highlight', {}).get('content', [])
+                                file_path_highlights = result_doc.get('highlight', {}).get('file_path', [])
+
+                                combined_highlights = content_highlights + file_path_highlights
+
+                                if combined_highlights:
+                                    for highlight_text in combined_highlights:
+                                        results_dict[file_path].append({
+                                            "line": 0, # Placeholder, ES doesn't provide line numbers directly
+                                            "text": highlight_text,
+                                            "start": 0, # Placeholder
+                                            "end": 0 # Placeholder
+                                        })
+                                else:
+                                    results_dict[file_path].append({
+                                        "line": 0,
+                                        "text": result_doc.get('content', 'No content available'),
+                                        "start": 0,
+                                        "end": 0
+                                    })
+
+                            total_matches = len(results_list)
+                            operation.metadata.update({
+                                "files_searched": len(results_dict),
+                                "total_matches": total_matches
+                            })
+
+                            # Debug: Log the structure of results_dict
+                            logger.debug(f"results_dict structure: {list(results_dict.keys())[:3]}")  # First 3 keys
+                            for file_path, matches in list(results_dict.items())[:1]:  # First file
+                                logger.debug(f"File: {file_path}, matches type: {type(matches)}, first match: {matches[0] if matches else 'None'}")
+
+                            paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
+                            lazy_content_manager.cache_search_result(query_key, paginated_results)
+                            logger.info(f"Search successful with Elasticsearch. Cached result for query: {query_key}")
+
+                            performance_monitor.log_structured("info", "Search completed successfully",
+                                                               pattern=pattern,
+                                                               strategy="Elasticsearch_Content",
+                                                               files_searched=len(results_dict),
+                                                               total_matches=total_matches,
+                                                               duration_ms=operation.duration_ms)
+                            return paginated_results
+                except Exception as e:
+                    error_message = f"Error during Elasticsearch content search: {e}"
+                    logger.error(error_message)
+                    if performance_monitor:
+                        performance_monitor.log_structured("error", "Elasticsearch content search failed",
                                                            pattern=pattern,
-                                                           strategy="Elasticsearch_Content",
-                                                           file_pattern=file_pattern,
-                                                           case_sensitive=case_sensitive,
-                                                           fuzzy=fuzzy,
-                                                           fuzziness_level=fuzziness_level,
-                                                           content_boost=content_boost,
-                                                           filepath_boost=filepath_boost) as operation:
-                        
-                        results_list = dal.search.search_content(
-                            query=pattern,
-                            is_sqlite_pattern=fuzzy, # Use fuzzy parameter to indicate SQLite pattern
-                            fuzziness=fuzziness_level,
-                            content_boost=content_boost,
-                            file_path_boost=filepath_boost,
-                            highlight_pre_tags=[highlight_pre_tag],
-                            highlight_post_tags=[highlight_post_tag]
-                        )
-                        
-                        results_dict = {}
-                        logger.debug(f"Processing results_list with {len(results_list)} items")
-                        for i, result_item in enumerate(results_list):
-                            logger.debug(f"Result item {i}: type={type(result_item)}, value={result_item}")
-                            try:
-                                file_path, result_doc = result_item
+                                                           error=str(e))
+                        performance_monitor.increment_counter("search_errors_total")
+                    return {"error": error_message}
+            else:
+                # This is SQLite search - use simple query parameter only
+                logger.info("Using SQLite for content search.")
+                try:
+                    if performance_monitor:
+                        with performance_monitor.time_operation("search",
+                                                               pattern=pattern,
+                                                               strategy="SQLite_Content",
+                                                               file_pattern=file_pattern,
+                                                               case_sensitive=case_sensitive,
+                                                               fuzzy=fuzzy) as operation:
+
+                            results_list = dal.search.search_content(query=pattern)
+
+                            results_dict = {}
+                            for file_path, content in results_list:
                                 if file_path not in results_dict:
                                     results_dict[file_path] = []
-                            except ValueError as e:
-                                logger.error(f"Error unpacking result item {i}: {e}, item: {result_item}")
-                                raise
-                            content_highlights = result_doc.get('highlight', {}).get('content', [])
-                            file_path_highlights = result_doc.get('highlight', {}).get('file_path', [])
-
-                            combined_highlights = content_highlights + file_path_highlights
-                            
-                            if combined_highlights:
-                                for highlight_text in combined_highlights:
-                                    results_dict[file_path].append({
-                                        "line": 0, # Placeholder, ES doesn't provide line numbers directly
-                                        "text": highlight_text,
-                                        "start": 0, # Placeholder
-                                        "end": 0 # Placeholder
-                                    })
-                            else:
                                 results_dict[file_path].append({
-                                    "line": 0,
-                                    "text": result_doc.get('content', 'No content available'),
+                                    "line": 0,  # SQLite doesn't provide line numbers
+                                    "text": content,
                                     "start": 0,
                                     "end": 0
                                 })
 
-                        total_matches = len(results_list)
-                        operation.metadata.update({
-                            "files_searched": len(results_dict),
-                            "total_matches": total_matches
-                        })
-                        
-                        # Debug: Log the structure of results_dict
-                        logger.debug(f"results_dict structure: {list(results_dict.keys())[:3]}")  # First 3 keys
-                        for file_path, matches in list(results_dict.items())[:1]:  # First file
-                            logger.debug(f"File: {file_path}, matches type: {type(matches)}, first match: {matches[0] if matches else 'None'}")
-                        
-                        paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
-                        lazy_content_manager.cache_search_result(query_key, paginated_results)
-                        logger.info(f"Search successful with Elasticsearch. Cached result for query: {query_key}")
-                        
-                        performance_monitor.log_structured("info", "Search completed successfully",
-                                                          pattern=pattern,
-                                                          strategy="Elasticsearch_Content",
-                                                          files_searched=len(results_dict),
-                                                          total_matches=total_matches,
-                                                          duration_ms=operation.duration_ms)
-                        return paginated_results
-            except Exception as e:
-                error_message = f"Error during Elasticsearch content search: {e}"
-                logger.error(error_message)
-                if performance_monitor:
-                    performance_monitor.log_structured("error", "Elasticsearch content search failed",
-                                                      pattern=pattern,
-                                                      error=str(e))
-                    performance_monitor.increment_counter("search_errors_total")
-                return {"error": error_message}
+                            total_matches = len(results_list)
+                            operation.metadata.update({
+                                "files_searched": len(results_dict),
+                                "total_matches": total_matches
+                            })
+
+                            paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
+                            lazy_content_manager.cache_search_result(query_key, paginated_results)
+                            logger.info(f"Search successful with SQLite. Cached result for query: {query_key}")
+
+                            performance_monitor.log_structured("info", "Search completed successfully",
+                                                               pattern=pattern,
+                                                               strategy="SQLite_Content",
+                                                               files_searched=len(results_dict),
+                                                               total_matches=total_matches,
+                                                               duration_ms=operation.duration_ms)
+                            return paginated_results
+                except Exception as e:
+                    error_message = f"Error during SQLite content search: {e}"
+                    logger.error(error_message)
+                    if performance_monitor:
+                        performance_monitor.log_structured("error", "SQLite content search failed",
+                                                           pattern=pattern,
+                                                           error=str(e))
+                        performance_monitor.increment_counter("search_errors_total")
+                    return {"error": error_message}
         elif file_pattern:
             logger.info("Using Elasticsearch for file path search.")
             try:
@@ -3420,11 +3473,10 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                 if dal_instance and dal_instance.search:
                                     try:
                                         # Use SmartFileReader for enhanced content loading with better error handling
-                                        smart_reader = SmartFileReader()
-                                        content_result = smart_reader.read_content(full_file_path)
-                                        
-                                        if content_result.content:
-                                            content = content_result.content
+                                        smart_reader = SmartFileReader(base_path)
+                                        content = smart_reader.read_content(full_file_path)
+        
+                                        if content:
                                             logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
                                             doc_id = file_path # Use file_path as doc_id
                                             document = {
@@ -3498,10 +3550,8 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                         if dal_instance and dal_instance.search:
                             try:
                                 # Use SmartFileReader for enhanced content loading with better error handling
-                                smart_reader = SmartFileReader()
-                                content_result = smart_reader.read_content(full_file_path)
-                                
-                                content = content_result.content
+                                smart_reader = SmartFileReader(base_path)
+                                content = smart_reader.read_content(full_file_path)
                                 if content is not None:
                                     logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
                                     doc_id = file_path # Use file_path as doc_id
@@ -3812,10 +3862,9 @@ def _index_project(base_path: str) -> int:
                                 try:
                                     # Use SmartFileReader for enhanced content loading with better error handling
                                     smart_reader = SmartFileReader(base_path)
-                                    content_result = smart_reader.read_content(full_file_path)
-                                    
-                                    if content_result.content:
-                                        content = content_result.content
+                                    content = smart_reader.read_content(full_file_path)
+
+                                    if content:
                                         logger.debug(f"Received content for {full_file_path}, length: {len(content)} bytes.")
                                         doc_id = file_path # Use file_path as doc_id
                                         document = {
@@ -3937,9 +3986,8 @@ def _index_project(base_path: str) -> int:
                                     try:
                                         # Use SmartFileReader for enhanced content loading with better error handling
                                         smart_reader = SmartFileReader(base_path)
-                                        content_result = smart_reader.read_content(full_file_path)
-                                        
-                                        content = content_result.content
+                                        content = smart_reader.read_content(full_file_path)
+
                                         if content is not None:
                                             logger.debug(f"Received content for {full_file_path} (sequential), length: {len(content)} bytes.")
                                             doc_id = file_path # Use file_path as doc_id
