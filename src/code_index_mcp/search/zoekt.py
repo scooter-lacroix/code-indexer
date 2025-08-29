@@ -242,7 +242,11 @@ class ZoektStrategy(SearchStrategy):
         with self._detection_lock:
             # Check cache first
             if self._is_cache_valid() and self._availability_cache is not None:
-                return self._availability_cache
+                # If returning from cache and we have valid paths, return True
+                if self._availability_cache and self._zoekt_path and self._zoekt_index_path:
+                    return True
+                # If cache says available but paths are missing, we need to re-detect
+                # Fall through to detection logic
 
             try:
                 # First try standard PATH lookup
@@ -367,6 +371,11 @@ class ZoektStrategy(SearchStrategy):
         """
         with self._index_lock:
             try:
+                # First ensure zoekt is available and paths are set
+                if not self.is_available():
+                    self._logger.error("Zoekt is not available, cannot create index")
+                    return False
+
                 # Ensure index directory exists
                 if not os.path.exists(self.index_dir):
                     os.makedirs(self.index_dir, exist_ok=True)
@@ -462,6 +471,11 @@ class ZoektStrategy(SearchStrategy):
         try:
             self._logger.info(f"Creating Zoekt index for {base_path}")
 
+            # Safety check: ensure zoekt-index path is available
+            if not self._zoekt_index_path:
+                self._logger.error("Zoekt index path is not set. Cannot create index.")
+                return False
+
             # Create index using zoekt-index with correct syntax
             cmd = [
                 self._zoekt_index_path,
@@ -534,6 +548,10 @@ class ZoektStrategy(SearchStrategy):
         """
         if not self.is_available():
             raise RuntimeError("Zoekt is not available on this system")
+
+        # Safety check: ensure zoekt path is available
+        if not self._zoekt_path:
+            raise RuntimeError("Zoekt binary path is not set")
 
         # Ensure index exists
         if not self._ensure_index_exists(base_path):
