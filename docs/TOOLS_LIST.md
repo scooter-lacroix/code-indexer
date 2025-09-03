@@ -605,7 +605,7 @@ You have access to a comprehensive Code Index MCP server with the following capa
 5. `write_to_file` or `search_and_replace` - Make modifications
 6. `get_file_history` - Verify changes if needed
 
-Remember: This is an enterprise-grade system with PostgreSQL metadata storage, Elasticsearch search, and comprehensive version tracking. All operations are logged and tracked for complete auditability.
+Remember: This is a system with PostgreSQL metadata storage, Elasticsearch search, and comprehensive version tracking. All operations are logged and tracked for complete auditability.
 ```
 
 ## 🔧 Configuration Examples
