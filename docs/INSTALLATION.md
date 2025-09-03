@@ -10,7 +10,7 @@ This guide provides comprehensive installation instructions for the Code Index M
 - **Storage**: 1GB+ free space for index data
 - **Network**: Internet access for package installation
 
-### Database Requirements (Enterprise Features)
+### Database Requirements (Complete Feature Set)
 - **PostgreSQL**: 12+ (for metadata storage and version tracking)
 - **Elasticsearch**: 7.x or 8.x (for advanced search capabilities)
 - **RabbitMQ**: 3.8+ (for real-time indexing, optional)
