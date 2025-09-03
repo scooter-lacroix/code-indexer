@@ -1,4 +1,4 @@
-# Code Index MCP - Enterprise Edition
+# Code Indexer (MCP) - Complete Edition
 
 <div align="center">
 
@@ -59,9 +59,9 @@ This version is comprised of a complete architectural transformation with **hybr
 
 ---
 
-## What is Code Index MCP?
+## What is Code Indexer?
 
-Code Index MCP is a specialized MCP server that provides intelligent code indexing and analysis capabilities. It enables Large Language Models to interact with your code repositories, offering real-time insights and navigation through complex codebases.
+Code Indexer is a specialized MCP server that provides intelligent code indexing and analysis capabilities. It enables Large Language Models to interact with your code repositories, offering real-time insights and navigation through complex codebases.
 
 This server integrates with the [Model Context Protocol](https://modelcontextprotocol.io) (MCP), a standardized way for AI models to interact with external tools and data sources.
 
