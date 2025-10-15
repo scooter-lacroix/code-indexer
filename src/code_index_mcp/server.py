@@ -49,6 +49,9 @@ from .storage.dal_factory import get_dal_instance
 from .storage.storage_interface import DALInterface, SearchInterface # Import DALInterface and SearchInterface
 from .logger_config import logger # Import the centralized logger
 from .file_reader import SmartFileReader, ReadingStrategy, FileSizeCategory # Import SmartFileReader and enums
+from .system_utils import detect_system
+from .elasticsearch_installer import ElasticsearchInstaller
+from .elasticsearch_config import elasticsearch_config
 from .search_utils import (
     SearchBackendSelector, SearchErrorHandler, SearchPatternTranslator,
     SearchResultProcessor, SearchMonitor, search_monitor,
@@ -141,6 +144,10 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     # Load base_path from settings if available, otherwise default to empty string
     logger.info("Initializing Code Indexer MCP server...")
 
+    # Check and potentially install Elasticsearch before initialization
+    logger.info("Checking Elasticsearch availability...")
+    check_and_install_elasticsearch()
+
     # Initialize a temporary settings manager to load the base_path from the default config location
     # This ensures we can retrieve the last saved project path even if the server restarts
     default_settings = OptimizedProjectSettings("", skip_load=True, storage_backend='sqlite', use_trie_index=True)
@@ -164,19 +171,30 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
     logger.info("FileChangeTracker initialized with DAL metadata backend")
 
-    # Initialize Elasticsearch client with retry logic
+    # Initialize Elasticsearch client with proper configuration and retry logic
     max_retries = 10
     retry_delay_seconds = 5
     es_connected = False
+
+    # Log Elasticsearch configuration
+    connection_info = elasticsearch_config.get_connection_info()
+    logger.info(f"Elasticsearch configuration: {connection_info}")
+
     for i in range(max_retries):
         try:
-            es_client = Elasticsearch(hosts=[{"host": ES_HOST, "port": ES_PORT, "scheme": "http"}])
-            if es_client.ping():
-                logger.info(f"Connected to Elasticsearch at {ES_HOST}:{ES_PORT} after {i+1} attempts.")
-                es_connected = True
-                break
+            es_client = elasticsearch_config.create_elasticsearch_client(timeout=10)
+            if elasticsearch_config.test_connection(es_client):
+                logger.info(f"Connected to Elasticsearch after {i+1} attempts.")
+
+                # Ensure index exists
+                if elasticsearch_config.ensure_index_exists(es_client):
+                    logger.info(f"Elasticsearch index '{elasticsearch_config.get_elasticsearch_index_name()}' is ready")
+                    es_connected = True
+                    break
+                else:
+                    logger.warning(f"Elasticsearch connected but failed to ensure index exists (attempt {i+1}/{max_retries}).")
             else:
-                logger.warning(f"Could not connect to Elasticsearch at {ES_HOST}:{ES_PORT} (attempt {i+1}/{max_retries}). Retrying in {retry_delay_seconds} seconds.")
+                logger.warning(f"Could not connect to Elasticsearch (attempt {i+1}/{max_retries}). Retrying in {retry_delay_seconds} seconds.")
         except Exception as e:
             logger.warning(f"Error connecting to Elasticsearch (attempt {i+1}/{max_retries}): {e}. Retrying in {retry_delay_seconds} seconds.")
         await asyncio.sleep(retry_delay_seconds) # Use asyncio.sleep for async context
@@ -4842,9 +4860,80 @@ def _add_file_to_index(directory: Dict, file_path: str):
             current_dir = current_dir[part]
     return False
 
+def check_and_install_elasticsearch():
+    """Check if Elasticsearch is available and offer to install it if not."""
+    try:
+        # Try to connect to Elasticsearch using proper configuration
+        test_client = elasticsearch_config.create_elasticsearch_client(timeout=10)
+        if elasticsearch_config.test_connection(test_client):
+            logger.info("Elasticsearch is already running")
+            return True
+    except Exception as e:
+        logger.warning(f"Could not connect to Elasticsearch: {e}")
+
+    # Check if we're on Linux and can offer auto-installation
+    system_info = detect_system()
+
+    if system_info.system.lower() == 'linux':
+        logger.info(f"Detected Linux system: {system_info.distribution} ({system_info.package_manager})")
+
+        # Only auto-install in certain contexts (not when called as an MCP tool)
+        # Check if we're in interactive mode or being run directly
+        if os.getenv('CODE_INDEX_AUTO_INSTALL_ES', '').lower() in ('1', 'true', 'yes'):
+            logger.info("Auto-installing Elasticsearch...")
+            try:
+                installer = ElasticsearchInstaller(verbose=False)
+                success = installer.install_elasticsearch()
+                if success:
+                    logger.info("Elasticsearch installed successfully")
+                    # Wait a moment for service to start
+                    time.sleep(5)
+                    return True
+                else:
+                    logger.error("Failed to install Elasticsearch")
+            except Exception as e:
+                logger.error(f"Elasticsearch installation failed: {e}")
+        else:
+            logger.info("Elasticsearch not found. To auto-install, set CODE_INDEX_AUTO_INSTALL_ES=1")
+            logger.info("Or install manually:")
+
+            if system_info.package_manager == 'apt':
+                logger.info("  # For Debian/Ubuntu:")
+                logger.info("  wget -qO - https://artifacts.elastic.co/GPG-KEY-elasticsearch | sudo gpg --dearmor -o /usr/share/keyrings/elasticsearch-keyring.gpg")
+                logger.info("  echo 'deb [signed-by=/usr/share/keyrings/elasticsearch-keyring.gpg] https://artifacts.elastic.co/packages/8.x/apt stable main' | sudo tee /etc/apt/sources.list.d/elastic-8.x.list")
+                logger.info("  sudo apt update")
+                logger.info("  sudo apt install elasticsearch")
+                logger.info("  sudo systemctl enable elasticsearch")
+                logger.info("  sudo systemctl start elasticsearch")
+            elif system_info.package_manager in ['yum', 'dnf']:
+                logger.info(f"  # For RHEL/CentOS/Fedora:")
+                logger.info("  sudo rpm --import https://artifacts.elastic.co/GPG-KEY-elasticsearch")
+                logger.info("  sudo tee /etc/yum.repos.d/elasticsearch.repo <<EOF")
+                logger.info("[elasticsearch]")
+                logger.info("name=Elasticsearch repository for 8.x packages")
+                logger.info("baseurl=https://artifacts.elastic.co/packages/8.x/yum")
+                logger.info("gpgcheck=1")
+                logger.info("gpgkey=https://artifacts.elastic.co/GPG-KEY-elasticsearch")
+                logger.info("enabled=0")
+                logger.info("autorefresh=1")
+                logger.info("type=rpm-md")
+                logger.info("EOF")
+                logger.info(f"  sudo {system_info.package_manager} install elasticsearch")
+                logger.info("  sudo systemctl enable elasticsearch")
+                logger.info("  sudo systemctl start elasticsearch")
+            elif system_info.package_manager == 'pacman':
+                logger.info("  # For Arch Linux:")
+                logger.info("  sudo pacman -S elasticsearch  # or use yay/paru for AUR")
+                logger.info("  sudo systemctl enable elasticsearch")
+                logger.info("  sudo systemctl start elasticsearch")
+
+    return False
+
+
 def main():
     """Main function to run the MCP server."""
     # Run the server. Tools are discovered automatically via decorators.
+    # Elasticsearch checking is handled in the lifespan function.
     mcp.run()
 
 if __name__ == '__main__':

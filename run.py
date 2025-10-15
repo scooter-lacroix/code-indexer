@@ -50,7 +50,10 @@ try:
             elif command == "server":
                 print("Starting Code Index MCP server...", file=sys.stderr)
                 print(f"Added path: {src_path}", file=sys.stderr)
-                
+
+                # Set auto-install environment variable for development
+                os.environ['CODE_INDEX_AUTO_INSTALL_ES'] = '1'
+
                 # Initialize ConfigManager
                 config_manager = ConfigManager()
                 dal_settings = config_manager.get_dal_settings()
@@ -93,7 +96,10 @@ try:
         else:
             print("Starting Code Index MCP server (default command)...", file=sys.stderr)
             print(f"Added path: {src_path}", file=sys.stderr)
-            
+
+            # Set auto-install environment variable for development
+            os.environ['CODE_INDEX_AUTO_INSTALL_ES'] = '1'
+
             # Initialize ConfigManager
             config_manager = ConfigManager()
             dal_settings = config_manager.get_dal_settings()

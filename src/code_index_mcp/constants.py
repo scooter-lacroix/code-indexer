@@ -11,10 +11,11 @@ INDEX_FILE = "file_index.pickle"
 CACHE_FILE = "content_cache.pickle"
 METADATA_FILE = "file_metadata.pickle"
 
-# Elasticsearch constants
+# Elasticsearch constants (fallback values)
 ES_HOST = "localhost"
 ES_PORT = 9200
 ES_INDEX_NAME = "code_index"
+ES_DEFAULT_URL = "http://localhost:9200"
 
 # RabbitMQ constants
 RABBITMQ_HOST = "localhost"

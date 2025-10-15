@@ -45,6 +45,7 @@ Homepage = "https://github.com/johnhuang316/code-index-mcp"
 
 [project.scripts]
 code-index-mcp = "code_index_mcp.server:main"
+setup-elasticsearch = "setup_elasticsearch:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

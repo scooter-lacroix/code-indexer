@@ -46,7 +46,7 @@ dal_settings:
   elasticsearch_username: "${ELASTICSEARCH_USERNAME:-}"
   elasticsearch_password: "${ELASTICSEARCH_PASSWORD:-}"
   # Elasticsearch SSL/TLS settings
-  elasticsearch_use_ssl: "${ELASTICSEARCH_USE_SSL:-true}"
+  elasticsearch_use_ssl: "${ELASTICSEARCH_USE_SSL:-false}"
   elasticsearch_verify_certs: "${ELASTICSEARCH_VERIFY_CERTS:-true}"
   elasticsearch_ca_certs: "${ELASTICSEARCH_CA_CERTS:-}" # Path to CA certificate bundle
   elasticsearch_client_cert: "${ELASTICSEARCH_CLIENT_CERT:-}" # Path to client certificate
