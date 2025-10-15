@@ -65,15 +65,21 @@ class ElasticsearchSearch(SearchInterface):
         
         try:
             self.es = Elasticsearch(**connection_params)
-            self.es.info() # Test connection
+            # Test connection with timeout
+            self.es.info(request_timeout=2) # Test connection with short timeout
             logger.info(f"Successfully connected to Elasticsearch at {hosts} with secure settings.")
             self._ensure_index()
+            self._connected = True
         except ConnectionError as e:
-            logger.error(f"Could not connect to Elasticsearch at {hosts} with provided credentials: {e}")
-            raise
+            logger.warning(f"Could not connect to Elasticsearch at {hosts} with provided credentials: {e}")
+            logger.info("Elasticsearch search functionality will be unavailable until connection is restored.")
+            self._connected = False
+            # Don't raise - allow server to continue without Elasticsearch
         except Exception as e:
-            logger.error(f"An unexpected error occurred during Elasticsearch connection: {e}")
-            raise
+            logger.warning(f"An unexpected error occurred during Elasticsearch connection: {e}")
+            logger.info("Elasticsearch search functionality will be unavailable until connection is restored.")
+            self._connected = False
+            # Don't raise - allow server to continue without Elasticsearch
 
     def _ensure_index(self):
         """Ensure the Elasticsearch index exists with appropriate mappings."""
@@ -171,6 +177,10 @@ class ElasticsearchSearch(SearchInterface):
         Indexes a document into Elasticsearch.
         `document` should contain at least 'file_path' and 'content'.
         """
+        if not hasattr(self, '_connected') or not self._connected:
+            logger.debug(f"Elasticsearch not connected, skipping indexing of document {doc_id}")
+            return False
+
         try:
             content_preview = ""
             if 'content' in document and isinstance(document['content'], str):
@@ -298,6 +308,10 @@ class ElasticsearchSearch(SearchInterface):
         Search across file content using Elasticsearch with advanced features.
         Can handle both direct queries and SQLite-style patterns.
         """
+        if not hasattr(self, '_connected') or not self._connected:
+            logger.debug(f"Elasticsearch not connected, returning empty results for content search")
+            return []
+
         results = []
         logger.debug(f"Elasticsearch search_content called with query='{query}', is_sqlite_pattern={is_sqlite_pattern}")
         try:
@@ -367,6 +381,10 @@ class ElasticsearchSearch(SearchInterface):
         Search across file paths using Elasticsearch with advanced features.
         Can handle both direct queries and SQLite-style patterns.
         """
+        if not hasattr(self, '_connected') or not self._connected:
+            logger.debug(f"Elasticsearch not connected, returning empty results for file path search")
+            return []
+
         paths = []
         try:
             highlight_settings = {
