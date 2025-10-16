@@ -179,6 +179,9 @@ python src/scripts/etl_script.py --mode verify
 For detailed installation instructions, database setup, and troubleshooting, see:
 **[📖 Installation Guide](docs/INSTALLATION.md)**
 
+For Elasticsearch security configuration (authentication, TLS/SSL, API keys), see:
+**[🔒 Elasticsearch Security Guide](docs/ELASTICSEARCH_SECURITY.md)**
+
 ## 🔌 MCP Integration
 
 The Code Index MCP server supports multiple integration methods:

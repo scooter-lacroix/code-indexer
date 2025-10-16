@@ -185,6 +185,9 @@ ELASTICSEARCH_INDEX_NAME=code_index
 ELASTICSEARCH_USERNAME=elastic
 ELASTICSEARCH_PASSWORD=your-elastic-password
 
+# Note: By default, Elasticsearch is configured for development with security disabled.
+# For security setup, see: [Elasticsearch Security Guide](ELASTICSEARCH_SECURITY.md)
+
 # Optional: RabbitMQ Configuration
 RABBITMQ_HOST=localhost
 RABBITMQ_PORT=5672
