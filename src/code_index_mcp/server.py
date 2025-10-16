@@ -4848,9 +4848,15 @@ def check_and_install_elasticsearch():
         system_info = detect_system()
 
         if system_info.system.lower() == 'linux':
-            logger.info(f"Auto-installing Elasticsearch on {system_info.distribution} ({system_info.package_manager})...")
             try:
                 installer = ElasticsearchInstaller(verbose=False)
+
+                # Check if Elasticsearch is already installed and running
+                if installer._check_elasticsearch_installed():
+                    logger.info("Elasticsearch is already installed and running")
+                    return True
+
+                logger.info(f"Auto-installing Elasticsearch on {system_info.distribution} ({system_info.package_manager})...")
                 success = installer.install_elasticsearch()
                 if success:
                     logger.info("Elasticsearch installed successfully")

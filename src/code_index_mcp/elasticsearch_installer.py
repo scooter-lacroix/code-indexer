@@ -154,6 +154,10 @@ class ElasticsearchInstaller:
                 self.logger.error(f"Error: {e}")
                 return False
 
+        # Configure Elasticsearch for development (disable security, optimize memory)
+        if not self._configure_for_development():
+            self.logger.warning("Failed to configure Elasticsearch for development, but installation succeeded")
+
         # Wait for Elasticsearch to start
         return self._wait_for_elasticsearch()
 
@@ -184,6 +188,11 @@ type=rpm-md
         # Start and enable service
         self._run_command(["sudo", "systemctl", "daemon-reload"])
         self._run_command(["sudo", "systemctl", "enable", "elasticsearch"])
+
+        # Configure Elasticsearch for development (disable security, optimize memory)
+        if not self._configure_for_development():
+            self.logger.warning("Failed to configure Elasticsearch for development, but installation succeeded")
+
         self._run_command(["sudo", "systemctl", "start", "elasticsearch"])
 
         return self._wait_for_elasticsearch()
@@ -215,6 +224,11 @@ type=rpm-md
         # Start and enable service
         self._run_command(["sudo", "systemctl", "daemon-reload"])
         self._run_command(["sudo", "systemctl", "enable", "elasticsearch"])
+
+        # Configure Elasticsearch for development (disable security, optimize memory)
+        if not self._configure_for_development():
+            self.logger.warning("Failed to configure Elasticsearch for development, but installation succeeded")
+
         self._run_command(["sudo", "systemctl", "start", "elasticsearch"])
 
         return self._wait_for_elasticsearch()
@@ -252,6 +266,11 @@ type=rpm-md
         # Start and enable service
         self._run_command(["sudo", "systemctl", "daemon-reload"])
         self._run_command(["sudo", "systemctl", "enable", "elasticsearch"])
+
+        # Configure Elasticsearch for development (disable security, optimize memory)
+        if not self._configure_for_development():
+            self.logger.warning("Failed to configure Elasticsearch for development, but installation succeeded")
+
         self._run_command(["sudo", "systemctl", "start", "elasticsearch"])
 
         return self._wait_for_elasticsearch()
@@ -286,6 +305,11 @@ type=rpm-md
         # Start and enable service
         self._run_command(["sudo", "systemctl", "daemon-reload"])
         self._run_command(["sudo", "systemctl", "enable", "elasticsearch"])
+
+        # Configure Elasticsearch for development (disable security, optimize memory)
+        if not self._configure_for_development():
+            self.logger.warning("Failed to configure Elasticsearch for development, but installation succeeded")
+
         self._run_command(["sudo", "systemctl", "start", "elasticsearch"])
 
         return self._wait_for_elasticsearch()
@@ -306,6 +330,58 @@ type=rpm-md
 
         self.logger.warning("Elasticsearch installed via npm. This may require manual configuration.")
         return True
+
+    def _configure_for_development(self) -> bool:
+        """Configure Elasticsearch for development use (disable security, optimize memory)."""
+        try:
+            self.logger.info("Configuring Elasticsearch for development...")
+
+            # Create development configuration with security disabled and memory optimized
+            config_content = """cluster.name: code-index-cluster
+node.name: code-index-node-1
+path.data: /var/lib/elasticsearch
+path.logs: /var/log/elasticsearch
+network.host: 127.0.0.1
+http.port: 9200
+discovery.type: single-node
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+"""
+
+            # Write configuration file
+            self._run_command(["sudo", "tee", "/etc/elasticsearch/elasticsearch.yml"], input=config_content)
+
+            # Create systemd override for memory settings
+            override_content = """[Service]
+# Set heap size to 4GB for development (adjust based on available RAM)
+Environment=ES_JAVA_OPTS="-Xms4g -Xmx4g"
+
+# Memory limits to prevent excessive usage
+MemoryLimit=6g
+MemoryMax=6g
+
+# Performance optimizations
+Environment=ES_DIRECTORIES_SIZE_LIMIT=1g
+"""
+
+            # Create override directory and file
+            self._run_command(["sudo", "mkdir", "-p", "/etc/systemd/system/elasticsearch.service.d"], check=False)
+            self._run_command(["sudo", "tee", "/etc/systemd/system/elasticsearch.service.d/override.conf"], input=override_content)
+
+            # Reload systemd to apply changes
+            self._run_command(["sudo", "systemctl", "daemon-reload"])
+
+            self.logger.info("✓ Elasticsearch configured for development:")
+            self.logger.info("  - Security disabled (no authentication required)")
+            self.logger.info("  - Memory limited to 4GB heap")
+            self.logger.info("  - Running on http://localhost:9200")
+            self.logger.info("  - Note: For production, enable security and adjust memory settings")
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Failed to configure Elasticsearch for development: {e}")
+            return False
 
     def _wait_for_elasticsearch(self, timeout: int = 60) -> bool:
         """Wait for Elasticsearch to start and become responsive."""
@@ -436,6 +512,10 @@ def main():
 
         if status['status'] == 'running':
             print("✓ Elasticsearch is now running on http://localhost:9200")
+            print("✓ Development configuration applied:")
+            print("  - Security disabled (no authentication)")
+            print("  - Memory optimized (4GB heap limit)")
+            print("  - Ready for code-indexer integration")
         else:
             print("⚠ Elasticsearch may require manual configuration to start")
     else:
