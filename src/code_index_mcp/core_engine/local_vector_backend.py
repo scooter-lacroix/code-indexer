@@ -1629,40 +1629,74 @@ class LocalVectorBackend:
 
         return SearchResponse(data=results)
 
-    def _load_chunk_content(self, file_path: str, start_line: Optional[int], end_line: Optional[int]) -> str:
+    def _load_chunk_content(self, file_path: str, start_line: Optional[int], end_line: Optional[int], max_chars: int = 1500) -> str:
         """
-        Load file content for a chunk.
+        Load file content for a chunk with intelligent truncation for token efficiency.
+
+        TOKEN EFFICIENCY: Limits content per result to prevent token flooding.
+        - Default max_chars: 1500 (approximately 300-400 tokens)
+        - Preserves context by including line numbers
+        - Adds truncation indicator when content is limited
 
         Args:
             file_path: Path to the file
             start_line: Starting line number (1-indexed, inclusive)
             end_line: Ending line number (1-indexed, inclusive)
+            max_chars: Maximum characters to return per chunk (default: 1500)
 
         Returns:
-            File content for the chunk
+            File content for the chunk (intelligently truncated)
         """
         try:
             if not os.path.exists(file_path):
                 logger.warning(f"File not found: {file_path}")
-                return f"[Content not available: file not found at {file_path}]"
+                return f"[Content not available: file not found]"
 
             with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
                 if start_line is not None and end_line is not None:
-                    # Load specific lines
+                    # Load specific lines with line numbers for context
                     lines = f.readlines()
                     if 1 <= start_line <= len(lines) and 1 <= end_line <= len(lines):
-                        return ''.join(lines[start_line - 1:end_line])
+                        selected_lines = lines[start_line - 1:end_line]
+
+                        # TOKEN EFFICIENCY: Limit content size
+                        content_chars = sum(len(line) for line in selected_lines)
+
+                        if content_chars > max_chars:
+                            # Smart truncation: prioritize earlier lines, add continuation marker
+                            result_lines = []
+                            current_chars = 0
+                            for i, line in enumerate(selected_lines):
+                                if current_chars + len(line) > max_chars:
+                                    # Add continuation marker with remaining line count
+                                    remaining = len(selected_lines) - i
+                                    result_lines.append(f"\n... [+{remaining} more lines, use read_file for full content]")
+                                    break
+                                result_lines.append(line)
+                                current_chars += len(line)
+
+                            # Add line numbers for context (compact format)
+                            numbered_lines = []
+                            for i, line in enumerate(result_lines):
+                                line_num = start_line + i
+                                # Compact format: "L123: content"
+                                numbered_lines.append(f"L{line_num}: {line.rstrip()}")
+                            return '\n'.join(numbered_lines)
+                        else:
+                            # Content fits within limit, add line numbers
+                            numbered_lines = []
+                            for i, line in enumerate(selected_lines):
+                                line_num = start_line + i
+                                numbered_lines.append(f"L{line_num}: {line.rstrip()}")
+                            return '\n'.join(numbered_lines)
                     else:
                         logger.warning(f"Invalid line range {start_line}-{end_line} for {file_path} (has {len(lines)} lines)")
-                        # Return what we can
-                        if 1 <= start_line <= len(lines):
-                            return ''.join(lines[start_line - 1:])
-                        return f"[Content not available: invalid line range]"
+                        return f"[Content not available: invalid line range {start_line}-{end_line}]"
                 else:
-                    # Load full file content (with size limit)
+                    # Load full file content with strict size limit
                     content = f.read()
-                    if len(content) > 10000:  # Limit to 10k chars
-                        content = content[:10000] + "\n... [truncated]"
+                    if len(content) > max_chars:
+                        content = content[:max_chars] + f"\n... [truncated, {len(content) - max_chars} more chars]"
                     return content
 
         except Exception as e:

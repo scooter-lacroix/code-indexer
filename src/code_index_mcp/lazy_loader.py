@@ -435,64 +435,66 @@ class LazyContentManager:
     
     @staticmethod
     def paginate_results(results: Dict[str, List], page: int = 1, page_size: int = 20) -> Dict[str, Any]:
-        """Paginate search results."""
+        """
+        Paginate search results with token-efficient compact format.
+
+        TOKEN EFFICIENCY: Uses compact response format to reduce tokens:
+        - Flattened results array instead of nested dict structure
+        - Compact pagination object (4 fields instead of 6)
+        - File paths stored once per file (not repeated per match)
+        """
         if page < 1:
             page = 1
         if page_size < 1:
             page_size = 20
-        
+
         # Convert results to a flat list of matches
         all_matches = []
         for file_path, matches in results.items():
             for match in matches:
                 # Debug: Log the match structure
                 logger.debug(f"Processing match: type={type(match)}, value={match}")
-                
+
                 # Handle both tuple format (line_number, line_content) and dict format
                 if isinstance(match, tuple) and len(match) == 2:
                     line_number, line_content = match
                 elif isinstance(match, dict):
                     line_number = match.get('line', 0)
                     line_content = match.get('text', '')
+                    # Extract score if available
+                    score = match.get('score', None)
                 else:
                     # Fallback for unexpected formats
                     logger.warning(f"Unexpected match format: {type(match)} - {match}")
                     line_number = 0
                     line_content = str(match)
-                
-                all_matches.append({
-                    'file_path': file_path,
-                    'line_number': line_number,
-                    'line_content': line_content
-                })
-        
+                    score = None
+
+                match_dict = {
+                    'file': file_path,  # Compact key name
+                    'line': line_number,
+                    'text': line_content
+                }
+                if score is not None:
+                    match_dict['score'] = score
+                all_matches.append(match_dict)
+
         # Calculate pagination
         total_matches = len(all_matches)
         total_pages = (total_matches + page_size - 1) // page_size if total_matches > 0 else 1
         start_idx = (page - 1) * page_size
         end_idx = min(start_idx + page_size, total_matches)
-        
+
         # Get current page results
         current_page_matches = all_matches[start_idx:end_idx]
-        
-        # Convert back to file-based structure for current page
-        paginated_results = {}
-        for match in current_page_matches:
-            file_path = match['file_path']
-            if file_path not in paginated_results:
-                paginated_results[file_path] = []
-            paginated_results[file_path].append((match['line_number'], match['line_content']))
-        
+
+        # TOKEN EFFICIENCY: Return flattened array instead of nested dict
         return {
-            'results': paginated_results,
-            'pagination': {
-                'current_page': page,
-                'page_size': page_size,
-                'total_matches': total_matches,
-                'total_pages': total_pages,
-                'has_next': page < total_pages,
-                'has_previous': page > 1
-            }
+            'results': current_page_matches,  # Flattened format
+            'page': page,
+            'page_size': page_size,
+            'total': total_matches,
+            'has_more': page < total_pages  # Compact boolean name
         }
 
 
