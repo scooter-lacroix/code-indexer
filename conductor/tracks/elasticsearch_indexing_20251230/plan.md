@@ -76,9 +76,9 @@
   - After fixes, codex-reviewer re-reviews for rigor verification
   - Only proceed to Phase 3 when codex-reviewer approves
 
-## Phase 3: Integration Tests and End-to-End Verification
+## Phase 3: Integration Tests and End-to-End Verification [checkpoint: 55fddde]
 
-- [ ] Task: Write integration test `test_end_to_end_reindex_to_search`
+- [x] Task: Write integration test `test_end_to_end_reindex_to_search`
   - Create test file `tests/integration/test_elasticsearch_indexing.py`
   - Start with empty Elasticsearch index
   - Run `manage_project(action="reindex")` on test project
@@ -86,13 +86,13 @@
   - Assert Elasticsearch document count matches file count
   - Run search query and verify results
 
-- [ ] Task: Verify Elasticsearch population works end-to-end
+- [x] Task: Verify Elasticsearch population works end-to-end
   - Ensure RabbitMQ consumer processes messages
   - Verify Elasticsearch documents contain actual file content
   - Confirm stale test data is replaced/updated
   - Test search returns results from newly indexed content
 
-- [ ] Task: Write integration test `test_operation_status_tracking`
+- [x] Task: Write integration test `test_operation_status_tracking`
   - Run reindex on test project
   - Immediately query operation status
   - Assert status is `"in_progress"` with `files_queued`
@@ -100,13 +100,13 @@
   - Query operation status again
   - Assert status is `"complete"` with `files_completed == files_queued`
 
-- [ ] Task: Implement operation status updates
+- [x] Task: Implement operation status updates
   - Ensure operation tracker updates status during indexing
   - Update `files_completed` count as files are processed
   - Transition status from `"in_progress"` to `"complete"`
   - Handle failed indexing scenarios
 
-- [ ] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 3' (Zero Tolerance - Tsar of Excellence)
+- [x] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 3' (Zero Tolerance - Tsar of Excellence)
   - Deploy codex-reviewer agent to conduct comprehensive review
   - Review must cover: integration tests, end-to-end flow, operation status
   - All findings must be debugged (amp-code or opencode-scaffolder)
