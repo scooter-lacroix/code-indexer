@@ -391,6 +391,14 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     from .core_engine.local_vector_backend import LocalVectorBackend
 
     vector_backend = LocalVectorBackend()
+    # CRITICAL FIX: Initialize the vector backend to load the embedding model and create FAISS index
+    # This is an async operation that downloads the model if needed and sets up the index
+    try:
+        await vector_backend.initialize()
+        logger.info("LocalVectorBackend initialized successfully")
+    except Exception as e:
+        logger.error(f"Failed to initialize LocalVectorBackend: {e}. Semantic search will be unavailable.")
+        # Continue without semantic search - server will still work with Elasticsearch/Zoekt
 
     # Initialize Core Engine with configured backends
     core_engine = CoreEngine(vector_backend=vector_backend, legacy_backend=dal_instance)
@@ -1666,10 +1674,18 @@ async def search_code_advanced(
     # Use Core Engine if available (Unified Search)
     if core_engine:
         try:
+            # CRITICAL FIX: Determine search strategy based on query type
+            # - fuzzy=True (regex): Use Zoekt for precise pattern matching
+            # - case_sensitive=False: Use Zoekt for case-insensitive keyword search
+            # - Default (fuzzy=False, case_sensitive=True): Use semantic/vector search
+            # This ensures natural language queries use semantic search, while
+            # pattern/regex queries use the faster Zoekt backend
+            use_zoekt_for_search = fuzzy or (not case_sensitive)
+
             search_options = SearchOptions(
                 rerank=True,  # Default to True as per mgrep default
                 top_k=page_size * page,  # Fetch enough for pagination
-                use_zoekt=True,  # Allow fallback to Zoekt if available
+                use_zoekt=use_zoekt_for_search,  # Use Zoekt only for pattern/regex search
             )
             # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
             # For now, we rely on CoreEngine's internal handling or backend capabilities.

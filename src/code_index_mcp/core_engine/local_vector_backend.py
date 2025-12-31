@@ -1607,9 +1607,12 @@ class LocalVectorBackend:
                 if not matches_store:
                     continue
 
+            # Load actual file content for the chunk
+            text_content = self._load_chunk_content(meta.file_path, meta.start_line, meta.end_line)
+
             results.append(ChunkType(
                 type="text",
-                text="",  # Content stored separately (TODO: load from file/content store)
+                text=text_content,
                 score=float(score),
                 metadata=FileMetadata(
                     path=meta.file_path,
@@ -1625,6 +1628,46 @@ class LocalVectorBackend:
             ))
 
         return SearchResponse(data=results)
+
+    def _load_chunk_content(self, file_path: str, start_line: Optional[int], end_line: Optional[int]) -> str:
+        """
+        Load file content for a chunk.
+
+        Args:
+            file_path: Path to the file
+            start_line: Starting line number (1-indexed, inclusive)
+            end_line: Ending line number (1-indexed, inclusive)
+
+        Returns:
+            File content for the chunk
+        """
+        try:
+            if not os.path.exists(file_path):
+                logger.warning(f"File not found: {file_path}")
+                return f"[Content not available: file not found at {file_path}]"
+
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                if start_line is not None and end_line is not None:
+                    # Load specific lines
+                    lines = f.readlines()
+                    if 1 <= start_line <= len(lines) and 1 <= end_line <= len(lines):
+                        return ''.join(lines[start_line - 1:end_line])
+                    else:
+                        logger.warning(f"Invalid line range {start_line}-{end_line} for {file_path} (has {len(lines)} lines)")
+                        # Return what we can
+                        if 1 <= start_line <= len(lines):
+                            return ''.join(lines[start_line - 1:])
+                        return f"[Content not available: invalid line range]"
+                else:
+                    # Load full file content (with size limit)
+                    content = f.read()
+                    if len(content) > 10000:  # Limit to 10k chars
+                        content = content[:10000] + "\n... [truncated]"
+                    return content
+
+        except Exception as e:
+            logger.error(f"Error loading content from {file_path}: {e}")
+            return f"[Content not available: {str(e)}]"
 
     async def ask(
         self,

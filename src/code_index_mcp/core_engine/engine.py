@@ -409,7 +409,7 @@ class CoreEngine:
         # 1. Zoekt Strategy (fast code-aware search)
         if options.use_zoekt and self.zoekt_backend and self.zoekt_backend.is_available():
             try:
-                base_path = search_store_ids[0] if search_store_ids else "."
+                base_path = store_ids[0] if store_ids else "."
                 if not os.path.exists(base_path):
                     base_path = "."
 
@@ -439,7 +439,7 @@ class CoreEngine:
         # 2. Core Vector Search (Primary)
         try:
             if self.vector_backend and self.vector_backend.is_available():
-                result = await self.vector_backend.search(search_store_ids, query, options)
+                result = await self.vector_backend.search(store_ids, query, options)
                 return self._enforce_result_limit(result, self.max_results)
         except Exception as e:
             logger.error(f"Core Vector search failed: {e}")
