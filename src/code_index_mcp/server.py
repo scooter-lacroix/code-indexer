@@ -401,15 +401,30 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     file_change_tracker = FileChangeTracker(dal_instance.metadata, incremental_indexer)
     logger.info("FileChangeTracker initialized with DAL metadata backend")
 
-    # Defer Elasticsearch connection until needed to allow fast MCP startup
+    # Initialize Elasticsearch client for RabbitMQ indexing pipeline
+    # NOTE: We connect to ES during startup to enable the RabbitMQ async indexing pipeline
     es_connected = False
     es_client = None
-    logger.info("Elasticsearch connection deferred - will be established when needed")
-    logger.info(
-        "Server will start immediately. Search functionality will be available when Elasticsearch is running."
-    )
+    rabbitmq_producer = None
+    rabbitmq_consumer = None
+    realtime_indexer = None
 
-    if es_connected:
+    try:
+        logger.info("Attempting to connect to Elasticsearch for RabbitMQ indexing pipeline...")
+        es_config_instance = elasticsearch_config  # Get the singleton instance
+        es_client = es_config_instance.create_elasticsearch_client()
+        if es_client and es_config_instance.test_connection(es_client):
+            es_connected = True
+            logger.info("Successfully connected to Elasticsearch")
+        else:
+            logger.warning("Elasticsearch connection test failed")
+            es_client = None
+    except Exception as e:
+        logger.warning(f"Failed to connect to Elasticsearch: {e}. Search functionality will be limited.")
+        es_client = None
+
+    # Initialize RabbitMQ producer and consumer if ES is available
+    if es_connected and es_client:
         try:
             # Initialize RabbitMQ producer and consumer only if ES is connected
             rabbitmq_producer = RabbitMQProducer(
@@ -439,15 +454,10 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
             rabbitmq_producer = None
             rabbitmq_consumer = None
             realtime_indexer = None
-            # Keep es_client as it was successfully connected
     else:
         logger.info(
-            "Elasticsearch connection deferred - Real-time indexing will be disabled until Elasticsearch is available."
+            "Elasticsearch not available - Real-time indexing will be disabled until Elasticsearch is available."
         )
-        es_client = None
-        rabbitmq_producer = None
-        rabbitmq_consumer = None
-        realtime_indexer = None
 
     # Initialize context with Phase 7 modules
     context = CodeIndexerContext(
