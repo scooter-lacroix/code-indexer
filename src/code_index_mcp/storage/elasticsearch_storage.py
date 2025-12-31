@@ -590,12 +590,30 @@ class ElasticsearchSearch(SearchInterface):
                 logger.debug(f"Elasticsearch search response: {response}")
                 for hit in response['hits']['hits']:
                     logger.debug(f"Processing hit: {hit}")
-                    source = hit['_source']
+                    source = hit.get('_source', {})
+
+                    # Extract file_path with multiple fallbacks for backward compatibility
+                    # Priority: 'path' (new) -> 'file_path' (old) -> _id (fallback)
+                    file_path = source.get('path') or source.get('file_path')
+                    if not file_path:
+                        # Try _id as fallback (file_path is often used as document ID)
+                        file_path = hit.get('_id', '')
+                        logger.warning(f"Document missing 'path' and 'file_path' fields in _source, using _id: {file_path}")
+
+                    # Extract content with fallback
+                    content = source.get('content', '')
+
+                    # Validate we have both path and content
+                    if not file_path:
+                        logger.warning(f"Skipping hit with no valid file_path: {hit.get('_id')}")
+                        continue
+
+                    # Create result document with validated fields
                     result_doc = {
-                        "file_path": source.get('path'),
-                        "content": source.get('content'),
+                        "file_path": file_path,
+                        "content": content,
                     }
-                    tuple_result = (source.get('path'), result_doc)
+                    tuple_result = (file_path, result_doc)
                     logger.debug(f"Appending tuple result: {tuple_result}")
                     results.append(tuple_result)
         except Exception as e:
@@ -751,7 +769,7 @@ class ElasticsearchSearch(SearchInterface):
             IOError: If the file cannot be indexed
         """
         doc = {
-            "file_path": file_path,
+            "path": file_path,  # Use 'path' to match Elasticsearch mapping
             "content": content,
             "timestamp": datetime.now().isoformat()
         }
@@ -786,10 +804,10 @@ class ElasticsearchSearch(SearchInterface):
         return [
             {
                 "file_path": file_path,
-                "score": score,
-                "content": content
+                "score": result_doc.get("score", 0.0),
+                "content": result_doc.get("content", "")
             }
-            for file_path, (content, score) in results
+            for file_path, result_doc in results
         ]
 
     def clear(self) -> bool:
