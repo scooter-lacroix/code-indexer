@@ -1073,6 +1073,106 @@ class SQLiteSearch(SearchInterface):
         """Close the search backend."""
         pass
 
+    def index_file(self, file_path: str, content: str) -> None:
+        """Index a file for search.
+
+        Args:
+            file_path: Path of the file to index
+            content: Content of the file to index
+
+        Raises:
+            IOError: If the file cannot be indexed
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Store content in kv_store
+                conn.execute('''
+                    INSERT OR REPLACE INTO kv_store (key, value, value_type)
+                    VALUES (?, ?, 'text')
+                ''', (file_path, content.encode('utf-8')))
+
+                # Update FTS if enabled
+                if self.enable_fts:
+                    conn.execute('''
+                        INSERT OR REPLACE INTO kv_fts (key, value_text)
+                        VALUES (?, ?)
+                    ''', (file_path, content))
+
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error indexing file {file_path}: {e}")
+            raise IOError(f"Failed to index file {file_path}: {e}")
+
+    def delete_indexed_file(self, file_path: str) -> None:
+        """Delete a file from the search index.
+
+        Args:
+            file_path: Path of the file to delete from index
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('DELETE FROM kv_store WHERE key = ?', (file_path,))
+                if self.enable_fts:
+                    conn.execute('DELETE FROM kv_fts WHERE key = ?', (file_path,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error deleting indexed file {file_path}: {e}")
+
+    def search_files(self, query: str) -> List[Dict[str, Any]]:
+        """Search for files matching the query.
+
+        Args:
+            query: The search query string
+
+        Returns:
+            A list of dictionaries containing file search results
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                if self.enable_fts:
+                    cursor = conn.execute('''
+                        SELECT key, value
+                        FROM kv_fts
+                        WHERE kv_fts MATCH ?
+                        LIMIT 100
+                    ''', (query,))
+                else:
+                    cursor = conn.execute('''
+                        SELECT key, value
+                        FROM kv_store
+                        WHERE value_type = 'text' AND key LIKE ?
+                        LIMIT 100
+                    ''', (f'%{query}%',))
+
+                results = []
+                for key, value in cursor.fetchall():
+                    results.append({
+                        'path': key,
+                        'content': value.decode('utf-8') if isinstance(value, bytes) else value
+                    })
+                return results
+        except Exception as e:
+            logger.error(f"Error searching files: {e}")
+            return []
+
+    def clear(self) -> bool:
+        """Clear the search index.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('DELETE FROM kv_store')
+                if self.enable_fts:
+                    conn.execute('DELETE FROM kv_fts')
+                    conn.execute('DELETE FROM files_fts')
+                conn.commit()
+                return True
+        except Exception as e:
+            logger.error(f"Error clearing search index: {e}")
+            return False
+
 
 class SQLiteDAL(DALInterface):
     """
