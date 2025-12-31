@@ -49,15 +49,17 @@ from .base import Repository, RepositoryError, NotFoundError, ValidationError
 from .file_repository import FileRepository
 from .search_repository import SearchRepository
 from .index_repository import IndexRepository
+from .quality_metrics_repository import QualityMetricsRepository
 from .repository_factory import RepositoryFactory
 
 __all__ = [
-    'Repository',
-    'RepositoryError',
-    'NotFoundError',
-    'ValidationError',
-    'FileRepository',
-    'SearchRepository',
-    'IndexRepository',
-    'RepositoryFactory',
+    "Repository",
+    "RepositoryError",
+    "NotFoundError",
+    "ValidationError",
+    "FileRepository",
+    "SearchRepository",
+    "IndexRepository",
+    "QualityMetricsRepository",
+    "RepositoryFactory",
 ]
