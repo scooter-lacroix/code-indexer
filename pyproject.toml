@@ -56,9 +56,9 @@ no-build-isolation = false
 # DO NOT add PyPI as extra-index-url - it provides GPU packages
 index-url = "https://download.pytorch.org/whl/cpu"
 
-# Explicitly block ALL GPU/CUDA packages
-constraints = [
-    # Block FAISS GPU variant
+# Explicitly block ALL GPU/CUDA packages using constraint-dependencies
+constraint-dependencies = [
+    # Block FAISS GPU variant (use ==0.0.0 to make it unsatisfiable)
     "faiss-gpu==0.0.0",
     # Block NVIDIA CUDA runtime packages
     "nvidia-cuda-runtime-cu12==0.0.0",
@@ -70,9 +70,10 @@ constraints = [
     "nvidia-cusparse-cu12==0.0.0",
 ]
 
-# Ensure CPU-only FAISS variant
-[[tool.uv.override-dependencies]]
-name = "faiss-cpu"
+# Ensure CPU-only FAISS variant by explicitly requiring it
+override-dependencies = [
+    "faiss-cpu>=1.7.4",
+]
 
 [project.urls]
 Homepage = "https://github.com/scooter-lacroix/code-indexer"
