@@ -134,6 +134,11 @@ memory_aware_manager = None
 # Global performance monitor - will be initialized when project is set
 performance_monitor = None
 
+# CRITICAL FIX: Global search session tracker for deduplication across queries
+# This prevents the same files from appearing in multiple related searches
+_search_session_files: Dict[str, int] = {}  # Maps file_path -> last_shown_timestamp
+_search_session_start: float = time.time()  # When the current session started
+
 # ============================================================================
 # PHASE 7 GLOBAL INSTANCES
 # ============================================================================
@@ -214,6 +219,48 @@ def ensure_performance_monitor():
         except Exception as e:
             logger.warning(f"Could not initialize performance monitor: {e}")
     return performance_monitor
+
+
+# CRITICAL FIX: Search session deduplication helpers
+def _reset_search_session():
+    """Reset the search session tracker (e.g., when project changes)."""
+    global _search_session_files, _search_session_start
+    _search_session_files.clear()
+    _search_session_start = time.time()
+    logger.debug("Search session reset")
+
+
+def _mark_files_as_shown(file_paths: List[str]):
+    """Mark files as shown in the current search session."""
+    global _search_session_files
+    now = int(time.time())
+    for path in file_paths:
+        _search_session_files[path] = now
+
+
+def _filter_recently_shown_files(file_paths: List[str], min_interval_seconds: int = 300) -> List[str]:
+    """
+    Filter out files that were shown recently in the search session.
+
+    Args:
+        file_paths: List of file paths to filter
+        min_interval_seconds: Minimum time before showing same file again (default: 5 minutes)
+
+    Returns:
+        Filtered list of file paths, excluding recently shown ones
+    """
+    global _search_session_files
+    now = int(time.time())
+    filtered = []
+
+    for path in file_paths:
+        last_shown = _search_session_files.get(path, 0)
+        if now - last_shown > min_interval_seconds:
+            filtered.append(path)
+        else:
+            logger.debug(f"Filtering out recently shown file: {path}")
+
+    return filtered
 
 
 supported_extensions = [
@@ -1224,8 +1271,13 @@ def manage_temp(
 # =============================================================================
 
 
-async def set_project_path(path: str, ctx: Context) -> str:
-    """Set the base project path for indexing."""
+async def set_project_path(path: str, ctx: Context) -> Union[str, Dict[str, Any]]:
+    """
+    Set the base project path for indexing.
+
+    CRITICAL PERFORMANCE FIX: Early return when path is unchanged and index is recent.
+    This prevents hanging for 8+ minutes when setting the same path that's already indexed.
+    """
     # Validate and normalize path
     try:
         norm_path = os.path.normpath(path)
@@ -1236,6 +1288,50 @@ async def set_project_path(path: str, ctx: Context) -> str:
 
         if not os.path.isdir(abs_path):
             return f"Error: Path is not a directory: {abs_path}"
+
+        # CRITICAL FIX: Early return if path is unchanged and index is recent
+        current_base_path = ctx.request_context.lifespan_context.base_path
+        if current_base_path:
+            # Normalize for comparison
+            current_normalized = os.path.normpath(os.path.abspath(current_base_path))
+            if current_normalized == abs_path:
+                # Path is unchanged - check if reindexing is needed
+                logger.info(f"Path unchanged: {abs_path}. Checking if reindexing is needed...")
+
+                # Get current config to check last_indexed
+                config = ctx.request_context.lifespan_context.settings.load_config()
+                last_indexed_str = config.get("last_indexed")
+
+                if last_indexed_str:
+                    try:
+                        from datetime import datetime, timedelta
+                        last_indexed = datetime.fromisoformat(last_indexed_str)
+                        now = datetime.now()
+                        time_since_index = (now - last_indexed).total_seconds()
+
+                        # Threshold: 48 hours
+                        REINDEX_THRESHOLD_HOURS = 48
+                        threshold_seconds = REINDEX_THRESHOLD_HOURS * 3600
+
+                        if time_since_index < threshold_seconds:
+                            hours = time_since_index / 3600
+                            logger.info(f"Index is recent ({hours:.1f} hours old). Skipping reindex.")
+                            return {
+                                "status": "already_indexed",
+                                "path": abs_path,
+                                "message": f"Path already indexed {hours:.1f} hours ago. Index is up to date.",
+                                "last_indexed": last_indexed_str,
+                                "time_since_index_hours": round(hours, 1)
+                            }
+                        else:
+                            # Re-indexing is needed due to staleness
+                            hours = time_since_index / 3600
+                            logger.info(f"Index is stale ({hours:.1f} hours old). Will reindex.")
+                    except Exception as e:
+                        logger.warning(f"Could not parse last_indexed timestamp: {e}")
+                        # Continue with reindexing
+
+        # Path changed or reindexing needed - continue with full setup
 
         # CRITICAL FIX: Properly dispose and recreate the LazyContentManager when projects change
         global \
@@ -1266,6 +1362,9 @@ async def set_project_path(path: str, ctx: Context) -> str:
         # This ensures no cached content from the old project remains in memory
         lazy_content_manager = LazyContentManager(max_loaded_files=100)
         logger.info("New LazyContentManager created for project switch")
+
+        # CRITICAL FIX: Reset search session when project changes
+        _reset_search_session()
 
         # Update the base path in context and global variable
         ctx.request_context.lifespan_context.base_path = abs_path
@@ -1600,7 +1699,7 @@ async def search_code_advanced(
     highlight_pre_tag: str = "<em>",  # New parameter for highlight pre-tag
     highlight_post_tag: str = "</em>",  # New parameter for highlight post-tag
     page: int = 1,
-    page_size: int = 20,
+    page_size: int = 5,  # CRITICAL FIX: Reduced from 20 to 5 to prevent token flooding
 ) -> Dict[str, Any]:
     """
     Search for a code pattern in the project using an advanced, fast tool with improved backend selection and error handling.
@@ -1667,9 +1766,17 @@ async def search_code_advanced(
             )
         return cached_result
 
-    # Log cache miss
+    # Log cache miss with diagnostics
     if performance_monitor:
         performance_monitor.increment_counter("search_cache_misses_total")
+        performance_monitor.log_structured(
+            "info",
+            "Search cache miss",
+            pattern=pattern,
+            query_key_hash=query_key[:32] + "...",  # Log truncated key for debugging
+            query_params=f"fuzzy={fuzzy}, cs={case_sensitive}, page={page}, page_size={page_size}"
+        )
+    logger.debug(f"Cache miss for query_key: {query_key[:64]}...")  # Debug log
 
     # Use Core Engine if available (Unified Search)
     if core_engine:
@@ -1682,9 +1789,13 @@ async def search_code_advanced(
             # pattern/regex queries use the faster Zoekt backend
             use_zoekt_for_search = fuzzy or (not case_sensitive)
 
+            # CRITICAL FIX: Fetch more results to account for deduplication
+            # We fetch 3x page_size so we have enough after filtering duplicates
+            fetch_k = page_size * page * 3
+
             search_options = SearchOptions(
                 rerank=True,  # Default to True as per mgrep default
-                top_k=page_size * page,  # Fetch enough for pagination
+                top_k=fetch_k,  # Fetch extra for deduplication
                 use_zoekt=use_zoekt_for_search,  # Use Zoekt only for pattern/regex search
             )
             # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
@@ -1700,10 +1811,33 @@ async def search_code_advanced(
                 store_ids, pattern, search_options
             )
 
+            # CRITICAL FIX: Collect file paths for deduplication
+            all_file_paths = []
+            for chunk in search_response.data:
+                f_path = chunk.metadata.path if chunk.metadata else "unknown"
+                if f_path != "unknown":
+                    all_file_paths.append(f_path)
+
+            # CRITICAL FIX: Filter out recently shown files (session deduplication)
+            # Only apply on page 1 to avoid filtering out legitimate paginated results
+            if page == 1:
+                filtered_paths = _filter_recently_shown_files(all_file_paths, min_interval_seconds=300)
+                filtered_set = set(filtered_paths)
+
+                if len(filtered_set) < len(all_file_paths):
+                    logger.info(f"Deduplication: Filtered {len(all_file_paths) - len(filtered_set)} recently shown files")
+
+                # Rebuild results with only filtered files
+            else:
+                filtered_set = set(all_file_paths)
+
             # Map to Legacy Format
             results_dict = {}
             for chunk in search_response.data:
                 f_path = chunk.metadata.path if chunk.metadata else "unknown"
+                # Skip if filtered out by deduplication (page 1 only)
+                if page == 1 and f_path not in filtered_set:
+                    continue
                 # Filter by file_pattern if provided (client-side filtering for now)
                 if file_pattern and not fnmatch.fnmatch(f_path, file_pattern):
                     continue
@@ -1720,6 +1854,11 @@ async def search_code_advanced(
                         "score": chunk.score,
                     }
                 )
+
+            # CRITICAL FIX: Mark shown files for future deduplication (page 1 only)
+            if page == 1:
+                shown_files = list(results_dict.keys())
+                _mark_files_as_shown(shown_files)
 
             # Paginate
             paginated_results = lazy_content_manager.paginate_results(
