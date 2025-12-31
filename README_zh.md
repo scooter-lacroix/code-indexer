@@ -88,8 +88,8 @@
 
 1.  **複製儲存庫**：
     ```bash
-    git clone https://github.com/johnhuang316/code-index-mcp.git
-    cd code-index-mcp
+    git clone https://github.com/scooter-lacroix/code-indexer.git
+    cd code-indexer
     ```
 
 2.  **安裝相依套件**：使用 `uv` 安裝所需套件。
