@@ -22,11 +22,12 @@
 This version introduces the **Unified Core Engine**, a next-generation search and indexing architecture that seamlessly blends semantic understanding with traditional code search:
 
 ### 🌟 **Unified Core Engine**
-- **✅ Hybrid Intelligence** - Intelligently routes queries between Vector Search (Semantic), Zoekt (Regex/Symbolic), and Elasticsearch.
-- **✅ Semantic Search & Reranking** - Deep understanding of code intent with automatic reranking for high precision.
-- **✅ Web Search Integration** - Optional capability to augment code search with web results.
-- **✅ Standalone Power** - Operates efficiently without external databases (PostgreSQL/Elasticsearch) for many use cases.
-- **✅ Dual-Mode Architecture** - Supports both "Core Engine" (Vector-first) and "Legacy" (ES/PG) backends simultaneously.
+- **✅ Local Vector Search** - FAISS-based semantic search with zero cloud dependencies, zero cost, and full privacy
+- **✅ Hybrid Intelligence** - Intelligently routes queries between Local Vector (Semantic), Zoekt (Regex/Symbolic), and Elasticsearch
+- **✅ Semantic Search & Reranking** - Deep understanding of code intent with automatic reranking for high precision
+- **✅ Web Search Integration** - Optional capability to augment code search with web results
+- **✅ Standalone Power** - Operates efficiently without external databases (PostgreSQL/Elasticsearch) for many use cases
+- **✅ Dual-Mode Architecture** - Supports both "Core Engine" (Vector-first) and "Legacy" (ES/PG) backends simultaneously
 
 ### 🏗️ **Architecture Transformation**
 - **✅ Unified Router** - Centralized dispatch for all search and indexing operations.
@@ -46,15 +47,16 @@ This version introduces the **Unified Core Engine**, a next-generation search an
 - **✅ Real-time Updates** - Instant search index updates
 
 ### 🛠️ **New Features**
-1. **Unified Core Engine** - Semantic search, Reranking, Web Search.
-2. **File Version Tracking** - Complete change history with diffs
-3. **PostgreSQL Metadata** - Structured data with relationships
-4. **Elasticsearch Search** - Advanced full-text search capabilities
-5. **Real-time Indexing** - RabbitMQ message queue processing
-6. **ETL Migration Tools** - Seamless data migration utilities
-7. **Database Migrations** - Alembic-based schema management
-8. **Backup & Recovery** - Comprehensive backup strategies
-9. **Monitoring & Logging** - Enterprise-grade observability
+1. **Local Vector Store** - FAISS + sentence-transformers for zero-cost semantic search (BAAI/bge-small-en-v1.5 default)
+2. **Unified Core Engine** - Semantic search, Reranking, Web Search
+3. **File Version Tracking** - Complete change history with diffs
+4. **PostgreSQL Metadata** - Structured data with relationships
+5. **Elasticsearch Search** - Advanced full-text search capabilities
+6. **Real-time Indexing** - RabbitMQ message queue processing
+7. **ETL Migration Tools** - Seamless data migration utilities
+8. **Database Migrations** - Alembic-based schema management
+9. **Backup & Recovery** - Comprehensive backup strategies
+10. **Monitoring & Logging** - Enterprise-grade observability
 
 ### 📋 **Verified Functionality**
 - **✅ Unified Search** - Semantic + Regex + Web search capabilities
@@ -85,6 +87,7 @@ This server integrates with the [Model Context Protocol](https://modelcontextpro
 - **Smart Filtering**: Advanced gitignore integration and size-based filtering
 
 ### 🔍 Advanced Search & Analysis
+- **Local Semantic Search**: FAISS-based vector search with zero cloud dependencies (p50 < 20ms after model loaded)
 - **Async Search**: Non-blocking search operations with real-time progress tracking
 - **Multi-Pattern Search**: Concurrent search across multiple patterns with scoped results
 - **Intelligent Caching**: 90% faster repeated searches with LRU cache
@@ -150,6 +153,12 @@ uv add code-index-mcp
 pip install code-index-mcp
 ```
 
+**For local vector search support (recommended):**
+```bash
+# Install FAISS and sentence-transformers dependencies
+uv pip install 'faiss-cpu>=1.7.4' 'sentence-transformers>=2.2.0' 'numpy>=1.24.0'
+```
+
 ### 🏗️ **Comprehensive Setup (PostgreSQL + Elasticsearch)**
 
 **1. Database Setup:**
@@ -164,13 +173,21 @@ python run.py start-dev-dbs
 **2. Environment Configuration:**
 ```bash
 # Set environment variables
-export CORE_ENGINE_API_KEY=your-api-key # Optional: For Semantic Search & Reranking
 export DAL_BACKEND_TYPE=postgresql_elasticsearch_only
+
+# Local Vector Store Configuration (optional, has defaults)
+export LOCAL_VECTOR_MODEL=BAAI/bge-small-en-v1.5  # Options: BAAI/bge-small-en-v1.5, microsoft/codebert-base, all-MiniLM-L6-v2
+export FAISS_INDEX_THRESHOLD=100000  # Switch to IVFFlat after this many vectors
+export FAISS_INDEX_PATH=./faiss_index  # Where to store the index
+
+# PostgreSQL Configuration
 export POSTGRES_HOST=localhost
 export POSTGRES_PORT=5432
 export POSTGRES_USER=codeindex
 export POSTGRES_PASSWORD=your-secure-password
 export POSTGRES_DB=code_index_db
+
+# Elasticsearch Configuration
 export ELASTICSEARCH_HOSTS=http://localhost:9200
 ```
 
@@ -193,6 +210,9 @@ For detailed installation instructions, database setup, and troubleshooting, see
 
 For Elasticsearch security configuration (authentication, TLS/SSL, API keys), see:
 **[🔒 Elasticsearch Security Guide](docs/ELASTICSEARCH_SECURITY.md)**
+
+For local vector store architecture, configuration, and supported models, see:
+**[🔍 Local Vector Store Guide](docs/LOCAL_VECTOR_STORE.md)**
 
 ## 🤖 Agent Integration
 

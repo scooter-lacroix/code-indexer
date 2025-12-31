@@ -268,10 +268,10 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     if stats_collector:
         logger.info("Statistics Collector initialized for dashboard")
 
-    # Initialize VectorBackend with API key manager
-    # The vector backend will use the API key manager for multi-key rotation
-    from .core_engine.vector_store import VectorBackend
-    vector_backend = VectorBackend(api_key_manager=api_key_manager)
+    # Initialize LocalVectorBackend (FAISS-based, no cloud dependency)
+    # Note: API key manager is not needed for LocalVectorBackend since it uses local embeddings
+    from .core_engine.local_vector_backend import LocalVectorBackend
+    vector_backend = LocalVectorBackend()
 
     # Initialize Core Engine with configured backends
     core_engine = CoreEngine(
@@ -1373,12 +1373,10 @@ async def search_code_advanced(
             )
             # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
             # For now, we rely on CoreEngine's internal handling or backend capabilities.
-            # VectorBackend handles 'path' filter in list_files but search filtering depends on backend.
-            # Mixedbread supports filters. We need to pass file_pattern to CoreEngine.
+            # LocalVectorBackend handles metadata but search filtering depends on implementation.
+            # Zoekt supports file pattern filtering natively.
             # CoreEngine.search currently doesn't accept filters in SearchOptions, but we can extend it or pass in query.
             # We'll assume for now CoreEngine handles it or we filter post-search (less efficient).
-            # Actually, `mgrep` supports filters. `CoreEngine` maps `options` to backend.
-            # I should update SearchOptions to include filters or file_pattern.
             # For this iteration, I'll proceed with basic query.
             
             store_ids = [base_path] # Use base_path as store_id
