@@ -498,7 +498,7 @@ class BatchIndexer:
 
         try:
             # Execute bulk operation
-            response = self.es_client.bulk(body=bulk_ops)
+            response = self.es_client.bulk(body=bulk_ops, request_timeout=30)
 
             # Check for errors
             if response.get("errors"):
@@ -638,7 +638,19 @@ class RabbitMQProducer:
     def _connect(self):
         """Establishes a connection to RabbitMQ."""
         try:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host, port=self.port))
+            # Add heartbeat and connection timeout to fix pika connection issues
+            credentials = pika.PlainCredentials('guest', 'guest')
+            parameters = pika.ConnectionParameters(
+                host=self.host,
+                port=self.port,
+                virtual_host='/',
+                credentials=credentials,
+                heartbeat=600,  # 10 minute heartbeat
+                blocked_connection_timeout=300,  # 5 minute blocked connection timeout
+                connection_attempts=3,
+                retry_delay=5
+            )
+            self.connection = pika.BlockingConnection(parameters)
             self.channel = self.connection.channel()
             self.channel.exchange_declare(exchange=self.exchange, exchange_type='topic', durable=True)
             logger.info("Successfully connected to RabbitMQ and declared exchange.",
@@ -744,6 +756,10 @@ class RabbitMQConsumer:
         self._processing_count = 0
         self._processing_times: Deque[float] = deque(maxlen=100)
 
+        # Message retry tracking to prevent infinite NACK loops
+        self._message_retry_counts: Dict[str, int] = {}
+        self._max_message_retries = 3
+
         logger.info(
             f"RabbitMQConsumer initialized for {host}:{port}, queue='{queue_name}' "
             f"(batching={enable_batching}, backpressure={enable_backpressure})",
@@ -753,7 +769,19 @@ class RabbitMQConsumer:
     def _connect(self):
         """Establishes a connection to RabbitMQ and declares queue/exchange."""
         try:
-            self.connection = pika.BlockingConnection(pika.ConnectionParameters(host=self.host, port=self.port))
+            # Add heartbeat and connection timeout to fix pika connection issues
+            credentials = pika.PlainCredentials('guest', 'guest')
+            parameters = pika.ConnectionParameters(
+                host=self.host,
+                port=self.port,
+                virtual_host='/',
+                credentials=credentials,
+                heartbeat=600,  # 10 minute heartbeat
+                blocked_connection_timeout=300,  # 5 minute blocked connection timeout
+                connection_attempts=3,
+                retry_delay=5
+            )
+            self.connection = pika.BlockingConnection(parameters)
             self.channel = self.connection.channel()
             self.channel.exchange_declare(exchange=self.exchange, exchange_type='topic', durable=True)
             result = self.channel.queue_declare(queue=self.queue_name, durable=True)
@@ -932,7 +960,8 @@ class RabbitMQConsumer:
                 index=self.index_name,
                 id=file_path,
                 document=document,
-                op_type='index'
+                op_type='index',
+                request_timeout=10
             )
             logger.info(f"Indexed/Updated document for {file_path}: {response['result']}",
                         extra={'component': 'Elasticsearch', 'action': 'index_document', 'file_path': file_path, 'result': response['result']})
@@ -955,7 +984,8 @@ class RabbitMQConsumer:
             response = self.es_client.delete(
                 index=self.index_name,
                 id=file_path,
-                ignore=[404]
+                ignore=[404],
+                request_timeout=10
             )
             if response['result'] == 'deleted':
                 logger.info(f"Deleted document for {file_path}",
@@ -987,12 +1017,24 @@ class RabbitMQConsumer:
         - Batch processing for better throughput
         - Backpressure checking before processing
         - Latency tracking for monitoring
+        - Retry tracking to prevent infinite NACK loops
         """
         start_time = time.time()
         try:
             operation: IndexingOperation = json.loads(body.decode('utf-8'))
             op_type = operation.get("type")
             file_path = operation.get("file_path")
+
+            # CRITICAL FIX: Check if this message has exceeded max retries
+            retry_count = self._message_retry_counts.get(file_path, 0)
+            if retry_count >= self._max_message_retries:
+                logger.error(
+                    f"Message for {file_path} exceeded max retries ({self._max_message_retries}), rejecting permanently.",
+                    extra={'component': 'RabbitMQConsumer', 'action': 'max_retries_exceeded', 'file_path': file_path, 'retry_count': retry_count}
+                )
+                ch.basic_reject(delivery_tag=method.delivery_tag, requeue=False)
+                self._message_retry_counts.pop(file_path, None)
+                return
 
             # PRODUCT.MD ALIGNMENT: Check backpressure before processing
             if self.backpressure and self.backpressure.should_throttle():
@@ -1035,13 +1077,17 @@ class RabbitMQConsumer:
 
             if success:
                 ch.basic_ack(delivery_tag=method.delivery_tag)
+                # CRITICAL FIX: Clear retry count on successful processing
+                if file_path in self._message_retry_counts:
+                    self._message_retry_counts.pop(file_path, None)
                 logger.info(f"Acknowledged message for {file_path} (took {processing_time:.0f}ms)",
                             extra={'component': 'RabbitMQConsumer', 'action': 'message_acknowledged', 'file_path': file_path, 'latency_ms': processing_time})
             else:
-                # Requeue message if processing failed
+                # CRITICAL FIX: Increment retry count and requeue message if processing failed
+                self._message_retry_counts[file_path] = retry_count + 1
                 ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
-                logger.warning(f"NACKed message for {file_path}, requeued.",
-                               extra={'component': 'RabbitMQConsumer', 'action': 'message_nacked', 'file_path': file_path})
+                logger.warning(f"NACKed message for {file_path}, requeued. Retry count: {retry_count + 1}/{self._max_message_retries}",
+                               extra={'component': 'RabbitMQConsumer', 'action': 'message_nacked', 'file_path': file_path, 'retry_count': retry_count + 1})
 
         except json.JSONDecodeError as e:
             logger.error(f"Error decoding message body: {e}. Message: {body.decode('utf-8')}. Rejecting message.",
@@ -1053,48 +1099,91 @@ class RabbitMQConsumer:
             ch.basic_nack(delivery_tag=method.delivery_tag, requeue=True)
 
     def _worker(self):
-        """Worker thread function to consume messages."""
+        """
+        Worker thread function to consume messages.
+
+        CRITICAL FIX: ALL connection setup and consumer registration happens
+        in this worker thread. Pika's BlockingConnection is NOT thread-safe,
+        so we cannot share channels/connections between threads.
+
+        This worker thread:
+        1. Establishes its own connection
+        2. Registers the consumer
+        3. Calls start_consuming()
+        """
         logger.info("RabbitMQConsumer worker thread started.",
                     extra={'component': 'RabbitMQConsumer', 'action': 'worker_start'})
+
         while not self._stop_event.is_set():
-            if not self.channel or self.connection.is_closed:
-                logger.warning("RabbitMQ connection not active for consumer, attempting to reconnect...",
-                               extra={'component': 'RabbitMQConsumer', 'action': 'worker_reconnect_attempt'})
-                if not self._connect():
-                    time.sleep(5) # Wait before retrying connection
-                    continue
-            
+            # Always establish connection and register consumer in this thread
+            # Pika's BlockingConnection is NOT thread-safe
+            if not self._connect():
+                logger.warning("Failed to connect to RabbitMQ, retrying in 5s...",
+                               extra={'component': 'RabbitMQConsumer', 'action': 'worker_connect_failed'})
+                time.sleep(5)
+                continue
+
+            # Register consumer in this thread (required by Pika's threading model)
             try:
-                # Start consuming messages. This call blocks until a message is received
-                # or the connection is closed. We use a timeout to allow for graceful shutdown.
+                self.channel.basic_qos(prefetch_count=10)
                 self.channel.basic_consume(
                     queue=self.queue_name,
                     on_message_callback=self._process_message,
-                    auto_ack=False # Manual acknowledgment
+                    auto_ack=False
                 )
+                logger.info(
+                    f"Consumer registered on queue '{self.queue_name}' in worker thread",
+                    extra={'component': 'RabbitMQConsumer', 'action': 'consumer_registered', 'queue': self.queue_name}
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to register consumer: {e}",
+                    extra={'component': 'RabbitMQConsumer', 'action': 'consumer_register_failed', 'error': str(e)}
+                )
+                time.sleep(5)
+                continue
+
+            try:
+                # Start consuming messages. This call blocks until a message is received
+                # or the connection is closed.
                 self.channel.start_consuming()
             except pika.exceptions.AMQPConnectionError as e:
                 logger.error(f"RabbitMQ connection error during consuming: {e}. Attempting to reconnect...",
                             extra={'component': 'RabbitMQConsumer', 'action': 'worker_consume_connection_error', 'error': str(e)})
-                self.connection = None # Mark for reconnection
+                self.connection = None  # Mark for reconnection
+                time.sleep(5)
+            except pika.exceptions.AMQPChannelError as e:
+                logger.error(f"RabbitMQ channel error: {e}. Attempting to reconnect...",
+                            extra={'component': 'RabbitMQConsumer', 'action': 'worker_channel_error', 'error': str(e)})
+                self.connection = None  # Mark for reconnection
                 time.sleep(5)
             except Exception as e:
                 logger.error(f"Unhandled error in RabbitMQConsumer worker: {e}",
                             extra={'component': 'RabbitMQConsumer', 'action': 'worker_unhandled_error', 'error': str(e)})
-                time.sleep(1) # Prevent busy-loop on persistent errors
+                time.sleep(1)  # Prevent busy-loop on persistent errors
 
         logger.info("RabbitMQConsumer worker thread stopped.",
                     extra={'component': 'RabbitMQConsumer', 'action': 'worker_stop'})
 
     def start(self):
-        """Starts the consumer worker thread."""
+        """
+        Starts the consumer worker thread.
+
+        CRITICAL FIX: Do NOT establish connection or register consumer in the main thread.
+        Pika's BlockingConnection is NOT thread-safe, so ALL connection setup and
+        consumer registration must happen in the worker thread.
+
+        This method simply starts the worker thread and returns immediately.
+        """
         if self._worker_thread is None or not self._worker_thread.is_alive():
             self._stop_event.clear()
             self._worker_thread = threading.Thread(target=self._worker, daemon=True)
             self._worker_thread.start()
-            logger.info("RabbitMQConsumer worker thread initiated.")
+            logger.info("RabbitMQConsumer worker thread initiated.",
+                        extra={'component': 'RabbitMQConsumer', 'action': 'worker_started'})
         else:
-            logger.warning("RabbitMQConsumer worker thread is already running.")
+            logger.warning("RabbitMQConsumer worker thread is already running.",
+                          extra={'component': 'RabbitMQConsumer', 'action': 'worker_already_running'})
 
     def stop(self):
         """
@@ -1108,12 +1197,25 @@ class RabbitMQConsumer:
         if self._worker_thread and self._worker_thread.is_alive():
             logger.info("Signaling RabbitMQConsumer worker thread to stop...")
 
-            # PRODUCT.MD ALIGNMENT: Flush any pending batch operations
+            # PRODUCT.MD ALIGNMENT: Flush any pending batch operations with timeout
             if self.enable_batching and self.batch_indexer:
                 pending = self.batch_indexer.get_pending_count()
                 if pending > 0:
                     logger.info(f"Flushing {pending} pending batch operations before stop...")
-                    self.batch_indexer.flush()
+                    flush_complete = threading.Event()
+
+                    def do_flush():
+                        try:
+                            self.batch_indexer.flush()
+                        finally:
+                            flush_complete.set()
+
+                    flush_thread = threading.Thread(target=do_flush, daemon=True)
+                    flush_thread.start()
+                    flush_complete.wait(timeout=10)  # Max 10 second flush
+
+                    if not flush_complete.is_set():
+                        logger.warning("Flush operation timed out during stop, forcing shutdown")
 
             self._stop_event.set()
 
