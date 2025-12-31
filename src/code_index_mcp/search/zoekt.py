@@ -15,6 +15,7 @@ import hashlib
 import logging
 from typing import Dict, List, Optional, Tuple
 from .base import SearchStrategy, parse_search_output
+from ..retry import retry_sync, RetryConfig, is_recoverable_error
 
 
 class ZoektStrategy(SearchStrategy):
@@ -48,32 +49,12 @@ class ZoektStrategy(SearchStrategy):
         self._cache_timestamp = 0
         self._cache_ttl = 300  # 5 minutes cache TTL
 
-        # Retry configuration
-        self._max_retries = 3
-        self._base_retry_delay = 0.5
-        self._max_retry_delay = 5.0
-
         # Setup logging
         self._logger = logging.getLogger(__name__)
 
-    def _calculate_retry_delay(self, attempt: int) -> float:
-        """
-        Calculate retry delay with exponential backoff and jitter.
-
-        Args:
-            attempt: Current attempt number (0-based)
-
-        Returns:
-            Delay in seconds
-        """
-        delay = min(self._base_retry_delay * (2 ** attempt), self._max_retry_delay)
-        # Add jitter to prevent thundering herd
-        jitter = delay * 0.1 * (0.5 - time.time() % 1)
-        return delay + jitter
-
     def _execute_with_retry(self, func, *args, **kwargs) -> subprocess.CompletedProcess:
         """
-        Execute a function with retry logic and exponential backoff.
+        Execute a function with retry logic using centralized retry utility.
 
         Args:
             func: Function to execute
@@ -86,21 +67,42 @@ class ZoektStrategy(SearchStrategy):
         Raises:
             Exception: Last exception if all retries fail
         """
-        last_exception = None
 
-        for attempt in range(self._max_retries):
-            try:
-                return func(*args, **kwargs)
-            except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError) as e:
-                last_exception = e
-                if attempt < self._max_retries - 1:
-                    delay = self._calculate_retry_delay(attempt)
-                    self._logger.warning(f"Attempt {attempt + 1} failed: {e}. Retrying in {delay:.2f}s")
-                    time.sleep(delay)
-                else:
-                    self._logger.error(f"All {self._max_retries} attempts failed. Last error: {e}")
+        def on_retry(attempt: int, delay: float, exception: Exception) -> None:
+            self._logger.warning(
+                f"Attempt {attempt} failed: {exception}. Retrying in {delay:.2f}s"
+            )
 
-        raise last_exception
+        def on_failure(exception: Exception) -> None:
+            self._logger.error(f"All 3 attempts failed. Last error: {exception}")
+
+        def is_subprocess_retryable(error: Exception) -> bool:
+            """Check if subprocess errors are retryable."""
+            return isinstance(
+                error,
+                (
+                    subprocess.TimeoutExpired,
+                    FileNotFoundError,
+                    OSError,
+                    PermissionError,
+                ),
+            )
+
+        config = RetryConfig(
+            max_attempts=3,
+            base_delay=0.5,
+            max_delay=5.0,
+            jitter=True,
+            jitter_factor=0.1,
+            on_retry=on_retry,
+        )
+
+        return retry_sync(
+            lambda: func(*args, **kwargs),
+            config=config,
+            is_retryable=is_subprocess_retryable,
+            on_failure=on_failure,
+        )
 
     def _validate_binary(self, binary_path: str, expected_name: str) -> bool:
         """
@@ -140,18 +142,20 @@ class ZoektStrategy(SearchStrategy):
                     [binary_path] + help_args,
                     capture_output=True,
                     text=True,
-                    timeout=10
+                    timeout=10,
                 )
             except (subprocess.TimeoutExpired, FileNotFoundError):
                 # Try without --help for some binaries
                 try:
                     result = subprocess.run(
-                        [binary_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
+                        [binary_path], capture_output=True, text=True, timeout=5
                     )
-                except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError):
+                except (
+                    subprocess.TimeoutExpired,
+                    FileNotFoundError,
+                    OSError,
+                    PermissionError,
+                ):
                     self._logger.warning(f"Cannot run binary {binary_path}")
                     return False
 
@@ -169,9 +173,13 @@ class ZoektStrategy(SearchStrategy):
                     return False
                 return True
 
-            found_keywords = sum(1 for keyword in expected_keywords if keyword in output)
+            found_keywords = sum(
+                1 for keyword in expected_keywords if keyword in output
+            )
             if found_keywords < 2:
-                self._logger.warning(f"Binary {binary_path} doesn't appear to be {expected_name}")
+                self._logger.warning(
+                    f"Binary {binary_path} doesn't appear to be {expected_name}"
+                )
                 return False
 
             return True
@@ -200,7 +208,9 @@ class ZoektStrategy(SearchStrategy):
             return False
 
         try:
-            index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+            index_files = [
+                f for f in os.listdir(self.index_dir) if f.endswith(".zoekt")
+            ]
             if not index_files:
                 return False
 
@@ -217,7 +227,7 @@ class ZoektStrategy(SearchStrategy):
 
                 # Try to read a small portion to check if file is accessible
                 try:
-                    with open(file_path, 'rb') as f:
+                    with open(file_path, "rb") as f:
                         f.read(1024)  # Read first 1KB
                 except (OSError, IOError) as e:
                     self._logger.warning(f"Cannot read index file {file_path}: {e}")
@@ -233,7 +243,7 @@ class ZoektStrategy(SearchStrategy):
     def name(self) -> str:
         """The name of the search tool."""
         return "zoekt"
-    
+
     def is_available(self) -> bool:
         """
         Check if Zoekt is available on the system with thread synchronization,
@@ -243,7 +253,11 @@ class ZoektStrategy(SearchStrategy):
             # Check cache first
             if self._is_cache_valid() and self._availability_cache is not None:
                 # If returning from cache and we have valid paths, return True
-                if self._availability_cache and self._zoekt_path and self._zoekt_index_path:
+                if (
+                    self._availability_cache
+                    and self._zoekt_path
+                    and self._zoekt_index_path
+                ):
                     return True
                 # If cache says available but paths are missing, we need to re-detect
                 # Fall through to detection logic
@@ -261,10 +275,13 @@ class ZoektStrategy(SearchStrategy):
                     for go_bin_path in go_paths:
                         if os.path.exists(go_bin_path):
                             candidate_zoekt = os.path.join(go_bin_path, "zoekt")
-                            candidate_zoekt_index = os.path.join(go_bin_path, "zoekt-index")
+                            candidate_zoekt_index = os.path.join(
+                                go_bin_path, "zoekt-index"
+                            )
 
-                            if (os.path.exists(candidate_zoekt) and
-                                os.path.exists(candidate_zoekt_index)):
+                            if os.path.exists(candidate_zoekt) and os.path.exists(
+                                candidate_zoekt_index
+                            ):
                                 zoekt_path = candidate_zoekt
                                 zoekt_index_path = candidate_zoekt_index
                                 break
@@ -275,8 +292,10 @@ class ZoektStrategy(SearchStrategy):
                     return False
 
                 # Validate binaries
-                if not (self._validate_binary(zoekt_path, "zoekt") and
-                        self._validate_binary(zoekt_index_path, "zoekt-index")):
+                if not (
+                    self._validate_binary(zoekt_path, "zoekt")
+                    and self._validate_binary(zoekt_index_path, "zoekt-index")
+                ):
                     self._logger.warning("Binary validation failed")
                     self._update_cache(False)
                     return False
@@ -284,10 +303,7 @@ class ZoektStrategy(SearchStrategy):
                 # Test if we can run zoekt with retry logic
                 def test_zoekt():
                     return subprocess.run(
-                        [zoekt_path],
-                        capture_output=True,
-                        text=True,
-                        timeout=5
+                        [zoekt_path], capture_output=True, text=True, timeout=5
                     )
 
                 result = self._execute_with_retry(test_zoekt)
@@ -299,7 +315,9 @@ class ZoektStrategy(SearchStrategy):
                     # Atomically update paths only if validation succeeded
                     self._zoekt_path = zoekt_path
                     self._zoekt_index_path = zoekt_index_path
-                    self._logger.info(f"Zoekt binaries found and validated: {zoekt_path}, {zoekt_index_path}")
+                    self._logger.info(
+                        f"Zoekt binaries found and validated: {zoekt_path}, {zoekt_index_path}"
+                    )
 
                 self._update_cache(is_available)
                 return is_available
@@ -320,12 +338,10 @@ class ZoektStrategy(SearchStrategy):
 
         # Try to get GOPATH from environment
         try:
+
             def get_gopath():
                 return subprocess.run(
-                    ["go", "env", "GOPATH"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
+                    ["go", "env", "GOPATH"], capture_output=True, text=True, timeout=5
                 )
 
             gopath_result = self._execute_with_retry(get_gopath)
@@ -338,13 +354,15 @@ class ZoektStrategy(SearchStrategy):
 
         # Add common Go binary locations
         home_dir = os.path.expanduser("~")
-        go_paths.extend([
-            os.path.join(home_dir, "go", "bin"),
-            "/usr/local/go/bin",
-            "/opt/go/bin",
-            "/usr/local/bin",
-            "/usr/bin"
-        ])
+        go_paths.extend(
+            [
+                os.path.join(home_dir, "go", "bin"),
+                "/usr/local/go/bin",
+                "/opt/go/bin",
+                "/usr/local/bin",
+                "/usr/bin",
+            ]
+        )
 
         return go_paths
 
@@ -357,7 +375,7 @@ class ZoektStrategy(SearchStrategy):
         """
         self._availability_cache = availability
         self._cache_timestamp = time.time()
-    
+
     def _ensure_index_exists(self, base_path: str) -> bool:
         """
         Ensure that a Zoekt index exists for the given base path with thread synchronization
@@ -388,7 +406,9 @@ class ZoektStrategy(SearchStrategy):
 
                 # Check for and handle index corruption
                 if self._check_index_corruption():
-                    self._logger.warning("Detected corrupted index, attempting recovery")
+                    self._logger.warning(
+                        "Detected corrupted index, attempting recovery"
+                    )
                     if not self._recover_corrupted_index():
                         self._logger.error("Failed to recover corrupted index")
                         return False
@@ -414,7 +434,9 @@ class ZoektStrategy(SearchStrategy):
             return False
 
         try:
-            index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+            index_files = [
+                f for f in os.listdir(self.index_dir) if f.endswith(".zoekt")
+            ]
             if not index_files:
                 return False
 
@@ -479,9 +501,11 @@ class ZoektStrategy(SearchStrategy):
             # Create index using zoekt-index with correct syntax
             cmd = [
                 self._zoekt_index_path,
-                "-index", self.index_dir,
-                "-parallelism", "2",  # Limit parallelism for stability
-                base_path
+                "-index",
+                self.index_dir,
+                "-parallelism",
+                "2",  # Limit parallelism for stability
+                base_path,
             ]
 
             def run_indexing():
@@ -489,7 +513,7 @@ class ZoektStrategy(SearchStrategy):
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=300  # 5 minutes timeout for indexing
+                    timeout=300,  # 5 minutes timeout for indexing
                 )
 
             result = self._execute_with_retry(run_indexing)
@@ -498,15 +522,23 @@ class ZoektStrategy(SearchStrategy):
                 self._index_initialized = True
 
                 # Verify index was created
-                index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+                index_files = [
+                    f for f in os.listdir(self.index_dir) if f.endswith(".zoekt")
+                ]
                 if index_files:
-                    self._logger.info(f"Zoekt index created successfully with {len(index_files)} shard(s)")
+                    self._logger.info(
+                        f"Zoekt index created successfully with {len(index_files)} shard(s)"
+                    )
                     return True
                 else:
-                    self._logger.error("Zoekt indexing completed but no index files found")
+                    self._logger.error(
+                        "Zoekt indexing completed but no index files found"
+                    )
                     return False
             else:
-                self._logger.error(f"Zoekt indexing failed with return code {result.returncode}")
+                self._logger.error(
+                    f"Zoekt indexing failed with return code {result.returncode}"
+                )
                 if result.stdout:
                     self._logger.error(f"STDOUT: {result.stdout}")
                 if result.stderr:
@@ -519,7 +551,7 @@ class ZoektStrategy(SearchStrategy):
         except Exception as e:
             self._logger.error(f"Error creating Zoekt index: {e}")
             return False
-    
+
     def search(
         self,
         pattern: str,
@@ -527,7 +559,7 @@ class ZoektStrategy(SearchStrategy):
         case_sensitive: bool = True,
         context_lines: int = 0,
         file_pattern: Optional[str] = None,
-        fuzzy: bool = False
+        fuzzy: bool = False,
     ) -> Dict[str, List[Tuple[int, str]]]:
         """
         Execute a search using Zoekt with retry logic and comprehensive error handling.
@@ -576,7 +608,7 @@ class ZoektStrategy(SearchStrategy):
                     cmd,
                     capture_output=True,
                     text=True,
-                    timeout=30  # 30 second timeout for searches
+                    timeout=30,  # 30 second timeout for searches
                 )
 
             result = self._execute_with_retry(run_search)
@@ -592,10 +624,14 @@ class ZoektStrategy(SearchStrategy):
             self._logger.error(f"Zoekt search timed out for pattern: {pattern}")
             raise RuntimeError("Zoekt search timed out")
         except Exception as e:
-            self._logger.error(f"Error running Zoekt search for pattern '{pattern}': {e}")
+            self._logger.error(
+                f"Error running Zoekt search for pattern '{pattern}': {e}"
+            )
             raise RuntimeError(f"Error running Zoekt: {e}")
 
-    def _build_search_query(self, pattern: str, file_pattern: Optional[str], fuzzy: bool) -> str:
+    def _build_search_query(
+        self, pattern: str, file_pattern: Optional[str], fuzzy: bool
+    ) -> str:
         """
         Build the search query for zoekt with proper escaping and file pattern handling.
 
@@ -616,25 +652,27 @@ class ZoektStrategy(SearchStrategy):
         # CRITICAL FIX: Validate pattern length to prevent DoS
         MAX_PATTERN_LENGTH = 1000
         if len(pattern) > MAX_PATTERN_LENGTH:
-            self._logger.error(f"Search pattern exceeds maximum length of {MAX_PATTERN_LENGTH}")
+            self._logger.error(
+                f"Search pattern exceeds maximum length of {MAX_PATTERN_LENGTH}"
+            )
             # Return safe pattern that matches nothing
-            return ''
+            return ""
 
         # CRITICAL FIX: Check for command injection patterns
         dangerous_patterns = [
-            ';',  # Command separator
-            '|',  # Pipe (could be used for command chaining)
-            '&',  # Background execution
-            '`',  # Command substitution
-            '$(',  # Command substitution
-            '\n',  # Newline injection
-            '\r',  # Carriage return injection
-            '\t',  # Tab injection
-            '\\',  # Escape character that could be abused
-            '<',  # Input redirection
-            '>',  # Output redirection
-            '(',   # Subshell start (unless part of valid regex)
-            ')',   # Subshell end
+            ";",  # Command separator
+            "|",  # Pipe (could be used for command chaining)
+            "&",  # Background execution
+            "`",  # Command substitution
+            "$(",  # Command substitution
+            "\n",  # Newline injection
+            "\r",  # Carriage return injection
+            "\t",  # Tab injection
+            "\\",  # Escape character that could be abused
+            "<",  # Input redirection
+            ">",  # Output redirection
+            "(",  # Subshell start (unless part of valid regex)
+            ")",  # Subshell end
         ]
 
         # Check if pattern contains dangerous characters that aren't part of valid search patterns
@@ -643,9 +681,9 @@ class ZoektStrategy(SearchStrategy):
             if dangerous in pattern:
                 # Some characters like '(' ')' might be valid in regex
                 # Only flag if they look like command injection attempts
-                if dangerous in ('(', ')'):
+                if dangerous in ("(", ")"):
                     # Check for suspicious patterns around parentheses
-                    if '$(' in pattern or '`' in pattern:
+                    if "$(" in pattern or "`" in pattern:
                         pattern_contains_dangerous = True
                         break
                 else:
@@ -653,9 +691,11 @@ class ZoektStrategy(SearchStrategy):
                     break
 
         if pattern_contains_dangerous:
-            self._logger.error(f"Potentially malicious search pattern detected: {pattern}")
+            self._logger.error(
+                f"Potentially malicious search pattern detected: {pattern}"
+            )
             # Return safe empty pattern
-            return ''
+            return ""
 
         # Construct the search query with file pattern if specified
         search_query = pattern
@@ -668,39 +708,45 @@ class ZoektStrategy(SearchStrategy):
                 return pattern  # Return just the search pattern without file filter
 
             # Check for dangerous characters in file pattern
-            file_pattern_contains_dangerous = any(d in file_pattern for d in dangerous_patterns)
+            file_pattern_contains_dangerous = any(
+                d in file_pattern for d in dangerous_patterns
+            )
             if file_pattern_contains_dangerous:
-                self._logger.error(f"Potentially malicious file pattern detected: {file_pattern}")
+                self._logger.error(
+                    f"Potentially malicious file pattern detected: {file_pattern}"
+                )
                 return pattern  # Return just the search pattern
 
             if file_pattern.startswith("*."):
                 # Simple extension pattern - zoekt uses file:ext syntax
                 # CRITICAL FIX: Validate extension contains only safe characters
                 ext = file_pattern[2:]
-                if not ext or not all(c.isalnum() or c in '._-' for c in ext):
+                if not ext or not all(c.isalnum() or c in "._-" for c in ext):
                     self._logger.error(f"Invalid file extension: {ext}")
                     return pattern
                 search_query = f"file:{ext} {pattern}"
             else:
                 # For more complex patterns, validate carefully
-                if '*' in file_pattern:
+                if "*" in file_pattern:
                     # Try to extract extension from glob pattern
                     if file_pattern.endswith("*"):
                         base = file_pattern[:-1]
                         # Validate base pattern
-                        if not all(c.isalnum() or c in '._-/' for c in base):
+                        if not all(c.isalnum() or c in "._-/" for c in base):
                             self._logger.error(f"Invalid file pattern base: {base}")
                             return pattern
                         search_query = f"file:{base} {pattern}"
                     else:
                         # Complex pattern - validate and use as-is
-                        if not all(c.isalnum() or c in '._-*/?' for c in file_pattern):
-                            self._logger.error(f"Invalid characters in file pattern: {file_pattern}")
+                        if not all(c.isalnum() or c in "._-*/?" for c in file_pattern):
+                            self._logger.error(
+                                f"Invalid characters in file pattern: {file_pattern}"
+                            )
                             return pattern
                         search_query = pattern
                 else:
                     # Exact filename match
-                    if not all(c.isalnum() or c in '._-/' for c in file_pattern):
+                    if not all(c.isalnum() or c in "._-/" for c in file_pattern):
                         self._logger.error(f"Invalid filename: {file_pattern}")
                         return pattern
                     search_query = f"file:{file_pattern} {pattern}"
@@ -711,39 +757,43 @@ class ZoektStrategy(SearchStrategy):
             # CRITICAL FIX: Validate regex pattern is safe
             try:
                 import re
+
                 # Try to compile the regex to validate it
                 re.compile(search_query)
             except re.error as e:
                 self._logger.error(f"Invalid search pattern '{search_query}': {e}")
-                return ''
+                return ""
             return search_query
         else:
             # For literal search, escape special regex characters in the pattern part only
             import re
+
             if file_pattern and " " in search_query:
                 # Split the query and escape only the pattern part
-                parts = search_query.split(' ', 1)
+                parts = search_query.split(" ", 1)
                 if len(parts) == 2:
                     file_part, pattern_part = parts
                     # CRITICAL FIX: Escape special regex characters but keep it safe
                     # Only escape characters that could be interpreted as regex
                     escaped_pattern = pattern_part
                     # Characters to escape for literal search: . * + ? ^ $ { } [ ] ( ) | \
-                    regex_chars = r'.*+?^${}[]()|\\'
+                    regex_chars = r".*+?^${}[]()|\\"
                     for char in regex_chars:
-                        escaped_pattern = escaped_pattern.replace(char, '\\' + char)
+                        escaped_pattern = escaped_pattern.replace(char, "\\" + char)
                     return f"{file_part} {escaped_pattern}"
                 else:
                     return search_query
             else:
                 # CRITICAL FIX: Escape the entire query if no file pattern
                 escaped_pattern = pattern
-                regex_chars = r'.*+?^${}[]()|\\'
+                regex_chars = r".*+?^${}[]()|\\"
                 for char in regex_chars:
-                    escaped_pattern = escaped_pattern.replace(char, '\\' + char)
+                    escaped_pattern = escaped_pattern.replace(char, "\\" + char)
                 return escaped_pattern
 
-    def _handle_search_error(self, result: subprocess.CompletedProcess, pattern: str) -> Dict[str, List[Tuple[int, str]]]:
+    def _handle_search_error(
+        self, result: subprocess.CompletedProcess, pattern: str
+    ) -> Dict[str, List[Tuple[int, str]]]:
         """
         Handle search command errors and return appropriate results.
 
@@ -764,24 +814,26 @@ class ZoektStrategy(SearchStrategy):
                 error_msg += f": {result.stderr}"
             self._logger.error(error_msg)
             raise RuntimeError(error_msg)
-    
-    def _parse_zoekt_output(self, output: str, base_path: str) -> Dict[str, List[Tuple[int, str]]]:
+
+    def _parse_zoekt_output(
+        self, output: str, base_path: str
+    ) -> Dict[str, List[Tuple[int, str]]]:
         """
         Parse Zoekt output format.
-        
+
         Zoekt output format is similar to grep:
         filename:line_number:content
-        
+
         Args:
             output: Raw output from Zoekt
             base_path: Base path for making paths relative
-            
+
         Returns:
             Parsed search results
         """
         # Zoekt output is similar to grep, so we can reuse the parse function
         return parse_search_output(output, base_path)
-    
+
     def refresh_index(self, base_path: str) -> bool:
         """
         Refresh the Zoekt index for the given base path with thread synchronization
@@ -820,7 +872,7 @@ class ZoektStrategy(SearchStrategy):
             except Exception as e:
                 self._logger.error(f"Error refreshing Zoekt index: {e}")
                 return False
-    
+
     def get_index_info(self) -> Dict[str, any]:
         """
         Get information about the current Zoekt index with thread safety and error handling.
@@ -838,24 +890,28 @@ class ZoektStrategy(SearchStrategy):
                     "zoekt_index_path": self._zoekt_index_path,
                     "cache_valid": self._is_cache_valid(),
                     "cache_timestamp": self._cache_timestamp,
-                    "availability_cache": self._availability_cache
+                    "availability_cache": self._availability_cache,
                 }
 
                 # Handle case where index directory doesn't exist
                 if not os.path.exists(self.index_dir):
-                    info.update({
-                        "index_files": [],
-                        "index_file_count": 0,
-                        "index_corrupted": False,
-                        "index_size_bytes": 0,
-                        "index_size_mb": 0.0,
-                        "index_file_details": [],
-                        "error": f"Index directory does not exist: {self.index_dir}"
-                    })
+                    info.update(
+                        {
+                            "index_files": [],
+                            "index_file_count": 0,
+                            "index_corrupted": False,
+                            "index_size_bytes": 0,
+                            "index_size_mb": 0.0,
+                            "index_file_details": [],
+                            "error": f"Index directory does not exist: {self.index_dir}",
+                        }
+                    )
                     return info
 
                 try:
-                    index_files = [f for f in os.listdir(self.index_dir) if f.endswith('.zoekt')]
+                    index_files = [
+                        f for f in os.listdir(self.index_dir) if f.endswith(".zoekt")
+                    ]
                     info["index_files"] = index_files
                     info["index_file_count"] = len(index_files)
                     info["index_corrupted"] = self._check_index_corruption()
@@ -875,26 +931,35 @@ class ZoektStrategy(SearchStrategy):
                         file_path = os.path.join(self.index_dir, filename)
                         if os.path.exists(file_path):
                             stat_info = os.stat(file_path)
-                            index_details.append({
-                                "name": filename,
-                                "size_bytes": stat_info.st_size,
-                                "size_mb": round(stat_info.st_size / (1024 * 1024), 2),
-                                "modified_time": stat_info.st_mtime,
-                                "modified_time_iso": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat_info.st_mtime))
-                            })
+                            index_details.append(
+                                {
+                                    "name": filename,
+                                    "size_bytes": stat_info.st_size,
+                                    "size_mb": round(
+                                        stat_info.st_size / (1024 * 1024), 2
+                                    ),
+                                    "modified_time": stat_info.st_mtime,
+                                    "modified_time_iso": time.strftime(
+                                        "%Y-%m-%d %H:%M:%S",
+                                        time.localtime(stat_info.st_mtime),
+                                    ),
+                                }
+                            )
                     info["index_file_details"] = index_details
 
                 except (OSError, IOError) as e:
                     self._logger.warning(f"Error reading index directory: {e}")
-                    info.update({
-                        "index_read_error": str(e),
-                        "index_files": [],
-                        "index_file_count": 0,
-                        "index_corrupted": True,
-                        "index_size_bytes": 0,
-                        "index_size_mb": 0.0,
-                        "index_file_details": []
-                    })
+                    info.update(
+                        {
+                            "index_read_error": str(e),
+                            "index_files": [],
+                            "index_file_count": 0,
+                            "index_corrupted": True,
+                            "index_size_bytes": 0,
+                            "index_size_mb": 0.0,
+                            "index_file_details": [],
+                        }
+                    )
 
                 return info
 
@@ -910,5 +975,5 @@ class ZoektStrategy(SearchStrategy):
                     "index_corrupted": False,
                     "index_size_bytes": 0,
                     "index_size_mb": 0.0,
-                    "index_file_details": []
+                    "index_file_details": [],
                 }
