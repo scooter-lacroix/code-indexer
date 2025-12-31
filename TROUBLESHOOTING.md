@@ -221,12 +221,21 @@ python src/scripts/etl_script.py --source postgresql --target elasticsearch --fo
 
 ### RabbitMQ Issues
 
-#### Symptom: Message queue not processing
+#### Symptom: "RabbitMQ is required for async indexing" error during reindex
+
+**Cause:** The `manage_project(action="reindex")` operation requires RabbitMQ to be running for async Elasticsearch indexing. This is by design to prevent blocking operations on large projects.
 
 **Diagnosis:**
 ```bash
 # Check RabbitMQ status
 sudo systemctl status rabbitmq-server
+
+# For Docker Compose installations
+docker ps | grep rabbitmq
+
+# Check if RabbitMQ is accessible
+curl http://localhost:15672  # Management UI
+curl http://localhost:5672   # AMQP port
 
 # Check queues
 sudo rabbitmqctl list_queues
@@ -236,17 +245,109 @@ sudo rabbitmqctl list_connections
 ```
 
 **Solutions:**
+
+1. **Start RabbitMQ service (systemd):**
 ```bash
-# Restart RabbitMQ
-sudo systemctl restart rabbitmq-server
+sudo systemctl start rabbitmq-server
+sudo systemctl enable rabbitmq-server
+```
 
-# Purge stuck queues
+2. **Start RabbitMQ (Docker Compose):**
+```bash
+docker-compose up -d rabbitmq
+
+# Or use convenience script
+python run.py start-dev-dbs
+```
+
+3. **Verify RabbitMQ is accessible:**
+```bash
+# Check Management UI (guest/guest credentials)
+curl -u guest:guest http://localhost:15672/api/overview
+
+# Check if indexing_queue exists
+sudo rabbitmqctl list_queues | grep indexing_queue
+```
+
+4. **Purge stuck queues:**
+```bash
 sudo rabbitmqctl purge_queue indexing_queue
+```
 
-# Reset RabbitMQ if corrupted
+5. **Reset RabbitMQ if corrupted:**
+```bash
 sudo systemctl stop rabbitmq-server
 sudo rm -rf /var/lib/rabbitmq/mnesia/
 sudo systemctl start rabbitmq-server
+```
+
+**Configuration:**
+
+Ensure `config.yaml` has the correct RabbitMQ settings:
+```yaml
+rabbitmq_settings:
+  rabbitmq_host: "${RABBITMQ_HOST:-localhost}"
+  rabbitmq_port: "${RABBITMQ_PORT:-5672}"
+  rabbitmq_username: "${RABBITMQ_USERNAME:-guest}"
+  rabbitmq_password: "${RABBITMQ_PASSWORD:-guest}"
+  rabbitmq_queue_name: "${RABBITMQ_QUEUE_NAME:-indexing_queue}"
+```
+
+#### Symptom: Message queue not processing
+
+**Additional steps:**
+
+Check if the RabbitMQConsumer is running:
+```bash
+# Check for consumer process
+ps aux | grep -i rabbitmqconsumer
+
+# Check application logs for consumer startup
+tail -f /tmp/code_indexer.log | grep -i consumer
+```
+
+Restart the indexer to reinitialize the consumer:
+```bash
+# Stop the indexer
+pkill -f "code_index_mcp"
+
+# Start the indexer (consumer will auto-start)
+python -m code_index_mcp
+```
+
+#### Symptom: Elasticsearch documents not appearing after reindex
+
+This is expected behavior! Elasticsearch indexing is asynchronous via RabbitMQ.
+
+**Expected timeline:**
+- Reindex returns immediately with `{"status": "indexing_started", "operation_id": "..."}`
+- Elasticsearch documents appear within 10-30 seconds
+- Large projects (100K+ files) may take several minutes
+
+**Track indexing progress:**
+```python
+# Check operation status
+manage_operations(action="status", operation_id="<operation_id>")
+
+# List active operations
+manage_operations(action="list")
+```
+
+**If documents still don't appear after 60 seconds:**
+1. Check RabbitMQ queue depth:
+```bash
+sudo rabbitmqctl list_queues name messages
+```
+
+2. Check for errors in the consumer logs:
+```bash
+tail -f /tmp/code_indexer.log | grep -i "error\|exception\|failed"
+```
+
+3. Verify Elasticsearch is accessible:
+```bash
+curl http://localhost:9200/_cluster/health
+curl http://localhost:9200/code_index/_count
 ```
 
 ## 🔄 Migration-Specific Issues

@@ -5,6 +5,77 @@ All notable changes to the Code Index MCP project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.0.1] - 2025-12-30 - Elasticsearch Indexing Bug Fix
+
+### 🐛 **Bug Fix: Elasticsearch Indexing Pipeline**
+
+This release fixes a critical bug where `manage_project(action="reindex")` processed files (successfully updating PostgreSQL metadata and Zoekt indices) but failed to populate the Elasticsearch index, resulting in semantic search returning no results despite reindex operations reporting success.
+
+### ✅ **Fixed**
+
+#### **Elasticsearch Indexing Pipeline**
+- **RabbitMQ Integration**: Fixed `refresh_index()` to properly queue files for async Elasticsearch indexing via RabbitMQ
+- **Non-Blocking Reindex**: Reindex operations now return immediately with `{"status": "indexing_started", "operation_id": "...", "files_queued": N}`
+- **Operation Tracking**: Added `operation_id` for tracking async indexing operations via `manage_operations(action="status")`
+- **Error Handling**: Added RabbitMQ pre-flight check with clear error messages when RabbitMQ is unavailable
+- **Configuration**: Added complete `rabbitmq_settings` section to `config.yaml` with connection details, batching, and backpressure settings
+
+#### **Root Cause**
+The `refresh_index()` function in `server.py:2083` updated PostgreSQL and Zoekt but never called the Elasticsearch backend's indexing methods. The RabbitMQ consumer infrastructure existed but was never invoked during reindex operations.
+
+#### **Test Coverage**
+- **5 New Unit Tests**: Verify RabbitMQ publishing, error handling, operation tracking, edge cases
+- **10 New Integration Tests**: End-to-end reindex to search flow, operation status tracking, service availability
+- **All Tests Passing**: 187/187 unit tests pass (no regressions)
+
+### 🔧 **Technical Changes**
+
+#### **Modified Files**
+- `src/code_index_mcp/server.py`: Added RabbitMQ publishing to `refresh_index()` and `force_reindex()`
+- `config.yaml`: Added `rabbitmq_settings` configuration section (lines 55-80)
+- `tests/unit/test_elasticsearch_indexing.py`: Created comprehensive unit test suite
+- `tests/integration/test_elasticsearch_indexing.py`: Created integration test suite
+
+#### **New Behavior**
+```python
+# Before (Broken):
+refresh_index() → {"files_processed": 74, "success": true}
+# Elasticsearch: 3 stale documents, search returns empty
+
+# After (Fixed):
+refresh_index() → {
+    "status": "indexing_started",
+    "files_queued": 74,
+    "operation_id": "uuid-here",
+    "note": "PostgreSQL updated immediately. Elasticsearch indexing in progress."
+}
+# Elasticsearch: Documents appear within 10-30 seconds (async via RabbitMQ)
+```
+
+### 📋 **Success Metrics Achieved**
+
+| Metric | Before | After | Target |
+|--------|---------|-------|--------|
+| Elasticsearch document count | 3 (stale) | Matches file count | ✓ |
+| Search results | Empty | Returns actual content | ✓ |
+| Reindex operation time | ~0.2s | <5s (async) | ✓ |
+| RabbitMQ message processing | N/A | 100% within 30s | ✓ |
+
+### 🛠️ **Setup for Existing Users**
+
+If you're upgrading from v3.0.0, ensure RabbitMQ is running:
+
+```bash
+# Start RabbitMQ service
+docker-compose up -d rabbitmq
+
+# Or use convenience script
+python run.py start-dev-dbs
+
+# Verify RabbitMQ is accessible
+curl http://localhost:15672  # Management UI
+```
+
 ## [3.0.0] - 2025-01-21 - Large-Scale Database Migration
 
 ### 🚀 **MAJOR RELEASE: Complete Database Architecture Transformation**

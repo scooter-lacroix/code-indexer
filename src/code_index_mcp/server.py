@@ -2244,7 +2244,12 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
 
 async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any]:
     """Force a complete re-index of the project, ignoring incremental metadata.
-    
+
+    Phase 2 RabbitMQ Integration:
+    - Queues files to RabbitMQ for asynchronous Elasticsearch indexing
+    - Returns 'indexing_started' status with operation_id
+    - Fails gracefully if RabbitMQ is unavailable
+
     Args:
         clear_cache: Whether to clear all cached data before re-indexing (default: True)
     """
@@ -2255,6 +2260,26 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
         return {
             "error": "Project path not set. Please use set_project_path to set a project directory first.",
             "success": False
+        }
+
+    # PHASE 2: Check RabbitMQ availability
+    realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
+
+    if not realtime_indexer or not realtime_indexer.producer:
+        return {
+            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
+            "success": False,
+            "rabbitmq_required": True
+        }
+
+    # Check if RabbitMQ producer has active connection
+    if not realtime_indexer.producer.channel or \
+       not realtime_indexer.producer.connection or \
+       realtime_indexer.producer.connection.is_closed:
+        return {
+            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
+            "success": False,
+            "rabbitmq_required": True
         }
 
     try:
@@ -2331,22 +2356,56 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             )
             
             logger.info(f"Force re-indexing {total_files} files...")
-            
-            # Stage 3: Full Indexing
+
+            # Stage 3: Queue files to RabbitMQ for Elasticsearch indexing
             await progress_tracker.update_progress(
                 stage_index=2,
-                message=f"Starting full indexing of {total_files} files..."
+                message=f"Queuing {total_files} files to RabbitMQ for indexing..."
             )
-            
-            # Force full re-index by using the regular indexing function
-            # but with cleared metadata so everything is treated as new
-            file_count = await _index_project_with_progress(base_path, progress_tracker, ctx.request_context.lifespan_context.core_engine)
-            ctx.request_context.lifespan_context.file_count = file_count
-            
+
+            # PHASE 2: Collect all files and queue to RabbitMQ
+            files_to_queue = []
+            for root, dirs, files in os.walk(base_path):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    files_to_queue.append(file_path)
+                # Check for cancellation periodically
+                if len(files_to_queue) % 100 == 0:
+                    progress_tracker.cancellation_token.check_cancelled()
+
+            # PHASE 2: Publish each file to RabbitMQ
+            files_queued = 0
+            producer = realtime_indexer.producer
+
+            for file_path in files_to_queue:
+                # Check for cancellation
+                if files_queued % 100 == 0:
+                    progress_tracker.cancellation_token.check_cancelled()
+
+                # Create indexing operation message
+                operation = {
+                    "type": "index",
+                    "file_path": file_path,
+                    "timestamp": datetime.now().isoformat(),
+                    "metadata": {"source": "force_reindex"}
+                }
+
+                # Publish to RabbitMQ
+                producer.publish(operation)
+                files_queued += 1
+
+                # Update progress periodically
+                if files_queued % 100 == 0:
+                    await progress_tracker.update_progress(
+                        message=f"Queued {files_queued}/{total_files} files to RabbitMQ..."
+                    )
+
+            logger.info(f"Force re-index: Queued {files_queued} files to RabbitMQ for indexing")
+
             # Stage 4: Saving
             await progress_tracker.update_progress(
                 stage_index=3,
-                message="Saving complete index and metadata..."
+                message="Updating metadata..."
             )
             
             # Save the new index
@@ -2361,28 +2420,24 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             })
             
             await progress_tracker.update_progress(
-                message="Force re-index completed successfully"
+                message=f"Force re-index started: {files_queued} files queued to RabbitMQ"
             )
 
-        # Get final stats
-        settings = ctx.request_context.lifespan_context.settings
-        indexer = IncrementalIndexer(settings)
-        stats = indexer.get_stats()
-        
-        # Log completion
+        # PHASE 2: Log completion
         if performance_monitor:
-            performance_monitor.log_structured("info", "Force re-index completed successfully", 
-                                             base_path=base_path, files_processed=file_count,
+            performance_monitor.log_structured("info", "Force re-index started (async via RabbitMQ)",
+                                             base_path=base_path, files_queued=files_queued,
                                              elapsed_time=progress_tracker.elapsed_time)
             performance_monitor.increment_counter("force_reindex_operations_total")
 
+        # PHASE 2: Return indexing_started status instead of completion
         return {
+            "status": "indexing_started",
             "success": True,
-            "message": f"Force re-index completed. Processed {file_count} files from scratch.",
+            "message": f"Queued {files_queued} files to RabbitMQ for Elasticsearch indexing.",
             "operation_id": progress_tracker.operation_id,
-            "files_processed": file_count,
+            "files_queued": files_queued,
             "cache_cleared": clear_cache,
-            "metadata_stats": stats,
             "elapsed_time": progress_tracker.elapsed_time
         }
         
