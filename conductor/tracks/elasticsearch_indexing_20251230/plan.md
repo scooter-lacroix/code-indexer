@@ -27,16 +27,16 @@
   - After fixes, codex-reviewer re-reviews for rigor verification
   - Only proceed to Phase 2 when codex-reviewer approves
 
-## Phase 2: RabbitMQ Integration (Unit Tests - TDD)
+## Phase 2: RabbitMQ Integration (Unit Tests - TDD) [checkpoint: f4b8a9e]
 
-- [ ] Task: Write unit test `test_refresh_index_queues_to_rabbitmq` (TDD - Write Test)
+- [x] Task: Write unit test `test_refresh_index_queues_to_rabbitmq` (TDD - Write Test)
   - Create test file `tests/unit/test_elasticsearch_indexing.py`
   - Mock RabbitMQ connection
   - Test that `refresh_index()` publishes to RabbitMQ
   - Test return value includes `operation_id` and `"indexing_started"` status
   - Verify test fails initially (TDD red phase)
 
-- [ ] Task: Implement RabbitMQ publishing in `refresh_index()` (TDD - Implement)
+- [x] Task: Implement RabbitMQ publishing in `refresh_index()` (TDD - Implement)
   - Import `RabbitMQConsumer` from `realtime_indexer.py`
   - Add RabbitMQ pre-flight check
   - Publish files to RabbitMQ queue after PostgreSQL update
@@ -44,32 +44,32 @@
   - Update return value to `"indexing_started"` status
   - Verify unit test passes
 
-- [ ] Task: Write unit test `test_rabbitmq_unavailable_fails_gracefully` (TDD - Write Test)
+- [x] Task: Write unit test `test_rabbitmq_unavailable_fails_gracefully` (TDD - Write Test)
   - Mock RabbitMQ as unavailable/down
   - Test that `refresh_index()` returns error (does not hang)
   - Test error message mentions RabbitMQ requirement
   - Verify test fails initially
 
-- [ ] Task: Implement RabbitMQ error handling (TDD - Implement)
+- [x] Task: Implement RabbitMQ error handling (TDD - Implement)
   - Add `_rabbitmq_connected()` check method
   - Return error early if RabbitMQ unavailable
   - Include helpful error message with setup instructions
   - Verify unit test passes
 
-- [ ] Task: Write unit test `test_operation_tracking_created` (TDD - Write Test)
+- [x] Task: Write unit test `test_operation_tracking_created` (TDD - Write Test)
   - Test that operation tracker records new operation
   - Test operation has correct `operation_id`
   - Test operation status is `"in_progress"`
   - Verify test fails initially
 
-- [ ] Task: Implement operation tracking in `refresh_index()` (TDD - Implement)
+- [x] Task: Implement operation tracking in `refresh_index()` (TDD - Implement)
   - Create operation record via operation tracker
   - Set `files_queued` count
   - Set initial status to `"in_progress"`
   - Return `operation_id` in response
   - Verify unit test passes
 
-- [ ] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 2' (Zero Tolerance - Tsar of Excellence)
+- [x] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 2' (Zero Tolerance - Tsar of Excellence)
   - Deploy codex-reviewer agent to conduct comprehensive review
   - Review must cover: TDD compliance, error handling, operation tracking
   - All findings must be debugged (amp-code or opencode-scaffolder)
