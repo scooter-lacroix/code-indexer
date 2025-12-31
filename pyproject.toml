@@ -15,6 +15,7 @@ authors = [
 dependencies = [
     "alembic>=1.16.4",
     "aiofiles>=23.2.1",
+    "aiohttp>=3.9.0",
     "elasticsearch==8.10.0",
     "mcp>=0.3.0",
     "pdfminer-six>=20250506",

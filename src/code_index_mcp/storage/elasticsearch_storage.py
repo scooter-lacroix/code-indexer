@@ -529,10 +529,31 @@ class ElasticsearchSearch(SearchInterface):
         query load for frequently searched terms.
 
         Can handle both direct queries and SQLite-style patterns.
+
+        CRITICAL FIX: Raises meaningful error when Elasticsearch is unavailable
+        instead of silently returning empty results.
         """
         if not hasattr(self, '_connected') or not self._connected:
-            logger.debug(f"Elasticsearch not connected, returning empty results for content search")
-            return []
+            # Check if aiohttp is available
+            try:
+                import aiohttp
+                # aiohttp is available, but ES is not connected
+                error_msg = (
+                    "Elasticsearch backend is not connected. "
+                    "Please ensure Elasticsearch is running on localhost:9200 "
+                    "or check your Elasticsearch configuration."
+                )
+            except ImportError:
+                # aiohttp is missing - this is the root cause
+                error_msg = (
+                    "Elasticsearch backend is unavailable: the 'aiohttp' module is not installed. "
+                    "This is a required dependency for Elasticsearch connectivity. "
+                    "Please reinstall dependencies: pip install -e ."
+                )
+
+            logger.error(error_msg)
+            # Raise an error to make the failure visible instead of silently returning empty results
+            raise RuntimeError(error_msg)
 
         # PERFORMANCE FIX: Check cache first
         if self._cache_enabled and self._cache:
@@ -602,10 +623,31 @@ class ElasticsearchSearch(SearchInterface):
         query load for frequently searched path patterns.
 
         Can handle both direct queries and SQLite-style patterns.
+
+        CRITICAL FIX: Raises meaningful error when Elasticsearch is unavailable
+        instead of silently returning empty results.
         """
         if not hasattr(self, '_connected') or not self._connected:
-            logger.debug(f"Elasticsearch not connected, returning empty results for file path search")
-            return []
+            # Check if aiohttp is available
+            try:
+                import aiohttp
+                # aiohttp is available, but ES is not connected
+                error_msg = (
+                    "Elasticsearch backend is not connected. "
+                    "Please ensure Elasticsearch is running on localhost:9200 "
+                    "or check your Elasticsearch configuration."
+                )
+            except ImportError:
+                # aiohttp is missing - this is the root cause
+                error_msg = (
+                    "Elasticsearch backend is unavailable: the 'aiohttp' module is not installed. "
+                    "This is a required dependency for Elasticsearch connectivity. "
+                    "Please reinstall dependencies: pip install -e ."
+                )
+
+            logger.error(error_msg)
+            # Raise an error to make the failure visible instead of silently returning empty results
+            raise RuntimeError(error_msg)
 
         # PERFORMANCE FIX: Check cache first for path searches
         if self._cache_enabled and self._cache:

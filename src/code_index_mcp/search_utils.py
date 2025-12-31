@@ -635,9 +635,28 @@ class BackendHealthChecker:
 
     @staticmethod
     def check_elasticsearch_backend(search_backend: SearchInterface) -> Dict[str, Any]:
-        """Check Elasticsearch backend health."""
+        """
+        Check Elasticsearch backend health with detailed diagnostics.
+
+        CRITICAL FIX: Detects missing aiohttp dependency and provides
+        actionable error messages instead of generic failures.
+        """
         if not SearchBackendSelector.is_elasticsearch_backend(search_backend):
             return {"healthy": False, "reason": "Not an Elasticsearch backend"}
+
+        # Check for aiohttp dependency first
+        try:
+            import aiohttp
+        except ImportError:
+            return {
+                "healthy": False,
+                "backend_type": "Elasticsearch",
+                "reason": "Required dependency 'aiohttp' is not installed. "
+                         "This module is required for Elasticsearch connectivity. "
+                         "Please reinstall dependencies: pip install -e .",
+                "error_type": "ImportError",
+                "missing_dependency": "aiohttp"
+            }
 
         try:
             # Try a simple query to test connectivity
@@ -646,6 +665,23 @@ class BackendHealthChecker:
                 "healthy": True,
                 "backend_type": "Elasticsearch",
                 "test_results_count": len(test_results) if test_results else 0
+            }
+        except RuntimeError as e:
+            # Handle our enhanced error messages
+            error_msg = str(e)
+            if "aiohttp" in error_msg and "not installed" in error_msg:
+                return {
+                    "healthy": False,
+                    "backend_type": "Elasticsearch",
+                    "reason": error_msg,
+                    "error_type": "RuntimeError",
+                    "missing_dependency": "aiohttp"
+                }
+            return {
+                "healthy": False,
+                "backend_type": "Elasticsearch",
+                "reason": error_msg,
+                "error_type": "RuntimeError"
             }
         except Exception as e:
             return {
