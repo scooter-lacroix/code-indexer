@@ -2081,9 +2081,15 @@ def _has_docstrings(lines: List[str]) -> bool:
     return False
 
 async def refresh_index(ctx: Context) -> Dict[str, Any]:
-    """Refresh the project index using incremental indexing with progress tracking."""
+    """Refresh the project index using incremental indexing with progress tracking.
+
+    Phase 2 RabbitMQ Integration:
+    - Queues files to RabbitMQ for asynchronous Elasticsearch indexing
+    - Returns 'indexing_started' status with operation_id
+    - Fails gracefully if RabbitMQ is unavailable
+    """
     import asyncio  # Ensure asyncio is available in this function scope
-    
+
     base_path = ctx.request_context.lifespan_context.base_path
 
     # Check if base_path is set
@@ -2091,6 +2097,26 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
         return {
             "error": "Project path not set. Please use set_project_path to set a project directory first.",
             "success": False
+        }
+
+    # PHASE 2: Check RabbitMQ availability
+    realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
+
+    if not realtime_indexer or not realtime_indexer.producer:
+        return {
+            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
+            "success": False,
+            "rabbitmq_required": True
+        }
+
+    # Check if RabbitMQ producer has active connection
+    if not realtime_indexer.producer.channel or \
+       not realtime_indexer.producer.connection or \
+       realtime_indexer.producer.connection.is_closed:
+        return {
+            "error": "RabbitMQ is required for async indexing. Start it with: python run.py start-dev-dbs",
+            "success": False,
+            "rabbitmq_required": True
         }
 
     try:
@@ -2108,9 +2134,9 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
         async with ProgressContext(
             operation_name="Index Refresh",
             total_items=1000,  # Will be updated with actual file count
-            stages=["Scanning", "Indexing", "Saving"]
+            stages=["Scanning", "Queuing", "Saving"]
         ) as progress_tracker:
-            
+
             # Add cleanup task to save partial state on cancellation
             def cleanup_partial_state():
                 try:
@@ -2119,71 +2145,89 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
                         logger.info("Saved partial index state during cancellation")
                 except Exception as e:
                     logger.error(f"Error saving partial state: {e}")
-            
+
             progress_tracker.add_cleanup_task(cleanup_partial_state)
-            
+
             # Stage 1: Scanning
             await progress_tracker.update_progress(
                 stage_index=0,
                 message="Starting directory scan..."
             )
-            
-            # Count files first for accurate progress tracking
-            total_files = 0
+
+            # PHASE 2: Collect all files for RabbitMQ publishing
+            files_to_queue = []
             for root, dirs, files in os.walk(base_path):
-                total_files += len(files)
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    files_to_queue.append(file_path)
                 # Check for cancellation periodically
-                if total_files % 100 == 0:
+                if len(files_to_queue) % 100 == 0:
                     progress_tracker.cancellation_token.check_cancelled()
-            
+
+            total_files = len(files_to_queue)
+
             # Update total items with actual count
             progress_tracker.total_items = max(total_files, 1)
-            
+
             await progress_tracker.update_progress(
                 message=f"Found {total_files} files to process"
             )
-            
-            # Stage 2: Indexing
+
+            # Stage 2: Queue files to RabbitMQ for Elasticsearch indexing
             await progress_tracker.update_progress(
                 stage_index=1,
-                message="Starting incremental indexing..."
+                message="Queuing files to RabbitMQ for indexing..."
             )
-            
-            # Re-index the project with incremental indexing and progress tracking
-            file_count = await _index_project_with_progress(base_path, progress_tracker, ctx.request_context.lifespan_context.core_engine)
-            ctx.request_context.lifespan_context.file_count = file_count
-            
+
+            # PHASE 2: Publish each file to RabbitMQ
+            files_queued = 0
+            producer = realtime_indexer.producer
+
+            for file_path in files_to_queue:
+                # Check for cancellation
+                if files_queued % 100 == 0:
+                    progress_tracker.cancellation_token.check_cancelled()
+
+                # Create indexing operation message
+                operation = {
+                    "type": "index",
+                    "file_path": file_path,
+                    "timestamp": datetime.now().isoformat()
+                }
+
+                # Publish to RabbitMQ
+                producer.publish(operation)
+                files_queued += 1
+
+            logger.info(f"Queued {files_queued} files to RabbitMQ for indexing")
+
             # Stage 3: Saving
             await progress_tracker.update_progress(
                 stage_index=2,
-                message="Saving index and metadata..."
+                message="Updating metadata..."
             )
-            
-            # Save the updated index
-            ctx.request_context.lifespan_context.settings.save_index(file_index)
-            
+
             # Update the last indexed timestamp in config
             config = ctx.request_context.lifespan_context.settings.load_config()
             ctx.request_context.lifespan_context.settings.save_config({
                 **config,
                 'last_indexed': ctx.request_context.lifespan_context.settings._get_timestamp()
             })
-            
+
+            # Update file count
+            ctx.request_context.lifespan_context.file_count = total_files
+
             await progress_tracker.update_progress(
-                message="Index refresh completed successfully"
+                message=f"Indexing started: {files_queued} files queued to RabbitMQ"
             )
 
-        # Get incremental indexing stats for the response
-        settings = ctx.request_context.lifespan_context.settings
-        indexer = IncrementalIndexer(settings)
-        stats = indexer.get_stats()
-
+        # PHASE 2: Return indexing_started status instead of completion
         return {
+            "status": "indexing_started",
             "success": True,
-            "message": f"Project re-indexed using incremental indexing. Found {file_count} files.",
+            "message": f"Queued {files_queued} files to RabbitMQ for Elasticsearch indexing.",
             "operation_id": progress_tracker.operation_id,
-            "files_processed": file_count,
-            "metadata_stats": stats,
+            "files_queued": files_queued,
             "elapsed_time": progress_tracker.elapsed_time
         }
     except asyncio.CancelledError:
