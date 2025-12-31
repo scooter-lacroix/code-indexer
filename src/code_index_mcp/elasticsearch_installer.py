@@ -27,7 +27,9 @@ class ElasticsearchInstaller:
         """Setup logging configuration."""
         logger = logging.getLogger(__name__)
         if not logger.handlers:
-            handler = logging.StreamHandler(sys.stdout)
+            # Use stderr to avoid contaminating MCP stdio transport
+            # MCP uses stdout exclusively for JSON-RPC protocol messages
+            handler = logging.StreamHandler(sys.stderr)
             formatter = logging.Formatter(
                 '%(asctime)s - %(levelname)s - %(message)s'
             )

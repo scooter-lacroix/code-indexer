@@ -224,8 +224,8 @@ ES_HEAP_MEMORY_LIMIT_MB = 4096
 """Number of shards for Elasticsearch index (3)."""
 ES_INDEX_NUMBER_OF_SHARDS = 3
 
-"""Number of replicas for Elasticsearch index (1)."""
-ES_INDEX_NUMBER_OF_REPLICAS = 1
+"""Number of replicas for Elasticsearch index (0 for single-node clusters)."""
+ES_INDEX_NUMBER_OF_REPLICAS = 0
 
 """Index refresh interval in seconds (1s)."""
 ES_INDEX_REFRESH_INTERVAL = "1s"

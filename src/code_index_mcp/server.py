@@ -104,8 +104,8 @@ from .search.ranking import ResultRanker, RankingConfig, SearchResult, PathImpor
 from .api_key_manager import APIKeyManager, create_manager_from_env
 from .stats_dashboard import IndexStatisticsCollector, DashboardStats
 
-# Create the MCP server
-mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
+# NOTE: FastMCP instance is created below after indexer_lifespan is defined (line ~528)
+# This ensures the lifespan manager is properly attached during initialization.
 
 # In-memory references (will be loaded from persistent storage)
 file_index = {}

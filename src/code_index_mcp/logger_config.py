@@ -5,7 +5,10 @@ from pythonjsonlogger import jsonlogger
 def setup_logging():
     """
     Sets up centralized logging for the application to output structured JSON logs.
-    Logs are directed to stdout, which can be easily collected by external tools.
+
+    IMPORTANT: Logs are directed to stderr, NOT stdout.
+    The MCP stdio transport uses stdout exclusively for JSON-RPC protocol messages.
+    Writing logs to stdout would break MCP communication.
     """
     log_level = logging.DEBUG
     
@@ -32,8 +35,10 @@ def setup_logging():
         # Add the filter to the logger
         logger.addFilter(DefaultFieldsFilter())
 
-        # Create a stream handler for stdout
-        handler = logging.StreamHandler(sys.stdout)
+        # Create a stream handler for stderr
+        # CRITICAL: MCP stdio transport uses stdout for JSON-RPC messages only
+        # Writing logs to stdout would break MCP communication
+        handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(formatter)
         logger.addHandler(handler)
 
