@@ -1,26 +1,26 @@
 # Implementation Plan: Fix Elasticsearch Indexing Pipeline
 
-## Phase 1: Investigation and Setup
+## Phase 1: Investigation and Setup [checkpoint: 204dfdf]
 
-- [ ] Task: Verify RabbitMQ infrastructure exists and is accessible
+- [x] Task: Verify RabbitMQ infrastructure exists and is accessible
   - Check `realtime_indexer.py` for `RabbitMQConsumer` class
   - Verify RabbitMQ connection configuration in `config.yaml`
   - Test RabbitMQ management UI accessibility (http://localhost:15672)
   - Document existing batch indexing methods available
 
-- [ ] Task: Analyze current `refresh_index()` implementation
+- [x] Task: Analyze current `refresh_index()` implementation
   - Read `server.py:2083` (`refresh_index()` function)
   - Trace current indexing flow (PostgreSQL, Zoekt)
   - Identify where Elasticsearch indexing should be inserted
   - Document current return value structure
 
-- [ ] Task: Set up test environment
+- [x] Task: Set up test environment
   - Create test project directory with ~10 sample files
   - Ensure PostgreSQL, Elasticsearch, RabbitMQ are running
   - Verify existing test infrastructure works
   - Run baseline tests to ensure environment is clean
 
-- [ ] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 1' (Zero Tolerance - Tsar of Excellence)
+- [x] Task: Conductor - Codex-Reviewer Rigor Check 'Phase 1' (Zero Tolerance - Tsar of Excellence)
   - Deploy codex-reviewer agent to conduct comprehensive review
   - Review must cover: code structure, test setup, infrastructure verification
   - All findings must be debugged (amp-code or opencode-scaffolder)
