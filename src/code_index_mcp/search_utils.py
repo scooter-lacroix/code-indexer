@@ -4,9 +4,17 @@ Search utilities for consistent backend selection and error handling.
 
 import logging
 import time
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Tuple, Optional, Callable
 from .storage.storage_interface import SearchInterface, DALInterface
 from .logger_config import logger
+from .constants import (
+    DEFAULT_MAX_SEARCH_RESULTS,
+    ES_MAX_SEARCH_RESULTS,
+    POSTGRESQL_MAX_SEARCH_RESULTS,
+    HEALTH_CHECK_CACHE_TIMEOUT,
+    SEARCH_OPERATIONS_MAX_AGE_HOURS,
+    RECENT_OPERATIONS_LIMIT,
+)
 
 class SearchBackendSelector:
     """Handles consistent backend selection and validation."""
@@ -88,7 +96,7 @@ class SearchBackendSelector:
             "supports_fuzzy": False,
             "supports_highlighting": False,
             "supports_pagination": True,
-            "max_result_limit": 1000
+            "max_result_limit": DEFAULT_MAX_SEARCH_RESULTS
         }
 
         if backend_type == "elasticsearch":
@@ -96,21 +104,21 @@ class SearchBackendSelector:
                 "supports_regex": True,
                 "supports_fuzzy": True,
                 "supports_highlighting": True,
-                "max_result_limit": 10000
+                "max_result_limit": ES_MAX_SEARCH_RESULTS
             })
         elif backend_type == "sqlite":
             capabilities.update({
                 "supports_regex": True,  # SQLite supports REGEXP
                 "supports_fuzzy": False,
                 "supports_highlighting": False,
-                "max_result_limit": 1000
+                "max_result_limit": DEFAULT_MAX_SEARCH_RESULTS
             })
         elif backend_type == "postgresql":
             capabilities.update({
                 "supports_regex": True,
                 "supports_fuzzy": True,
                 "supports_highlighting": False,
-                "max_result_limit": 5000
+                "max_result_limit": POSTGRESQL_MAX_SEARCH_RESULTS
             })
 
         return capabilities
@@ -572,7 +580,7 @@ class SearchMonitor:
 
         return summary
 
-    def get_recent_operations(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_recent_operations(self, limit: int = RECENT_OPERATIONS_LIMIT) -> List[Dict[str, Any]]:
         """Get the most recent search operations."""
         return sorted(self.search_operations[-limit:], key=lambda x: x.get("start_time", 0), reverse=True)
 
@@ -583,7 +591,7 @@ class SearchMonitor:
                 return operation
         return None
 
-    def cleanup_old_operations(self, max_age_hours: float = 24.0):
+    def cleanup_old_operations(self, max_age_hours: float = SEARCH_OPERATIONS_MAX_AGE_HOURS) -> None:
         """Clean up old search operations to prevent memory bloat."""
         cutoff_time = time.time() - (max_age_hours * 3600)
         original_count = len(self.search_operations)
@@ -667,9 +675,9 @@ class BackendHealthChecker:
 class GracefulDegradationManager:
     """Manages graceful degradation when backends are unavailable."""
 
-    def __init__(self):
-        self.backend_health_cache = {}
-        self.cache_timeout = 300  # 5 minutes
+    def __init__(self) -> None:
+        self.backend_health_cache: Dict[str, Dict[str, Any]] = {}
+        self.cache_timeout = HEALTH_CHECK_CACHE_TIMEOUT  # 5 minutes
 
     def get_backend_status(self, search_backend: SearchInterface) -> Dict[str, Any]:
         """Get the cached status of a backend, or check it if not cached or expired."""
@@ -704,7 +712,7 @@ class GracefulDegradationManager:
         else:
             return f"{backend_type} backend encountered an error: {reason}. Falling back to alternative search methods."
 
-    def cleanup_cache(self):
+    def cleanup_cache(self) -> None:
         """Clean up expired cache entries."""
         current_time = time.time()
         expired_keys = [

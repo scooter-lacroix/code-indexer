@@ -599,6 +599,9 @@ class ZoektStrategy(SearchStrategy):
         """
         Build the search query for zoekt with proper escaping and file pattern handling.
 
+        CRITICAL FIX: Properly escape or validate search patterns before subprocess execution
+        to prevent command injection attacks.
+
         Args:
             pattern: The search pattern
             file_pattern: Optional file pattern to filter results
@@ -606,33 +609,113 @@ class ZoektStrategy(SearchStrategy):
 
         Returns:
             Formatted search query string
+
+        Raises:
+            ValueError: If pattern contains potentially malicious content
         """
+        # CRITICAL FIX: Validate pattern length to prevent DoS
+        MAX_PATTERN_LENGTH = 1000
+        if len(pattern) > MAX_PATTERN_LENGTH:
+            self._logger.error(f"Search pattern exceeds maximum length of {MAX_PATTERN_LENGTH}")
+            # Return safe pattern that matches nothing
+            return ''
+
+        # CRITICAL FIX: Check for command injection patterns
+        dangerous_patterns = [
+            ';',  # Command separator
+            '|',  # Pipe (could be used for command chaining)
+            '&',  # Background execution
+            '`',  # Command substitution
+            '$(',  # Command substitution
+            '\n',  # Newline injection
+            '\r',  # Carriage return injection
+            '\t',  # Tab injection
+            '\\',  # Escape character that could be abused
+            '<',  # Input redirection
+            '>',  # Output redirection
+            '(',   # Subshell start (unless part of valid regex)
+            ')',   # Subshell end
+        ]
+
+        # Check if pattern contains dangerous characters that aren't part of valid search patterns
+        pattern_contains_dangerous = False
+        for dangerous in dangerous_patterns:
+            if dangerous in pattern:
+                # Some characters like '(' ')' might be valid in regex
+                # Only flag if they look like command injection attempts
+                if dangerous in ('(', ')'):
+                    # Check for suspicious patterns around parentheses
+                    if '$(' in pattern or '`' in pattern:
+                        pattern_contains_dangerous = True
+                        break
+                else:
+                    pattern_contains_dangerous = True
+                    break
+
+        if pattern_contains_dangerous:
+            self._logger.error(f"Potentially malicious search pattern detected: {pattern}")
+            # Return safe empty pattern
+            return ''
+
         # Construct the search query with file pattern if specified
         search_query = pattern
 
         # Add file pattern if specified using zoekt's file: syntax
         if file_pattern:
+            # CRITICAL FIX: Validate file pattern
+            if len(file_pattern) > 500:
+                self._logger.error(f"File pattern exceeds maximum length of 500")
+                return pattern  # Return just the search pattern without file filter
+
+            # Check for dangerous characters in file pattern
+            file_pattern_contains_dangerous = any(d in file_pattern for d in dangerous_patterns)
+            if file_pattern_contains_dangerous:
+                self._logger.error(f"Potentially malicious file pattern detected: {file_pattern}")
+                return pattern  # Return just the search pattern
+
             if file_pattern.startswith("*."):
                 # Simple extension pattern - zoekt uses file:ext syntax
+                # CRITICAL FIX: Validate extension contains only safe characters
                 ext = file_pattern[2:]
+                if not ext or not all(c.isalnum() or c in '._-' for c in ext):
+                    self._logger.error(f"Invalid file extension: {ext}")
+                    return pattern
                 search_query = f"file:{ext} {pattern}"
             else:
-                # For more complex patterns, we'll still try to use file: syntax
-                if "*" in file_pattern:
+                # For more complex patterns, validate carefully
+                if '*' in file_pattern:
                     # Try to extract extension from glob pattern
                     if file_pattern.endswith("*"):
                         base = file_pattern[:-1]
+                        # Validate base pattern
+                        if not all(c.isalnum() or c in '._-/' for c in base):
+                            self._logger.error(f"Invalid file pattern base: {base}")
+                            return pattern
                         search_query = f"file:{base} {pattern}"
                     else:
-                        # Complex pattern, use as-is
+                        # Complex pattern - validate and use as-is
+                        if not all(c.isalnum() or c in '._-*/?' for c in file_pattern):
+                            self._logger.error(f"Invalid characters in file pattern: {file_pattern}")
+                            return pattern
                         search_query = pattern
                 else:
                     # Exact filename match
+                    if not all(c.isalnum() or c in '._-/' for c in file_pattern):
+                        self._logger.error(f"Invalid filename: {file_pattern}")
+                        return pattern
                     search_query = f"file:{file_pattern} {pattern}"
 
         # Handle fuzzy search and escaping
         if fuzzy:
             # For fuzzy search, treat as regex
+            # CRITICAL FIX: Validate regex pattern is safe
+            try:
+                import re
+                # Try to compile the regex to validate it
+                re.compile(search_query)
+            except re.error as e:
+                self._logger.error(f"Invalid search pattern '{search_query}': {e}")
+                return ''
             return search_query
         else:
             # For literal search, escape special regex characters in the pattern part only
@@ -642,12 +725,23 @@ class ZoektStrategy(SearchStrategy):
                 parts = search_query.split(' ', 1)
                 if len(parts) == 2:
                     file_part, pattern_part = parts
-                    escaped_pattern = re.escape(pattern_part)
+                    # CRITICAL FIX: Escape special regex characters but keep it safe
+                    # Only escape characters that could be interpreted as regex
+                    escaped_pattern = pattern_part
+                    # Characters to escape for literal search: . * + ? ^ $ { } [ ] ( ) | \
+                    regex_chars = r'.*+?^${}[]()|\\'
+                    for char in regex_chars:
+                        escaped_pattern = escaped_pattern.replace(char, '\\' + char)
                     return f"{file_part} {escaped_pattern}"
                 else:
                     return search_query
             else:
-                return re.escape(search_query)
+                # CRITICAL FIX: Escape the entire query if no file pattern
+                escaped_pattern = pattern
+                regex_chars = r'.*+?^${}[]()|\\'
+                for char in regex_chars:
+                    escaped_pattern = escaped_pattern.replace(char, '\\' + char)
+                return escaped_pattern
 
     def _handle_search_error(self, result: subprocess.CompletedProcess, pattern: str) -> Dict[str, List[Tuple[int, str]]]:
         """

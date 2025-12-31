@@ -6,7 +6,7 @@ It provides tools for file discovery, content retrieval, and code analysis.
 """
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import AsyncIterator, Dict, List, Optional, Tuple, Any
+from typing import AsyncIterator, Dict, List, Optional, Tuple, Any, Union, Literal
 import os
 import pathlib
 import json
@@ -57,6 +57,14 @@ from .search_utils import (
     SearchResultProcessor, SearchMonitor, search_monitor,
     BackendHealthChecker, GracefulDegradationManager, degradation_manager
 ) # Import search utilities
+from .core_engine import CoreEngine, SearchOptions # Import CoreEngine
+
+# ============================================================================
+# PHASE 7 INTEGRATIONS: Ranking, API Key Manager, Stats Dashboard
+# ============================================================================
+from .search.ranking import ResultRanker, RankingConfig, SearchResult, PathImportance
+from .api_key_manager import APIKeyManager, create_manager_from_env
+from .stats_dashboard import IndexStatisticsCollector, DashboardStats
 
 # Create the MCP server
 mcp = FastMCP("CodeIndexer", dependencies=["pathlib"])
@@ -67,6 +75,7 @@ lazy_content_manager = LazyContentManager(max_loaded_files=100)
 
 # Global DAL instance
 dal_instance: Optional[DALInterface] = None
+core_engine: Optional[CoreEngine] = None # Global CoreEngine instance
 
 # Global Elasticsearch client, RabbitMQ producer/consumer, and real-time indexer
 es_client: Optional[Elasticsearch] = None
@@ -86,6 +95,72 @@ memory_aware_manager = None
 
 # Global performance monitor - will be initialized when project is set
 performance_monitor = None
+
+# ============================================================================
+# PHASE 7 GLOBAL INSTANCES
+# ============================================================================
+# Global result ranker for search ranking
+result_ranker: Optional[ResultRanker] = None
+
+# Global API key manager for multi-key rotation and quota management
+api_key_manager: Optional[APIKeyManager] = None
+
+# Global stats collector for dashboard
+stats_collector: Optional[IndexStatisticsCollector] = None
+
+def ensure_result_ranker() -> ResultRanker:
+    """Ensure result ranker is initialized, creating a default one if needed."""
+    global result_ranker
+    if result_ranker is None:
+        try:
+            # Load ranking config from environment if available
+            config = RankingConfig()
+            result_ranker = ResultRanker(config)
+            logger.info("Initialized default result ranker")
+        except Exception as e:
+            logger.warning(f"Could not initialize result ranker: {e}")
+            # Create a minimal ranker
+            result_ranker = ResultRanker(RankingConfig())
+    return result_ranker
+
+def ensure_api_key_manager() -> Optional[APIKeyManager]:
+    """Ensure API key manager is initialized from environment variables."""
+    global api_key_manager
+    if api_key_manager is None:
+        try:
+            # Try to create from environment
+            storage_path = os.path.join(SETTINGS_DIR, "api_key_stats.json")
+            api_key_manager = create_manager_from_env(
+                prefix="CORE_ENGINE_API_KEY_",
+                storage_path=storage_path
+            )
+            if api_key_manager and api_key_manager._keys:
+                logger.info(f"Initialized API key manager with {len(api_key_manager._keys)} keys")
+            else:
+                logger.info("No API keys configured in environment, using single-key mode")
+                api_key_manager = None
+        except Exception as e:
+            logger.warning(f"Could not initialize API key manager: {e}")
+            api_key_manager = None
+    return api_key_manager
+
+def ensure_stats_collector() -> IndexStatisticsCollector:
+    """Ensure stats collector is initialized."""
+    global stats_collector
+    if stats_collector is None:
+        try:
+            pg_dsn = os.getenv("DATABASE_URL")
+            es_url = os.getenv("ELASTICSEARCH_URL", "http://localhost:9200")
+            stats_collector = IndexStatisticsCollector(
+                pg_dsn=pg_dsn,
+                es_url=es_url
+            )
+            logger.info("Initialized index statistics collector")
+        except Exception as e:
+            logger.warning(f"Could not initialize stats collector: {e}")
+            # Create a minimal collector
+            stats_collector = IndexStatisticsCollector()
+    return stats_collector
 
 def ensure_performance_monitor():
     """Ensure performance monitor is initialized, creating a default one if needed."""
@@ -131,15 +206,21 @@ class CodeIndexerContext:
     file_count: int = 0
     file_change_tracker: Optional[FileChangeTracker] = None
     dal: Optional[DALInterface] = None # Add DAL instance to context
+    core_engine: Optional[CoreEngine] = None # Add CoreEngine to context
     es_client: Optional[Elasticsearch] = None
     rabbitmq_producer: Optional[RabbitMQProducer] = None
     rabbitmq_consumer: Optional[RabbitMQConsumer] = None
     realtime_indexer: Optional[RealtimeIndexer] = None
+    # Phase 7 additions
+    result_ranker: Optional[ResultRanker] = None
+    api_key_manager: Optional[APIKeyManager] = None
+    stats_collector: Optional[IndexStatisticsCollector] = None
 
 @asynccontextmanager
 async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]:
     """Manage the lifecycle of the Code Indexer MCP server."""
     global es_client, rabbitmq_producer, rabbitmq_consumer, realtime_indexer, dal_instance
+    global result_ranker, api_key_manager, stats_collector
 
     # Load base_path from settings if available, otherwise default to empty string
     logger.info("Initializing Code Indexer MCP server...")
@@ -152,19 +233,52 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     # This ensures we can retrieve the last saved project path even if the server restarts
     default_settings = OptimizedProjectSettings("", skip_load=True, storage_backend='sqlite', use_trie_index=True)
     base_path_from_config = default_settings.load_config().get('base_path', "")
-    
+
     global _current_project_path
     _current_project_path = base_path_from_config # Initialize global variable
 
     # Initialize the actual settings manager with the loaded base_path
     # This settings object will be used throughout the server's lifespan
     settings = OptimizedProjectSettings(base_path_from_config, skip_load=not bool(base_path_from_config), storage_backend='sqlite', use_trie_index=True)
-    
+
     # Update the base_path in the settings object itself, as it might have been initialized with an empty string
     settings.base_path = base_path_from_config
 
     # Initialize DAL instance (use configured backend type)
     dal_instance = get_dal_instance()
+
+    # ============================================================================
+    # PHASE 7: Initialize API Key Manager and Result Ranker
+    # ============================================================================
+    # The API key manager must be initialized before CoreEngine so that
+    # VectorBackend can use it for multi-key rotation and quota management
+    api_key_manager = ensure_api_key_manager()
+    if api_key_manager:
+        logger.info(f"API Key Manager initialized with {len(api_key_manager._keys)} keys")
+    else:
+        logger.info("API Key Manager not configured - using single-key mode")
+
+    # Initialize Result Ranker for search ranking
+    result_ranker = ensure_result_ranker()
+    if result_ranker:
+        logger.info("Result Ranker initialized for enhanced search ranking")
+
+    # Initialize Stats Collector for dashboard
+    stats_collector = ensure_stats_collector()
+    if stats_collector:
+        logger.info("Statistics Collector initialized for dashboard")
+
+    # Initialize VectorBackend with API key manager
+    # The vector backend will use the API key manager for multi-key rotation
+    from .core_engine.vector_store import VectorBackend
+    vector_backend = VectorBackend(api_key_manager=api_key_manager)
+
+    # Initialize Core Engine with configured backends
+    core_engine = CoreEngine(
+        vector_backend=vector_backend,
+        legacy_backend=dal_instance
+    )
+    logger.info("Core Engine initialized with API key manager support")
 
     # Initialize IncrementalIndexer and FileChangeTracker
     incremental_indexer = IncrementalIndexer(settings)
@@ -211,16 +325,21 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
         rabbitmq_consumer = None
         realtime_indexer = None
 
-    # Initialize context
+    # Initialize context with Phase 7 modules
     context = CodeIndexerContext(
         base_path=base_path_from_config,
         settings=settings,
         file_change_tracker=file_change_tracker,
         dal=dal_instance, # Store DAL instance in context
+        core_engine=core_engine,
         es_client=es_client,
         rabbitmq_producer=rabbitmq_producer,
         rabbitmq_consumer=rabbitmq_consumer,
-        realtime_indexer=realtime_indexer
+        realtime_indexer=realtime_indexer,
+        # Phase 7 additions
+        result_ranker=result_ranker,
+        api_key_manager=api_key_manager,
+        stats_collector=stats_collector
     )
 
     try:
@@ -366,7 +485,7 @@ def get_file_content(file_path: str) -> str:
         return f"Error reading file: {e}"
 
 @mcp.resource("structure://project")
-def get_project_structure() -> str:
+async def get_project_structure() -> str:
     """Get the structure of the project as a JSON tree."""
     ctx = mcp.get_context()
 
@@ -382,7 +501,7 @@ def get_project_structure() -> str:
 
     # Check if we need to refresh the index
     if not file_index:
-        _index_project(base_path)
+        await _index_project(base_path, ctx.request_context.lifespan_context.core_engine)
         # Update file count in context
         ctx.request_context.lifespan_context.file_count = _count_files(file_index)
         # Save updated index
@@ -405,8 +524,469 @@ def get_settings_stats() -> str:
 
 # ----- TOOLS -----
 
+# =============================================================================
+# MEGA-TOOLS: Consolidated 9 mega-tools that replace 50+ individual tools
+# Each mega-tool uses action/type/operation/mode-based routing
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 1: manage_project
+# Consolidates: set_project_path, refresh_index, force_reindex, clear_settings, reset_server_state
+# -----------------------------------------------------------------------------
 @mcp.tool()
-def set_project_path(path: str, ctx: Context) -> str:
+async def manage_project(
+    ctx: Context,
+    action: Literal["set_path", "refresh", "reindex", "clear", "reset"],
+    path: Optional[str] = None,
+    clear_cache: bool = True,
+) -> Union[str, Dict[str, Any]]:
+    """
+    Manage project lifecycle operations including setting path, refreshing, and reindexing.
+
+    This mega-tool consolidates all project-level operations into a single interface
+    with action-based routing.
+
+    Actions:
+        - "set_path": Set the base project path for indexing (requires: path)
+        - "refresh": Refresh the project index using incremental indexing
+        - "reindex": Force a complete re-index of the project (params: clear_cache)
+        - "clear": Clear all settings and cached data
+        - "reset": Completely reset the server state including global variables
+
+    Examples:
+        await manage_project(ctx, "set_path", path="/path/to/project")
+        await manage_project(ctx, "refresh")
+        await manage_project(ctx, "reindex", clear_cache=True)
+        await manage_project(ctx, "clear")
+        await manage_project(ctx, "reset")
+    """
+    match action:
+        case "set_path":
+            if path is None:
+                return {"success": False, "error": "path parameter is required for set_path action"}
+            return await set_project_path(path, ctx)
+        case "refresh":
+            return await refresh_index(ctx)
+        case "reindex":
+            return await force_reindex(ctx, clear_cache)
+        case "clear":
+            return clear_settings(ctx)
+        case "reset":
+            return reset_server_state(ctx)
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 2: search_content
+# Consolidates: search_code_advanced, find_files, rank_search_results
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def search_content(
+    ctx: Context,
+    action: Literal["search", "find", "rank"],
+    pattern: Optional[str] = None,
+    # Parameters for "search" action
+    case_sensitive: bool = True,
+    context_lines: int = 0,
+    file_pattern: Optional[str] = None,
+    fuzzy: bool = False,
+    fuzziness_level: Optional[str] = None,
+    content_boost: float = 1.0,
+    filepath_boost: float = 1.0,
+    highlight_pre_tag: str = "<em>",
+    highlight_post_tag: str = "</em>",
+    page: int = 1,
+    page_size: int = 20,
+    # Parameters for "rank" action
+    results: Optional[List[Dict[str, Any]]] = None,
+    query: Optional[str] = None,
+) -> Union[Dict[str, Any], List[str], List[Dict[str, Any]]]:
+    """
+    Search and discover content across the project using multiple strategies.
+
+    This mega-tool provides unified access to all content search and discovery operations.
+
+    Actions:
+        - "search": Advanced code search with multiple backend support (requires: pattern)
+        - "find": Find files matching a glob pattern (requires: pattern)
+        - "rank": Re-rank search results based on query relevance (requires: results, query)
+
+    Examples:
+        await search_content(ctx, "search", pattern="function foo()", fuzzy=True)
+        await search_content(ctx, "find", pattern="*.py")
+        await search_content(ctx, "rank", results=search_results, query="auth logic")
+    """
+    match action:
+        case "search":
+            if pattern is None:
+                return {"success": False, "error": "pattern parameter is required for search action"}
+            return await search_code_advanced(
+                pattern=pattern, ctx=ctx, case_sensitive=case_sensitive,
+                context_lines=context_lines, file_pattern=file_pattern, fuzzy=fuzzy,
+                fuzziness_level=fuzziness_level, content_boost=content_boost,
+                filepath_boost=filepath_boost, highlight_pre_tag=highlight_pre_tag,
+                highlight_post_tag=highlight_post_tag, page=page, page_size=page_size,
+            )
+        case "find":
+            if pattern is None:
+                return {"success": False, "error": "pattern parameter is required for find action"}
+            return find_files(pattern, ctx)
+        case "rank":
+            if results is None:
+                return {"success": False, "error": "results parameter is required for rank action"}
+            if query is None:
+                return {"success": False, "error": "query parameter is required for rank action"}
+            return await rank_search_results(results, query, ctx)
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 3: manage_file
+# Consolidates: write_to_file, apply_diff, insert_content, search_and_replace
+# Note: Named 'manage_file' (singular) to distinguish from 'manage_files' (plural)
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def manage_file(
+    ctx: Context,
+    operation: Literal["write", "diff", "insert", "replace"],
+    path: str,
+    content: Optional[str] = None,
+    line_count: Optional[int] = None,
+    search: Optional[str] = None,
+    replace: Optional[str] = None,
+    start_line: Optional[int] = None,
+    end_line: Optional[int] = None,
+    use_regex: bool = False,
+    ignore_case: bool = False,
+    line: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Modify file content using various strategies with version tracking.
+
+    This mega-tool consolidates all file content modification operations.
+
+    Operations:
+        - "write": Write complete content to a file (requires: content, line_count)
+        - "diff": Apply targeted modifications using search/replace (requires: search, replace)
+        - "insert": Insert new content at specified line (requires: content, line)
+        - "replace": Search and replace in file (requires: search, replace)
+
+    Examples:
+        await manage_file(ctx, "write", path="src/main.py", content="code", line_count=1)
+        await manage_file(ctx, "diff", path="config.json", search="old", replace="new")
+        await manage_file(ctx, "insert", path="README.md", line=10, content="new section")
+        await manage_file(ctx, "replace", path="api.md", search="TODO", replace="DONE")
+    """
+    match operation:
+        case "write":
+            if content is None or line_count is None:
+                return {"success": False, "error": "content and line_count required for write operation"}
+            return await write_to_file(path, content, line_count, ctx)
+        case "diff":
+            if search is None or replace is None:
+                return {"success": False, "error": "search and replace required for diff operation"}
+            return await apply_diff(path, search, replace, ctx, start_line, end_line, use_regex, ignore_case)
+        case "insert":
+            if content is None or line is None:
+                return {"success": False, "error": "content and line required for insert operation"}
+            return await insert_content(path, line, content, ctx)
+        case "replace":
+            if search is None or replace is None:
+                return {"success": False, "error": "search and replace required for replace operation"}
+            return await search_and_replace(path, search, replace, ctx, start_line, end_line, use_regex, ignore_case)
+        case _:
+            return {"success": False, "error": f"Unknown operation: {operation}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 4: manage_files
+# Consolidates: delete_file, rename_file, revert_file_to_version, get_file_history
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def manage_files(
+    ctx: Context,
+    action: Literal["delete", "rename", "revert", "history"],
+    file_path: Optional[str] = None,
+    new_file_path: Optional[str] = None,
+    version_id: Optional[str] = None,
+    timestamp: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Manage file system operations including delete, rename, revert, and history.
+
+    This mega-tool provides comprehensive file management with version tracking.
+
+    Actions:
+        - "delete": Delete a file from the filesystem (requires: file_path)
+        - "rename": Rename or move a file (requires: file_path, new_file_path)
+        - "revert": Revert a file to a previous version (requires: file_path, version_id or timestamp)
+        - "history": Get the change history for a file (requires: file_path)
+
+    Examples:
+        await manage_files(ctx, "delete", file_path="old_file.py")
+        await manage_files(ctx, "rename", file_path="src/old.py", new_file_path="src/new.py")
+        await manage_files(ctx, "revert", file_path="config.json", version_id="v1.2.3")
+        await manage_files(ctx, "history", file_path="src/main.py")
+    """
+    match action:
+        case "delete":
+            if file_path is None:
+                return {"success": False, "error": "file_path parameter is required for delete action"}
+            return await delete_file(file_path, ctx)
+        case "rename":
+            if file_path is None or new_file_path is None:
+                return {"success": False, "error": "file_path and new_file_path required for rename action"}
+            return await rename_file(file_path, new_file_path, ctx)
+        case "revert":
+            if file_path is None:
+                return {"success": False, "error": "file_path parameter is required for revert action"}
+            return await revert_file_to_version(file_path, ctx, version_id, timestamp)
+        case "history":
+            if file_path is None:
+                return {"success": False, "error": "file_path parameter is required for history action"}
+            return get_file_history(file_path, ctx)
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 5: get_diagnostics
+# Consolidates: get_memory_profile, get_index_statistics, get_backend_health,
+#               get_performance_metrics, get_active_operations, get_settings_info,
+#               get_ignore_patterns, get_filtering_config, get_ranking_configuration
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def get_diagnostics(
+    ctx: Context,
+    type: Literal["memory", "index", "backend", "performance", "operations",
+                  "settings", "ignore", "filtering", "ranking"],
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """
+    Get comprehensive diagnostics and metrics for all system components.
+
+    This mega-tool provides unified access to all diagnostic information.
+
+    Types:
+        - "memory": Get comprehensive memory profiling statistics
+        - "index": Get comprehensive index statistics (params: force_refresh)
+        - "backend": Get health status of all backends
+        - "performance": Get performance monitoring metrics
+        - "operations": Get status of all active operations
+        - "settings": Get information about project settings
+        - "ignore": Get information about loaded ignore patterns
+        - "filtering": Get current filtering configuration
+        - "ranking": Get search ranking configuration
+
+    Examples:
+        await get_diagnostics(ctx, "memory")
+        await get_diagnostics(ctx, "index", force_refresh=True)
+        await get_diagnostics(ctx, "backend")
+        await get_diagnostics(ctx, "performance")
+    """
+    match type:
+        case "memory":
+            return get_memory_profile()
+        case "index":
+            return await get_index_statistics(ctx, force_refresh)
+        case "backend":
+            return await get_backend_health(ctx)
+        case "performance":
+            return get_performance_metrics()
+        case "operations":
+            return get_active_operations()
+        case "settings":
+            return get_settings_info(ctx)
+        case "ignore":
+            return get_ignore_patterns(ctx)
+        case "filtering":
+            return get_filtering_config()
+        case "ranking":
+            return get_ranking_configuration(ctx)
+        case _:
+            return {"success": False, "error": f"Unknown type: {type}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 6: manage_memory
+# Consolidates: trigger_memory_cleanup, configure_memory_limits, export_memory_profile
+# -----------------------------------------------------------------------------
+@mcp.tool()
+def manage_memory(
+    ctx: Context,
+    action: Literal["cleanup", "configure", "export"],
+    soft_limit_mb: Optional[float] = None,
+    hard_limit_mb: Optional[float] = None,
+    max_loaded_files: Optional[int] = None,
+    max_cached_queries: Optional[int] = None,
+    file_path: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Manage memory usage including cleanup, configuration, and profiling.
+
+    This mega-tool provides comprehensive memory management capabilities.
+
+    Actions:
+        - "cleanup": Manually trigger memory cleanup and garbage collection
+        - "configure": Update memory limits configuration (params: soft_limit_mb, hard_limit_mb, etc.)
+        - "export": Export detailed memory profile to a file (params: file_path)
+
+    Examples:
+        manage_memory(ctx, "cleanup")
+        manage_memory(ctx, "configure", soft_limit_mb=1024)
+        manage_memory(ctx, "export", file_path="/tmp/profile.json")
+    """
+    match action:
+        case "cleanup":
+            return trigger_memory_cleanup()
+        case "configure":
+            return configure_memory_limits(soft_limit_mb, hard_limit_mb,
+                                         max_loaded_files, max_cached_queries)
+        case "export":
+            return export_memory_profile(file_path)
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 7: manage_operations
+# Consolidates: get_active_operations, cancel_operation, cancel_all_operations,
+#                cleanup_completed_operations
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def manage_operations(
+    ctx: Context,
+    action: Literal["list", "cancel", "cleanup"],
+    operation_id: Optional[str] = None,
+    reason: str = "Operation cancelled by user",
+    max_age_hours: float = 1.0,
+    cancel_all: bool = False,
+) -> Dict[str, Any]:
+    """
+    Manage tracked operations including listing, cancelling, and cleanup.
+
+    This mega-tool provides comprehensive operation lifecycle management.
+
+    Actions:
+        - "list": Get status of all active operations
+        - "cancel": Cancel a specific operation or all operations (params: operation_id or cancel_all)
+        - "cleanup": Clean up completed operations older than specified hours (params: max_age_hours)
+
+    Examples:
+        await manage_operations(ctx, "list")
+        await manage_operations(ctx, "cancel", operation_id="op-123")
+        await manage_operations(ctx, "cancel", cancel_all=True, reason="shutdown")
+        await manage_operations(ctx, "cleanup", max_age_hours=2.0)
+    """
+    match action:
+        case "list":
+            return get_active_operations()
+        case "cancel":
+            if cancel_all:
+                return await cancel_all_operations(reason)
+            if operation_id is None:
+                return {"success": False, "error": "operation_id parameter is required for cancel action"}
+            return await cancel_operation(operation_id, reason)
+        case "cleanup":
+            return cleanup_completed_operations(max_age_hours)
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 8: read_file
+# Consolidates: analyze_file_with_smart_reader, read_file_chunks,
+#               detect_file_errors, get_file_metadata
+# -----------------------------------------------------------------------------
+@mcp.tool()
+def read_file(
+    ctx: Context,
+    mode: Literal["smart", "chunks", "detect_errors", "metadata"],
+    file_path: str,
+    include_content: bool = True,
+    include_metadata: bool = True,
+    include_errors: bool = True,
+    include_chunks: bool = False,
+    chunk_size: int = 4 * 1024 * 1024,
+    max_chunks: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Read files using various strategies optimized for different use cases.
+
+    This mega-tool provides flexible file reading capabilities with automatic
+    strategy selection based on file characteristics.
+
+    Modes:
+        - "smart": Comprehensive file analysis using SmartFileReader
+        - "chunks": Read large file in chunks for memory efficiency
+        - "detect_errors": Detect and analyze errors in a file
+        - "metadata": Get comprehensive file metadata
+
+    Examples:
+        read_file(ctx, "smart", file_path="src/main.py", include_errors=True)
+        read_file(ctx, "chunks", file_path="large.json", chunk_size=8*1024*1024)
+        read_file(ctx, "detect_errors", file_path="config.py")
+        read_file(ctx, "metadata", file_path="README.md")
+    """
+    match mode:
+        case "smart":
+            return analyze_file_with_smart_reader(
+                file_path=file_path, ctx=ctx, include_content=include_content,
+                include_metadata=include_metadata, include_errors=include_errors,
+                include_chunks=include_chunks, chunk_size=chunk_size,
+            )
+        case "chunks":
+            return read_file_chunks(
+                file_path=file_path, ctx=ctx, chunk_size=chunk_size, max_chunks=max_chunks,
+            )
+        case "detect_errors":
+            return detect_file_errors(file_path, ctx)
+        case "metadata":
+            return get_file_metadata(file_path, ctx)
+        case _:
+            return {"success": False, "error": f"Unknown mode: {mode}"}
+
+
+# -----------------------------------------------------------------------------
+# MEGA-TOOL 9: manage_temp
+# Consolidates: create_temp_directory, check_temp_directory
+# -----------------------------------------------------------------------------
+@mcp.tool()
+def manage_temp(
+    ctx: Context,
+    action: Literal["create", "check"],
+) -> Dict[str, Any]:
+    """
+    Manage the temporary directory used for storing index data.
+
+    This mega-tool provides simple operations for creating and checking
+    the temporary directory where the indexer stores cached data.
+
+    Actions:
+        - "create": Create the temporary directory if it doesn't exist
+        - "check": Check the temporary directory status and contents
+
+    Examples:
+        manage_temp(ctx, "create")
+        manage_temp(ctx, "check")
+    """
+    match action:
+        case "create":
+            return create_temp_directory()
+        case "check":
+            return check_temp_directory()
+        case _:
+            return {"success": False, "error": f"Unknown action: {action}"}
+
+
+# =============================================================================
+# END OF MEGA-TOOLS
+# Below are the original individual tool functions (preserved for backward compatibility)
+# =============================================================================
+
+async def set_project_path(path: str, ctx: Context) -> str:
     """Set the base project path for indexing."""
     # Validate and normalize path
     try:
@@ -419,10 +999,27 @@ def set_project_path(path: str, ctx: Context) -> str:
         if not os.path.isdir(abs_path):
             return f"Error: Path is not a directory: {abs_path}"
 
-        # Clear existing in-memory index and unload cached content
+        # CRITICAL FIX: Properly dispose and recreate the LazyContentManager when projects change
         global file_index, lazy_content_manager, memory_profiler, memory_aware_manager, performance_monitor, es_client, realtime_indexer, dal_instance
         file_index = {}  # Always reset to dictionary - will be loaded as TrieFileIndex if available
-        lazy_content_manager.unload_all()
+
+        # CRITICAL FIX: Properly dispose of the old LazyContentManager before creating a new one
+        # This prevents memory leaks from cached content of the previous project
+        try:
+            if lazy_content_manager is not None:
+                # Unload all cached content
+                lazy_content_manager.unload_all()
+                # Clear any internal caches
+                if hasattr(lazy_content_manager, 'clear'):
+                    lazy_content_manager.clear()
+                logger.info("Old LazyContentManager properly disposed")
+        except Exception as e:
+            logger.error(f"Error disposing LazyContentManager: {e}")
+
+        # CRITICAL FIX: Create a fresh LazyContentManager instance for the new project
+        # This ensures no cached content from the old project remains in memory
+        lazy_content_manager = LazyContentManager(max_loaded_files=100)
+        logger.info("New LazyContentManager created for project switch")
 
         # Update the base path in context and global variable
         ctx.request_context.lifespan_context.base_path = abs_path
@@ -666,7 +1263,7 @@ def set_project_path(path: str, ctx: Context) -> str:
             logger.info(f"No existing index found, creating new index...")
 
         # If no existing index, create a new one
-        file_count = _index_project(abs_path)
+        file_count = await _index_project(abs_path, ctx.request_context.lifespan_context.core_engine)
         ctx.request_context.lifespan_context.file_count = file_count
 
         # Save the new index
@@ -693,7 +1290,6 @@ def set_project_path(path: str, ctx: Context) -> str:
         logger.error(f"Error setting project path: {e}")
         return f"Error setting project path: {e}"
 
-@mcp.tool()
 async def search_code_advanced(
     pattern: str,
     ctx: Context,
@@ -740,6 +1336,7 @@ async def search_code_advanced(
 
     settings = ctx.request_context.lifespan_context.settings
     dal = ctx.request_context.lifespan_context.dal
+    core_engine = ctx.request_context.lifespan_context.core_engine
 
     # Ensure performance monitor is initialized
     ensure_performance_monitor()
@@ -765,6 +1362,54 @@ async def search_code_advanced(
     # Log cache miss
     if performance_monitor:
         performance_monitor.increment_counter("search_cache_misses_total")
+
+    # Use Core Engine if available (Unified Search)
+    if core_engine:
+        try:
+            search_options = SearchOptions(
+                rerank=True, # Default to True as per mgrep default
+                top_k=page_size * page, # Fetch enough for pagination
+                use_zoekt=True # Allow fallback to Zoekt if available
+            )
+            # Add file_pattern to query if needed, or handle in CoreEngine (TODO: Add filter support in CoreEngine)
+            # For now, we rely on CoreEngine's internal handling or backend capabilities.
+            # VectorBackend handles 'path' filter in list_files but search filtering depends on backend.
+            # Mixedbread supports filters. We need to pass file_pattern to CoreEngine.
+            # CoreEngine.search currently doesn't accept filters in SearchOptions, but we can extend it or pass in query.
+            # We'll assume for now CoreEngine handles it or we filter post-search (less efficient).
+            # Actually, `mgrep` supports filters. `CoreEngine` maps `options` to backend.
+            # I should update SearchOptions to include filters or file_pattern.
+            # For this iteration, I'll proceed with basic query.
+            
+            store_ids = [base_path] # Use base_path as store_id
+            search_response = await core_engine.search(store_ids, pattern, search_options)
+            
+            # Map to Legacy Format
+            results_dict = {}
+            for chunk in search_response.data:
+                f_path = chunk.metadata.path if chunk.metadata else "unknown"
+                # Filter by file_pattern if provided (client-side filtering for now)
+                if file_pattern and not fnmatch.fnmatch(f_path, file_pattern):
+                    continue
+                    
+                if f_path not in results_dict:
+                    results_dict[f_path] = []
+                
+                results_dict[f_path].append({
+                    "line": chunk.generated_metadata.get("line_number", 0) if chunk.generated_metadata else 0,
+                    "text": chunk.text,
+                    "score": chunk.score
+                })
+            
+            # Paginate
+            paginated_results = lazy_content_manager.paginate_results(results_dict, page, page_size)
+            lazy_content_manager.cache_search_result(query_key, paginated_results)
+            return paginated_results
+            
+        except Exception as e:
+            logger.error(f"Core Engine search failed: {e}")
+            # Fallback to legacy logic below
+            pass
 
     # Normalize the search pattern
     normalized_pattern, is_regex = SearchPatternTranslator.normalize_pattern(pattern, fuzzy)
@@ -1137,7 +1782,6 @@ async def search_code_advanced(
         "error": f"Unexpected error: no strategies were attempted. Last error: {last_error}",
         "backend_type": "unknown"
     }
-@mcp.tool()
 def find_files(pattern: str, ctx: Context) -> List[str]:
     """Find files in the project matching a specific glob pattern."""
     base_path = ctx.request_context.lifespan_context.base_path
@@ -1159,7 +1803,6 @@ def find_files(pattern: str, ctx: Context) -> List[str]:
 
     return matching_files
 
-@mcp.tool()
 def get_file_summary(file_path: str, ctx: Context) -> Dict[str, Any]:
     """
     Get a comprehensive summary of a specific file using SmartFileReader, including:
@@ -1439,7 +2082,6 @@ def _has_docstrings(lines: List[str]) -> bool:
                 return True
     return False
 
-@mcp.tool()
 async def refresh_index(ctx: Context) -> Dict[str, Any]:
     """Refresh the project index using incremental indexing with progress tracking."""
     import asyncio  # Ensure asyncio is available in this function scope
@@ -1510,7 +2152,7 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
             )
             
             # Re-index the project with incremental indexing and progress tracking
-            file_count = await _index_project_with_progress(base_path, progress_tracker)
+            file_count = await _index_project_with_progress(base_path, progress_tracker, ctx.request_context.lifespan_context.core_engine)
             ctx.request_context.lifespan_context.file_count = file_count
             
             # Stage 3: Saving
@@ -1558,7 +2200,6 @@ async def refresh_index(ctx: Context) -> Dict[str, Any]:
             "success": False
         }
 
-@mcp.tool()
 async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any]:
     """Force a complete re-index of the project, ignoring incremental metadata.
     
@@ -1657,7 +2298,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             
             # Force full re-index by using the regular indexing function
             # but with cleared metadata so everything is treated as new
-            file_count = await _index_project_with_progress(base_path, progress_tracker)
+            file_count = await _index_project_with_progress(base_path, progress_tracker, ctx.request_context.lifespan_context.core_engine)
             ctx.request_context.lifespan_context.file_count = file_count
             
             # Stage 4: Saving
@@ -1718,7 +2359,6 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             "success": False
         }
 
-@mcp.tool()
 async def write_to_file(path: str, content: str, line_count: int, ctx: Context) -> Dict[str, Any]:
     """
     Write content to a file. If the file exists, it will be overwritten. If it doesn't exist, it will be created.
@@ -1752,12 +2392,16 @@ async def write_to_file(path: str, content: str, line_count: int, ctx: Context) 
         file_change_tracker._record_post_edit_state(path, old_content, content)
         file_change_tracker.flush()
 
+        # Update Core Engine
+        core_engine = ctx.request_context.lifespan_context.core_engine
+        if core_engine:
+            await core_engine.index_file(base_path, path, content)
+
         return {"success": True, "message": f"File '{path}' written successfully."}
     except Exception as e:
         return {"success": False, "error": f"Error writing to file '{path}': {e}"}
 
-@mcp.tool()
-def apply_diff(path: str, search: str, replace: str, ctx: Context,
+async def apply_diff(path: str, search: str, replace: str, ctx: Context,
                start_line: Optional[int] = None, end_line: Optional[int] = None,
                use_regex: bool = False, ignore_case: bool = False) -> Dict[str, Any]:
     """
@@ -1915,6 +2559,11 @@ def apply_diff(path: str, search: str, replace: str, ctx: Context,
         indexer.update_file_metadata(path, full_path)
         indexer.save_metadata()
 
+        # Update Core Engine
+        core_engine = ctx.request_context.lifespan_context.core_engine
+        if core_engine:
+            await core_engine.index_file(base_path, path, modified_content)
+
         # Enqueue for real-time indexing if available
         realtime_indexer = ctx.request_context.lifespan_context.realtime_indexer
         if realtime_indexer:
@@ -1990,7 +2639,6 @@ def _rollback_file(original_path: str, backup_path: str) -> bool:
         logger.error(f"Failed to rollback file {original_path}: {e}")
         return False
 
-@mcp.tool()
 async def insert_content(path: str, line: int, content: str, ctx: Context) -> Dict[str, Any]:
     """
     Insert new lines of content into a file without modifying existing content.
@@ -2034,7 +2682,6 @@ async def insert_content(path: str, line: int, content: str, ctx: Context) -> Di
     except Exception as e:
         return {"success": False, "error": f"Error inserting content into file '{path}': {e}"}
 
-@mcp.tool()
 async def search_and_replace(path: str, search: str, replace: str, ctx: Context,
                              start_line: Optional[int] = None, end_line: Optional[int] = None,
                              use_regex: bool = False, ignore_case: bool = False) -> Dict[str, Any]:
@@ -2107,8 +2754,7 @@ async def search_and_replace(path: str, search: str, replace: str, ctx: Context,
     except Exception as e:
         return {"success": False, "error": f"Error performing search and replace in '{path}': {e}"}
 
-@mcp.tool()
-def delete_file(file_path: str, ctx: Context) -> Dict[str, Any]:
+async def delete_file(file_path: str, ctx: Context) -> Dict[str, Any]:
     """
     A tool to delete a specified file.
     """
@@ -2146,12 +2792,16 @@ def delete_file(file_path: str, ctx: Context) -> Dict[str, Any]:
         ctx.request_context.lifespan_context.file_count = _count_files(file_index)
         ctx.request_context.lifespan_context.settings.save_index(file_index)
 
+        # Update Core Engine
+        core_engine = ctx.request_context.lifespan_context.core_engine
+        if core_engine:
+            await core_engine.delete_file(base_path, file_path)
+
         return {"success": True, "message": f"File '{file_path}' deleted successfully."}
     except Exception as e:
         return {"success": False, "error": f"Error deleting file '{file_path}': {e}"}
 
-@mcp.tool()
-def rename_file(old_file_path: str, new_file_path: str, ctx: Context) -> Dict[str, Any]:
+async def rename_file(old_file_path: str, new_file_path: str, ctx: Context) -> Dict[str, Any]:
     """
     A tool to rename/move a file.
     """
@@ -2206,11 +2856,18 @@ def rename_file(old_file_path: str, new_file_path: str, ctx: Context) -> Dict[st
         ctx.request_context.lifespan_context.file_count = _count_files(file_index)
         ctx.request_context.lifespan_context.settings.save_index(file_index)
 
+        # Update Core Engine
+        core_engine = ctx.request_context.lifespan_context.core_engine
+        if core_engine:
+            await core_engine.delete_file(base_path, old_file_path)
+            # Re-index at new path (using old_content which is same)
+            if old_content is not None:
+                await core_engine.index_file(base_path, new_file_path, old_content)
+
         return {"success": True, "message": f"File '{old_file_path}' renamed to '{new_file_path}' successfully."}
     except Exception as e:
         return {"success": False, "error": f"Error renaming file '{old_file_path}' to '{new_file_path}': {e}"}
 
-@mcp.tool()
 async def revert_file_to_version(file_path: str, ctx: Context, version_id: Optional[str] = None, timestamp: Optional[str] = None) -> Dict[str, Any]:
     """
     A tool to revert a file to a previous version.
@@ -2261,7 +2918,6 @@ async def revert_file_to_version(file_path: str, ctx: Context, version_id: Optio
     except Exception as e:
         return {"success": False, "error": f"Error reverting file '{file_path}': {e}"}
 
-@mcp.tool()
 def get_file_history(file_path: str, ctx: Context) -> Dict[str, Any]:
     """Retrieves the history of changes for a given file path."""
     base_path = ctx.request_context.lifespan_context.base_path
@@ -2346,7 +3002,6 @@ def get_file_history(file_path: str, ctx: Context) -> Dict[str, Any]:
         logger.error(f"Error retrieving file history for '{norm_path}': {e}", exc_info=True)
         return {"success": False, "error": f"Error retrieving file history for '{norm_path}': {e}"}
 
-@mcp.tool()
 def get_settings_info(ctx: Context) -> Dict[str, Any]:
     """Get information about the project settings."""
     base_path = ctx.request_context.lifespan_context.base_path
@@ -2382,7 +3037,6 @@ def get_settings_info(ctx: Context) -> Dict[str, Any]:
         "exists": os.path.exists(settings.settings_path)
     }
 
-@mcp.tool()
 def create_temp_directory() -> Dict[str, Any]:
     """Create the temporary directory used for storing index data."""
     temp_dir = os.path.join(tempfile.gettempdir(), SETTINGS_DIR)
@@ -2404,7 +3058,6 @@ def create_temp_directory() -> Dict[str, Any]:
 
     return result
 
-@mcp.tool()
 def check_temp_directory() -> Dict[str, Any]:
     """Check the temporary directory used for storing index data."""
     temp_dir = os.path.join(tempfile.gettempdir(), SETTINGS_DIR)
@@ -2438,14 +3091,12 @@ def check_temp_directory() -> Dict[str, Any]:
 
     return result
 
-@mcp.tool()
 def clear_settings(ctx: Context) -> str:
     """Clear all settings and cached data."""
     settings = ctx.request_context.lifespan_context.settings
     settings.clear()
     return "Project settings, index, and cache have been cleared."
 
-@mcp.tool()
 def reset_server_state(ctx: Context) -> str:
     """Completely reset the server state including global variables."""
     global file_index, lazy_content_manager, memory_profiler, memory_aware_manager, performance_monitor
@@ -2478,7 +3129,6 @@ def reset_server_state(ctx: Context) -> str:
     except Exception as e:
         return f"Error resetting server state: {e}"
 
-@mcp.tool()
 def refresh_search_tools(ctx: Context) -> str:
     """
     Manually re-detect the available command-line search tools on the system.
@@ -2491,7 +3141,6 @@ def refresh_search_tools(ctx: Context) -> str:
     
     return f"Search tools refreshed. Available: {config['available_tools']}. Preferred: {config['preferred_tool']}."
 
-@mcp.tool()
 def get_ignore_patterns(ctx: Context) -> Dict[str, Any]:
     """Get information about the loaded ignore patterns."""
     base_path = ctx.request_context.lifespan_context.base_path
@@ -2518,7 +3167,6 @@ def get_ignore_patterns(ctx: Context) -> Dict[str, Any]:
         "default_excludes": list(ignore_matcher.DEFAULT_EXCLUDES)
     }
 
-@mcp.tool()
 def get_filtering_config() -> Dict[str, Any]:
     """Get information about the current filtering configuration."""
     config_manager = ConfigManager()
@@ -2552,7 +3200,6 @@ def get_filtering_config() -> Dict[str, Any]:
         }
     }
 
-@mcp.tool()
 def get_lazy_loading_stats() -> Dict[str, Any]:
     """Get statistics about the lazy loading memory management."""
     global lazy_content_manager
@@ -2565,7 +3212,6 @@ def get_lazy_loading_stats() -> Dict[str, Any]:
         "description": "File contents are loaded on-demand to optimize memory usage"
     }
 
-@mcp.tool()
 def get_incremental_indexing_stats(ctx: Context) -> Dict[str, Any]:
     """Get statistics about incremental indexing metadata."""
     base_path = ctx.request_context.lifespan_context.base_path
@@ -2596,7 +3242,6 @@ def get_incremental_indexing_stats(ctx: Context) -> Dict[str, Any]:
             "base_path": base_path
         }
 
-@mcp.tool()
 def get_memory_profile() -> Dict[str, Any]:
     """
     Get comprehensive memory profiling statistics with robust error handling and defensive programming.
@@ -3014,7 +3659,6 @@ def get_memory_profile() -> Dict[str, Any]:
         logger.error("Unexpected error in get_memory_profile", exc_info=True)
         return result
 
-@mcp.tool()
 def trigger_memory_cleanup() -> Dict[str, Any]:
     """Manually trigger memory cleanup and garbage collection."""
     global memory_profiler, memory_aware_manager, lazy_content_manager
@@ -3066,8 +3710,7 @@ def trigger_memory_cleanup() -> Dict[str, Any]:
             "success": False
         }
 
-@mcp.tool()
-def configure_memory_limits(soft_limit_mb: Optional[float] = None, 
+def configure_memory_limits(soft_limit_mb: Optional[float] = None,
                           hard_limit_mb: Optional[float] = None,
                           max_loaded_files: Optional[int] = None,
                           max_cached_queries: Optional[int] = None) -> Dict[str, Any]:
@@ -3118,7 +3761,6 @@ def configure_memory_limits(soft_limit_mb: Optional[float] = None,
             "success": False
         }
 
-@mcp.tool()
 def export_memory_profile(file_path: Optional[str] = None) -> Dict[str, Any]:
     """Export detailed memory profile to a file."""
     global memory_profiler
@@ -3152,7 +3794,6 @@ def export_memory_profile(file_path: Optional[str] = None) -> Dict[str, Any]:
             "success": False
         }
 
-@mcp.tool()
 def get_performance_metrics() -> Dict[str, Any]:
     """Get comprehensive performance monitoring metrics and statistics."""
     global performance_monitor
@@ -3186,7 +3827,6 @@ def get_performance_metrics() -> Dict[str, Any]:
             "initialized": True
         }
 
-@mcp.tool()
 def export_performance_metrics(file_path: Optional[str] = None) -> Dict[str, Any]:
     """Export performance metrics to a JSON file."""
     global performance_monitor
@@ -3222,7 +3862,6 @@ def export_performance_metrics(file_path: Optional[str] = None) -> Dict[str, Any
 
 # ----- PROGRESS TRACKING TOOLS -----
 
-@mcp.tool()
 def get_active_operations() -> Dict[str, Any]:
     """Get status of all active operations with progress tracking."""
     try:
@@ -3241,7 +3880,6 @@ def get_active_operations() -> Dict[str, Any]:
             "success": False
         }
 
-@mcp.tool()
 def get_operation_status(operation_id: str) -> Dict[str, Any]:
     """Get detailed status of a specific operation."""
     try:
@@ -3263,7 +3901,6 @@ def get_operation_status(operation_id: str) -> Dict[str, Any]:
             "success": False
         }
 
-@mcp.tool()
 async def cancel_operation(operation_id: str, reason: str = "Operation cancelled by user") -> Dict[str, Any]:
     """Cancel a specific operation."""
     try:
@@ -3286,7 +3923,6 @@ async def cancel_operation(operation_id: str, reason: str = "Operation cancelled
             "success": False
         }
 
-@mcp.tool()
 async def cancel_all_operations(reason: str = "All operations cancelled by user") -> Dict[str, Any]:
     """Cancel all active operations."""
     try:
@@ -3305,7 +3941,6 @@ async def cancel_all_operations(reason: str = "All operations cancelled by user"
             "success": False
         }
 
-@mcp.tool()
 def cleanup_completed_operations(max_age_hours: float = 1.0) -> Dict[str, Any]:
     """Clean up completed operations older than specified hours."""
     try:
@@ -3330,7 +3965,6 @@ def cleanup_completed_operations(max_age_hours: float = 1.0) -> Dict[str, Any]:
             "error": f"Error cleaning up operations: {e}",
             "success": False
         }
-@mcp.tool()
 def analyze_file_with_smart_reader(file_path: str, ctx: Context,
                                    include_content: bool = True,
                                    include_metadata: bool = True,
@@ -3449,7 +4083,6 @@ def analyze_file_with_smart_reader(file_path: str, ctx: Context,
         return {"error": f"Error analyzing file: {e}"}
 
 
-@mcp.tool()
 def read_file_chunks(file_path: str, ctx: Context, chunk_size: int = 4*1024*1024,
                      max_chunks: Optional[int] = None) -> Dict[str, Any]:
     """
@@ -3541,7 +4174,6 @@ def read_file_chunks(file_path: str, ctx: Context, chunk_size: int = 4*1024*1024
         return {"error": f"Error reading file chunks: {e}"}
 
 
-@mcp.tool()
 def detect_file_errors(file_path: str, ctx: Context) -> Dict[str, Any]:
     """
     Detect and analyze errors in a file using SmartFileReader's error detection capabilities.
@@ -3626,7 +4258,6 @@ def detect_file_errors(file_path: str, ctx: Context) -> Dict[str, Any]:
         return {"error": f"Error detecting file errors: {e}"}
 
 
-@mcp.tool()
 def get_file_metadata(file_path: str, ctx: Context) -> Dict[str, Any]:
     """
     Get comprehensive metadata for a file using SmartFileReader.
@@ -3722,113 +4353,6 @@ def get_file_metadata(file_path: str, ctx: Context) -> Dict[str, Any]:
         return {"error": f"Error getting file metadata: {e}"}
 
 
-@mcp.tool()
-def compare_file_reading_strategies(file_path: str, ctx: Context) -> Dict[str, Any]:
-    """
-    Compare different file reading strategies for a given file.
-
-    This tool demonstrates how SmartFileReader automatically selects the optimal
-    reading strategy based on file characteristics and provides information about
-    why each strategy would be chosen.
-
-    Args:
-        file_path: Path to the file to analyze (relative to project root)
-
-    Returns:
-        Comparison of reading strategies with recommendations
-    """
-    base_path = ctx.request_context.lifespan_context.base_path
-
-    # Check if base_path is set
-    if not base_path:
-        return {"error": "Project path not set. Please use set_project_path to set a project directory first."}
-
-    # Normalize the file path
-    norm_path = os.path.normpath(file_path)
-    if norm_path.startswith('..'):
-        return {"error": f"Invalid file path: {file_path}"}
-
-    if os.path.isabs(norm_path):
-        try:
-            norm_path = os.path.relpath(norm_path, base_path)
-        except ValueError:
-            return {"error": f"File path is not within project directory: {file_path}"}
-
-    full_path = os.path.join(base_path, norm_path)
-
-    # Check if file exists
-    if not os.path.exists(full_path):
-        return {"error": f"File not found: {file_path}"}
-
-    try:
-        # Get file size for analysis
-        file_size = os.path.getsize(full_path)
-
-        # Determine file size category
-        if file_size < 10 * 1024 * 1024:  # < 10MB
-            size_category = "small"
-            recommended_strategy = "lazy_loading"
-        elif file_size < 100 * 1024 * 1024:  # < 100MB
-            size_category = "medium"
-            recommended_strategy = "chunked_reading"
-        else:  # >= 100MB
-            size_category = "large"
-            recommended_strategy = "memory_mapped"
-
-        # Strategy descriptions
-        strategies = {
-            "lazy_loading": {
-                "description": "Load content on-demand with caching",
-                "best_for": "Small to medium files (< 10MB)",
-                "memory_usage": "Low - only loads when needed",
-                "speed": "Fast for repeated access",
-                "use_case": "Most common files in codebases"
-            },
-            "chunked_reading": {
-                "description": "Read file in configurable chunks",
-                "best_for": "Medium to large files (10MB - 100MB)",
-                "memory_usage": "Medium - processes in chunks",
-                "speed": "Good for streaming processing",
-                "use_case": "Large log files, data files"
-            },
-            "memory_mapped": {
-                "description": "Map file directly to memory",
-                "best_for": "Very large files (> 100MB)",
-                "memory_usage": "High - maps entire file",
-                "speed": "Very fast for random access",
-                "use_case": "Large binary files, databases"
-            }
-        }
-
-        result = {
-            "file_path": norm_path,
-            "full_path": full_path,
-            "file_size_bytes": file_size,
-            "file_size_mb": file_size / (1024 * 1024),
-            "size_category": size_category,
-            "recommended_strategy": recommended_strategy,
-            "strategies": strategies,
-            "recommendation_reason": f"File size of {file_size:,} bytes ({file_size/(1024*1024):.2f} MB) falls in the {size_category} category"
-        }
-
-        # Add performance estimates
-        if recommended_strategy == "lazy_loading":
-            result["estimated_memory_mb"] = file_size / (1024 * 1024)
-            result["estimated_load_time_ms"] = file_size / (1024 * 1024) * 10  # Rough estimate
-        elif recommended_strategy == "chunked_reading":
-            result["estimated_memory_mb"] = 4  # 4MB chunks
-            result["estimated_load_time_ms"] = file_size / (4 * 1024 * 1024) * 50  # Rough estimate
-        else:  # memory_mapped
-            result["estimated_memory_mb"] = file_size / (1024 * 1024)
-            result["estimated_load_time_ms"] = 100  # Very fast mapping
-
-        return result
-
-    except Exception as e:
-        logger.error(f"Error comparing reading strategies for {full_path}: {e}", exc_info=True)
-        return {"error": f"Error comparing reading strategies: {e}"}
-
-
 # ----- PROGRESS TRACKING TOOLS -----
         
         ops_after = len(progress_manager.get_all_operations_status())
@@ -3906,7 +4430,7 @@ def _safe_clear_file_index():
     # Always reset to empty dictionary to ensure compatibility
     file_index = {}
 
-async def _index_project_with_progress(base_path: str, progress_tracker: ProgressTracker) -> int:
+async def _index_project_with_progress(base_path: str, progress_tracker: ProgressTracker, core_engine: Optional[CoreEngine] = None) -> int:
     """
     Create an index of the project files with progress tracking and cancellation support.
     Returns the number of files indexed.
@@ -4191,6 +4715,19 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                                             logger.warning(f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing.")
                                     except Exception as es_e:
                                         logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
+                                
+                                # Index into Core Engine
+                                if core_engine:
+                                    try:
+                                        # Ensure content is read if not already
+                                        if 'content' not in locals() or content is None:
+                                            smart_reader = SmartFileReader(base_path)
+                                            content = smart_reader.read_content(full_file_path)
+                                        
+                                        if content:
+                                            await core_engine.index_file(base_path, file_path, content)
+                                    except Exception as core_e:
+                                        logger.error(f"Error indexing {file_path} into Core Engine: {core_e}")
                     
                     logger.info(f"Parallel indexing completed: {file_count} files processed")
                 except Exception as e:
@@ -4268,6 +4805,19 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                             except Exception as es_e:
                                 logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
                         
+                        # Index into Core Engine (Sequential)
+                        if core_engine:
+                            try:
+                                # Ensure content is read if not already
+                                if 'content' not in locals() or content is None:
+                                    smart_reader = SmartFileReader(base_path)
+                                    content = smart_reader.read_content(full_file_path)
+                                
+                                if content:
+                                    await core_engine.index_file(base_path, file_path, content)
+                            except Exception as core_e:
+                                logger.error(f"Error indexing {file_path} into Core Engine (sequential): {core_e}")
+
                         # Update progress periodically
                         if processed_files % 10 == 0:
                             progress_percent = (processed_files / len(changed_files)) * 100
@@ -4351,7 +4901,7 @@ async def _index_project_with_progress(base_path: str, progress_tracker: Progres
                 pass
         raise
 
-def _index_project(base_path: str) -> int:
+async def _index_project(base_path: str, core_engine: Optional[CoreEngine] = None) -> int:
     """
     Create an index of the project files with size and directory count filtering.
     Returns the number of files indexed.
@@ -4516,7 +5066,7 @@ def _index_project(base_path: str) -> int:
             # Process files in parallel chunks
             try:
                 # Run the parallel processing
-                results = asyncio.run(parallel_indexer.process_files(indexing_tasks))
+                results = await parallel_indexer.process_files(indexing_tasks)
                 
                 # Merge results into file_index
                 for result in results:
@@ -4579,6 +5129,20 @@ def _index_project(base_path: str) -> int:
                                         logger.warning(f"SmartFileReader returned None content for {full_file_path}, skipping Elasticsearch indexing.")
                                 except Exception as es_e:
                                     logger.exception(f"Error indexing {file_path} into Elasticsearch: {es_e}")
+                            
+                            # Index into Core Engine
+                            if core_engine:
+                                try:
+                                    # Ensure content is read if not already
+                                    if 'content' not in locals() or content is None:
+                                        smart_reader = SmartFileReader(base_path)
+                                        content = smart_reader.read_content(full_file_path)
+                                    
+                                    if content:
+                                        await core_engine.index_file(base_path, file_path, content)
+                                except Exception as core_e:
+                                    logger.error(f"Error indexing {file_path} into Core Engine: {core_e}")
+
                     else:
                         logger.error(f"Failed to index task {result.task_id}: {result.errors}")
 
@@ -4701,6 +5265,19 @@ def _index_project(base_path: str) -> int:
                                             logger.warning(f"SmartFileReader returned None content for {full_file_path} (sequential), skipping Elasticsearch indexing.")
                                     except Exception as es_e:
                                         logger.exception(f"Error indexing {file_path} into Elasticsearch (sequential): {es_e}")
+                                
+                                # Index into Core Engine (Sequential)
+                                if core_engine:
+                                    try:
+                                        # Ensure content is read if not already
+                                        if 'content' not in locals() or content is None:
+                                            smart_reader = SmartFileReader(base_path)
+                                            content = smart_reader.read_content(full_file_path)
+                                        
+                                        if content:
+                                            await core_engine.index_file(base_path, file_path, content)
+                                    except Exception as core_e:
+                                        logger.error(f"Error indexing {file_path} into Core Engine (sequential): {core_e}")
                         
         # Save updated metadata
         indexer.save_metadata()
@@ -4869,6 +5446,171 @@ def check_and_install_elasticsearch():
                 logger.error(f"Elasticsearch installation failed: {e}")
 
     return False
+
+
+# ============================================================================
+# PHASE 7 MCP TOOLS: Ranking, API Key Manager, Stats Dashboard
+# ============================================================================
+
+async def get_index_statistics(
+    ctx: Context,
+    force_refresh: bool = False
+) -> Dict[str, Any]:
+    """
+    Get comprehensive index statistics from the dashboard.
+
+    PRODUCT.MD ALIGNMENT:
+    ---------------------
+    "Index Statistics Dashboard: CLI command showing index health metrics"
+
+    Provides statistics about:
+    - Document count and size
+    - Backend health (PostgreSQL, Elasticsearch)
+    - Index status and health
+    - Overall system status
+
+    Args:
+        force_refresh: Force refresh even if cache is valid
+
+    Returns:
+        Dictionary with index statistics including backend health,
+        document counts, sizes, and overall status
+    """
+    stats_collector = ensure_stats_collector()
+
+    try:
+        stats = await stats_collector.collect_statistics(force_refresh=force_refresh)
+        return stats.to_dict()
+    except Exception as e:
+        logger.error(f"Error collecting statistics: {e}")
+        return {
+            "error": str(e),
+            "overall_status": "error",
+            "indices": {},
+            "backends": {}
+        }
+
+
+async def get_backend_health(
+    ctx: Context
+) -> Dict[str, Any]:
+    """
+    Get health status of all backends.
+
+    Returns the health status of PostgreSQL, Elasticsearch,
+    and any other connected backends.
+
+    Returns:
+        Dictionary with backend names as keys and health status as values
+    """
+    stats_collector = ensure_stats_collector()
+
+    try:
+        stats = await stats_collector.collect_statistics(force_refresh=True)
+        return {
+            name: health.to_dict()
+            for name, health in stats.backends.items()
+        }
+    except Exception as e:
+        logger.error(f"Error checking backend health: {e}")
+        return {"error": str(e)}
+
+
+def get_ranking_configuration(
+    ctx: Context
+) -> Dict[str, Any]:
+    """
+    Get the current search ranking configuration.
+
+    Returns the weights and settings used for search result ranking,
+    including semantic, recency, frequency, path importance, and
+    file size weights.
+
+    Returns:
+        Dictionary with ranking configuration
+    """
+    ranker = ensure_result_ranker()
+
+    config = ranker.config
+
+    return {
+        "weights": {
+            "semantic": config.semantic_weight,
+            "recency": config.recency_weight,
+            "frequency": config.frequency_weight,
+            "path_importance": config.path_importance_weight,
+            "file_size": config.file_size_weight
+        },
+        "recency_settings": {
+            "half_life_days": config.recency_half_life_days,
+            "max_bonus": config.max_recency_bonus
+        },
+        "frequency_settings": {
+            "decay_factor": config.frequency_decay_factor,
+            "min_access_count": config.min_access_count
+        },
+        "path_importance_scores": {
+            category.value: score
+            for category, score in config.path_importance_scores.items()
+        },
+        "file_size_settings": {
+            "optimal_min": config.optimal_size_min,
+            "optimal_max": config.optimal_size_max
+        },
+        "user_tracking_enabled": config.enable_user_tracking
+    }
+
+
+async def rank_search_results(
+    ctx: Context,
+    results: List[Dict[str, Any]],
+    query: str = ""
+) -> List[Dict[str, Any]]:
+    """
+    Apply intelligent ranking to search results.
+
+    Enhances search results by applying multi-factor ranking:
+    - Semantic similarity (base score)
+    - File recency (recently modified files)
+    - User behavior frequency (frequently accessed files)
+    - Path importance (source > config > tests > docs)
+    - File size (prefer moderate sizes)
+
+    Args:
+        results: List of search result dictionaries with 'file_path', 'score', etc.
+        query: Optional search query for behavior tracking
+
+    Returns:
+        List of ranked search results with additional ranking metadata
+    """
+    ranker = ensure_result_ranker()
+
+    try:
+        ranked = ranker.rank_results(results, query=query)
+
+        # Convert SearchResult objects back to dictionaries
+        output = []
+        for result in ranked:
+            output.append({
+                "file_path": result.file_path,
+                "original_score": result.original_score,
+                "ranked_score": result.ranked_score,
+                "content_preview": result.content_preview,
+                "metadata": result.metadata,
+                "ranking_components": {
+                    "semantic": result.semantic_component,
+                    "recency": result.recency_component,
+                    "frequency": result.frequency_component,
+                    "path": result.path_component,
+                    "size": result.size_component
+                }
+            })
+
+        return output
+    except Exception as e:
+        logger.error(f"Error ranking search results: {e}")
+        # Return original results on error
+        return results
 
 
 def main():

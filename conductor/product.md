@@ -13,6 +13,11 @@ The goal is to update the existing `code-indexer` project to its next major vers
 
 ### 2. **Enhanced Agent Integration (Beyond MCP)**
 -   **Deeper Integration:** Move beyond the limitations of standard MCP to lower-overhead, high-capability integrations like Skills, Plugins, or Extensions.
+-   **Implemented Features:**
+    -   **CLI Tool:** `code-search` for direct agent interaction.
+    -   **Skill Definition:** Optimized `SKILL.md` for agents like Claude Code.
+    -   **Installation Helpers:** Scripts to configure various agent environments.
+    -   **Hooks:** Session start hooks to enforce skill usage.
 -   **Target Platforms:**
     -   **Priority 1:** Claude Code (Anthropic) and OpenAI (Codex/Custom GPTs).
     -   **Priority 2:** Editor environments like VS Code, Cursor, and Windsurf.

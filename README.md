@@ -17,13 +17,21 @@
 
 
 
-## 🚀 Comlpete Edition - v3.0.0 
+## 🚀 Unified Edition - v4.0.0
 
-This version is comprised of a complete architectural transformation with **hybrid database migration** from SQLite to PostgreSQL + Elasticsearch:
+This version introduces the **Unified Core Engine**, a next-generation search and indexing architecture that seamlessly blends semantic understanding with traditional code search:
+
+### 🌟 **Unified Core Engine**
+- **✅ Hybrid Intelligence** - Intelligently routes queries between Vector Search (Semantic), Zoekt (Regex/Symbolic), and Elasticsearch.
+- **✅ Semantic Search & Reranking** - Deep understanding of code intent with automatic reranking for high precision.
+- **✅ Web Search Integration** - Optional capability to augment code search with web results.
+- **✅ Standalone Power** - Operates efficiently without external databases (PostgreSQL/Elasticsearch) for many use cases.
+- **✅ Dual-Mode Architecture** - Supports both "Core Engine" (Vector-first) and "Legacy" (ES/PG) backends simultaneously.
 
 ### 🏗️ **Architecture Transformation**
+- **✅ Unified Router** - Centralized dispatch for all search and indexing operations.
 - **✅ PostgreSQL Integration** - Robust metadata storage with ACID compliance
-- **✅ Elasticsearch Integration** - High-performance full-text search capabilities  
+- **✅ Elasticsearch Integration** - High-performance full-text search capabilities
 - **✅ Hybrid Database Architecture** - Best of both worlds for different data types
 - **✅ Version Tracking System** - Complete file change history with diffs
 - **✅ Real-time Indexing** - RabbitMQ-based async processing
@@ -32,26 +40,28 @@ This version is comprised of a complete architectural transformation with **hybr
 ### 📊 **Migration Achievements**
 - **✅ Zero Data Loss** - Complete ETL migration from SQLite
 - **✅ Backward Compatibility** - Dual-write/read strategy during transition
-- **✅ Performance Gains** - 10x faster search with Elasticsearch
+- **✅ Performance Gains** - 10x faster search with Elasticsearch & Core Engine
 - **✅ Scalability** - Enterprise-grade database backends
 - **✅ Version Control** - Full file history tracking with PostgreSQL
 - **✅ Real-time Updates** - Instant search index updates
 
 ### 🛠️ **New Features**
-1. **File Version Tracking** - Complete change history with diffs
-2. **PostgreSQL Metadata** - Structured data with relationships
-3. **Elasticsearch Search** - Advanced full-text search capabilities
-4. **Real-time Indexing** - RabbitMQ message queue processing
-5. **ETL Migration Tools** - Seamless data migration utilities
-6. **Database Migrations** - Alembic-based schema management
-7. **Backup & Recovery** - Comprehensive backup strategies
-8. **Monitoring & Logging** - Enterprise-grade observability
+1. **Unified Core Engine** - Semantic search, Reranking, Web Search.
+2. **File Version Tracking** - Complete change history with diffs
+3. **PostgreSQL Metadata** - Structured data with relationships
+4. **Elasticsearch Search** - Advanced full-text search capabilities
+5. **Real-time Indexing** - RabbitMQ message queue processing
+6. **ETL Migration Tools** - Seamless data migration utilities
+7. **Database Migrations** - Alembic-based schema management
+8. **Backup & Recovery** - Comprehensive backup strategies
+9. **Monitoring & Logging** - Enterprise-grade observability
 
 ### 📋 **Verified Functionality**
+- **✅ Unified Search** - Semantic + Regex + Web search capabilities
 - **✅ File Operations** - Create, modify, delete with full tracking
 - **✅ Search Capabilities** - Basic, advanced, and pattern-based search
 - **✅ Version History** - Complete file change tracking and retrieval
-- **✅ Database Integration** - PostgreSQL + Elasticsearch working seamlessly
+- **✅ Database Integration** - PostgreSQL + Elasticsearch + Core Vector Store working seamlessly
 - **✅ Migration Tools** - ETL scripts for data migration
 - **✅ Backup Systems** - Automated backup and recovery procedures
 
@@ -89,7 +99,8 @@ This server integrates with the [Model Context Protocol](https://modelcontextpro
 - **Storage Backends**: SQLite and trie-based optimized storage
 
 ### 🔧 Plug and Play Experience
-- **MCP Tools**: 20+ specialized tools for code analysis and management
+- **MCP Tools**: 9 consolidated mega-tools for code analysis and management (replacing 50+ individual tools)
+- **Action-Based Routing**: Each mega-tool supports multiple actions for streamlined operations
 - **Background Cleanup**: Automatic cache management and garbage collection
 - **Error Recovery**: Graceful handling of failures with automatic fallbacks
 - **Extensible Architecture**: Pluggable storage and search backends
@@ -153,6 +164,7 @@ python run.py start-dev-dbs
 **2. Environment Configuration:**
 ```bash
 # Set environment variables
+export CORE_ENGINE_API_KEY=your-api-key # Optional: For Semantic Search & Reranking
 export DAL_BACKEND_TYPE=postgresql_elasticsearch_only
 export POSTGRES_HOST=localhost
 export POSTGRES_PORT=5432
@@ -181,6 +193,31 @@ For detailed installation instructions, database setup, and troubleshooting, see
 
 For Elasticsearch security configuration (authentication, TLS/SSL, API keys), see:
 **[🔒 Elasticsearch Security Guide](docs/ELASTICSEARCH_SECURITY.md)**
+
+## 🤖 Agent Integration
+
+The Unified Core Engine is designed for deep integration with AI agents.
+
+### 🛠️ CLI & Skills
+We provide a dedicated CLI tool `code-search` and a Skill definition for agents to autonomously navigate your codebase.
+
+**1. CLI Tool:**
+```bash
+# Search code (Semantic + Symbolic)
+code-search "How does the indexing work?"
+
+# Ask questions (RAG)
+code-search --answer "Explain the core engine architecture"
+```
+
+**2. Agent Configuration:**
+Run the installation helper to get configuration snippets for your agent:
+```bash
+python src/scripts/install_agent.py [claude-code|openai|vscode|all]
+```
+
+**3. Skill Integration:**
+For agents that support Skills or System Prompts, refer to `plugins/code_indexer/skills/code-search/SKILL.md` for the optimal prompt to ensure the agent uses the Unified Engine correctly.
 
 ## 🔌 MCP Integration
 
@@ -357,50 +394,173 @@ npx @modelcontextprotocol/inspector uv run code_index_mcp
 
 ## 🛠️ Available Tools
 
-The Code Index MCP server provides **25+ specialized tools** for comprehensive code analysis and management:
+The Code Index MCP server provides **9 consolidated mega-tools** for comprehensive code analysis and management. These mega-tools use action-based routing to streamline operations while preserving all functionality from the original 50+ individual tools.
 
-### 🏗️ **Core Project Management**
-- `set_project_path` - Initialize project workspace with database connections
-- `refresh_index` - Incremental indexing with progress tracking
-- `get_settings_info` - Project configuration and statistics
+### 🌟 **Mega-Tools Architecture**
 
-### 🔍 **Advanced Search & Discovery**
-- `search_code_advanced` - Enterprise search with fuzzy matching, highlighting, and Elasticsearch
-- `find_files` - Glob pattern file discovery
-- `get_file_summary` - Comprehensive file analysis with structure and metrics
+Each mega-tool accepts an `action`, `operation`, or `type` parameter that routes to the specific functionality you need:
 
-### ✏️ **File Operations with Version Tracking**
-- `write_to_file` - Create/modify files with automatic version tracking
-- `search_and_replace` - Regex-powered find/replace with scope control
-- `apply_diff` - Multi-file modifications with atomic operations
-- `insert_content` - Precise content insertion at specific lines
-- `delete_file` - File deletion with version history
-- `rename_file` - File renaming/moving with tracking
+| Mega-Tool | Actions/Operations/Modes | Consolidates |
+|-----------|------------------------|--------------|
+| **manage_project** | set_path, refresh, reindex, clear, reset | 5 tools |
+| **search_content** | search, find, rank | 3 tools |
+| **modify_file** | write, diff, insert, replace | 4 tools |
+| **manage_files** | delete, rename, revert, history | 4 tools |
+| **get_diagnostics** | memory, index, backend, performance, operations, settings, ignore, filtering, ranking | 9 tools |
+| **manage_memory** | cleanup, configure, export | 3 tools |
+| **manage_operations** | list, cancel, cleanup | 4 tools |
+| **read_file** | smart, chunks, detect_errors, metadata | 4 tools |
+| **manage_temp** | create, check | 2 tools |
 
-### 📚 **Version Control & History**
-- `get_file_history` - Complete change history with diffs and timestamps
-- `revert_file_to_version` - Rollback to any previous version
-- Full PostgreSQL-backed version tracking system
+### 📋 **Detailed Mega-Tools Reference**
 
-### ⚙️ **System Management & Performance**
-- `get_memory_profile` - Real-time memory usage monitoring
-- `get_performance_metrics` - Comprehensive performance statistics
-- `get_active_operations` - Operation tracking with progress
-- `cancel_operation` - Graceful operation cancellation
-- Memory management and garbage collection tools
+#### 1. **manage_project** - Project Lifecycle Management
+```python
+# Set project path
+manage_project(action="set_path", path="/path/to/project")
 
-### 🔧 **Large Scale Codebase Features (600K + files)**
-- Database migration and ETL tools
-- Backup and recovery systems
-- Real-time indexing with RabbitMQ
-- Elasticsearch integration for advanced search
-- PostgreSQL metadata storage with ACID compliance
+# Refresh with incremental indexing
+manage_project(action="refresh")
+
+# Force complete reindex
+manage_project(action="reindex", clear_cache=True)
+
+# Clear all settings
+manage_project(action="clear")
+
+# Reset server state
+manage_project(action="reset")
+```
+
+#### 2. **search_content** - Content Search and Discovery
+```python
+# Advanced semantic search
+search_content(action="search", pattern="function foo", fuzzy=True)
+
+# Find files by glob pattern
+search_content(action="find", pattern="*.py")
+
+# Rank search results by relevance
+search_content(action="rank", results=[...], query="authentication")
+```
+
+#### 3. **modify_file** - File Content Modifications
+```python
+# Write complete file
+modify_file(operation="write", path="src/main.py", content="...", line_count=10)
+
+# Apply diff with regex
+modify_file(operation="diff", path="config.json", search="old", replace="new")
+
+# Insert content at specific line
+modify_file(operation="insert", path="README.md", line=10, content="new section")
+
+# Search and replace
+modify_file(operation="replace", path="api.py", search="todo", replace="TODO")
+```
+
+#### 4. **manage_files** - File System Operations
+```python
+# Delete a file
+manage_files(action="delete", file_path="old_file.py")
+
+# Rename/move a file
+manage_files(action="rename", file_path="src/old.py", new_file_path="src/new.py")
+
+# Revert to specific version
+manage_files(action="revert", file_path="config.json", version_id="v1.2.3")
+
+# Get file history
+manage_files(action="history", file_path="src/main.py")
+```
+
+#### 5. **get_diagnostics** - System Diagnostics and Metrics
+```python
+# Check memory usage
+get_diagnostics(type="memory")
+
+# Get index statistics
+get_diagnostics(type="index", force_refresh=True)
+
+# Check backend health
+get_diagnostics(type="backend")
+
+# Get performance metrics
+get_diagnostics(type="performance")
+
+# List active operations
+get_diagnostics(type="operations")
+
+# View ignore patterns
+get_diagnostics(type="ignore")
+
+# Check ranking configuration
+get_diagnostics(type="ranking")
+```
+
+#### 6. **manage_memory** - Memory Management
+```python
+# Trigger memory cleanup
+manage_memory(action="cleanup")
+
+# Configure memory limits
+manage_memory(action="configure", soft_limit_mb=1024, hard_limit_mb=2048)
+
+# Export memory profile
+manage_memory(action="export", file_path="/tmp/memory.json")
+```
+
+#### 7. **manage_operations** - Operation Tracking and Control
+```python
+# List all active operations
+manage_operations(action="list")
+
+# Cancel specific operation
+manage_operations(action="cancel", operation_id="op-123")
+
+# Cleanup old completed operations
+manage_operations(action="cleanup", max_age_hours=2.0)
+```
+
+#### 8. **read_file** - File Reading Strategies
+```python
+# Full smart analysis
+read_file(mode="smart", file_path="src/main.py", include_content=True)
+
+# Read large file in chunks
+read_file(mode="chunks", file_path="large.json", chunk_size=8388608)
+
+# Detect errors in a file
+read_file(mode="detect_errors", file_path="config.py")
+
+# Get file metadata only
+read_file(mode="metadata", file_path="README.md")
+```
+
+#### 9. **manage_temp** - Temporary Directory Management
+```python
+# Ensure temp directory exists
+manage_temp(action="create")
+
+# Check temp directory status
+manage_temp(action="check")
+```
+
+### 📚 **Migration from Old Tools**
+
+If you were using the previous 50+ individual tools, see the **[Migration Guide](conductor/tracks/mcp_consolidation_local_vector_20251230/MIGRATION_GUIDE.md)** for a complete mapping of old tool names to the new mega-tools.
+
+**Quick Migration Examples:**
+- `set_project_path()` -> `manage_project(action="set_path", path=...)`
+- `search_code_advanced()` -> `search_content(action="search", pattern=...)`
+- `write_to_file()` -> `modify_file(operation="write", path=..., content=...)`
+- `get_file_history()` -> `manage_files(action="history", file_path=...)`
 
 **📖 Complete Documentation**: See [docs/TOOLS_LIST.md](docs/TOOLS_LIST.md) for detailed tool reference with examples and system prompt templates.
 
 ## Common Workflows and Examples
 
-Here’s a typical workflow for using Code Index MCP with an AI assistant like Claude.
+Here's a typical workflow for using Code Index MCP with an AI assistant like Claude.
 
 ### 1. Set Project Path & Initial Indexing
 
@@ -411,6 +571,11 @@ This is the first and most important step. When you set the project path, the se
 Please set the project path to C:\Users\username\projects\my-react-app
 ```
 
+**Mega-tool used:**
+```python
+manage_project(action="set_path", path="C:\\Users\\username\\projects\\my-react-app")
+```
+
 ### 2. Refresh the Index (When Needed)
 
 If you make significant changes to your project files after the initial setup, you can manually refresh the index to ensure all tools are working with the latest information.
@@ -419,7 +584,11 @@ If you make significant changes to your project files after the initial setup, y
 ```
 I've just added a few new components, please refresh the project index.
 ```
-*(The assistant would use the `refresh_index` tool)*
+
+**Mega-tool used:**
+```python
+manage_project(action="refresh")
+```
 
 ### 3. Explore the Project Structure
 
@@ -429,7 +598,11 @@ Once the index is ready, you can find files using patterns (globs) to understand
 ```
 Find all TypeScript component files in the 'src/components' directory.
 ```
-*(The assistant would use the `find_files` tool with a pattern like `src/components/**/*.tsx`)*
+
+**Mega-tool used:**
+```python
+search_content(action="find", pattern="src/components/**/*.tsx")
+```
 
 ### 4. Analyze a Specific File
 
@@ -439,7 +612,11 @@ Before diving into the full content of a file, you can get a quick summary of it
 ```
 Can you give me a summary of the 'src/api/userService.ts' file?
 ```
-*(The assistant would use the `get_file_summary` tool)*
+
+**Mega-tool used:**
+```python
+read_file(mode="smart", file_path="src/api/userService.ts", include_content=True)
+```
 
 ### 5. Search for Code
 
@@ -449,17 +626,99 @@ With an up-to-date index, you can search for code snippets, function names, or a
 ```
 Search for all occurrences of the "processData" function.
 ```
+```python
+search_content(action="search", pattern="function processData")
+```
 
 **Example: Search with Fuzzy Matching**
 ```
 I'm looking for a function related to user authentication, it might be named 'authUser', 'authenticateUser', or something similar. Can you do a fuzzy search for 'authUser'?
+```
+```python
+search_content(action="search", pattern="authUser", fuzzy=True)
 ```
 
 **Example: Search within Specific Files**
 ```
 Search for the string "API_ENDPOINT" only in Python files.
 ```
-*(The assistant would use the `search_code` tool with the `file_pattern` parameter set to `*.py`)*
+```python
+search_content(action="search", pattern="API_ENDPOINT", file_pattern="*.py")
+```
+
+### 6. Modify Files
+
+When you need to make changes to your code, use the modify_file mega-tool with different operations.
+
+**Example: Write a New File**
+```
+Create a new file 'src/utils/helpers.ts' with utility functions.
+```
+```python
+modify_file(
+    operation="write",
+    path="src/utils/helpers.ts",
+    content="export function formatDate(date: Date): string { ... }",
+    line_count=5
+)
+```
+
+**Example: Search and Replace**
+```
+Replace all occurrences of 'TODO' with 'FIXME' in the api.ts file.
+```
+```python
+modify_file(
+    operation="replace",
+    path="src/api.ts",
+    search="TODO",
+    replace="FIXME"
+)
+```
+
+### 7. Get System Diagnostics
+
+Monitor the health and performance of your code indexing system.
+
+**Example: Check Memory Usage**
+```
+How much memory is the indexer currently using?
+```
+```python
+get_diagnostics(type="memory")
+```
+
+**Example: View Index Statistics**
+```
+Show me the current index statistics.
+```
+```python
+get_diagnostics(type="index", force_refresh=True)
+```
+
+### 8. Manage File Versions
+
+Track and revert changes to files using the version history system.
+
+**Example: Get File History**
+```
+Show me the change history for config.json.
+```
+```python
+manage_files(action="history", file_path="config.json")
+```
+
+**Example: Revert to Previous Version**
+```
+Revert main.py to the version from yesterday.
+```
+```python
+manage_files(
+    action="revert",
+    file_path="main.py",
+    timestamp="2024-01-15T10:30:00"
+)
+```
 
 ## Development
 

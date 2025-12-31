@@ -11,14 +11,64 @@ logger = logging.getLogger(__name__)
 class ContentExtractor:
     """
     Handles content extraction from various file types.
+
+    CRITICAL FIX: Added path validation to ensure all file accesses are
+    within the configured base_path to prevent path traversal attacks.
     """
     def __init__(self, base_path: str):
         self.base_path = base_path
         self.MAX_CONTENT_SIZE_MB = 50  # Max content size to load directly into memory (50MB)
 
     def _get_full_path(self, file_path: str) -> str:
-        """Constructs the full absolute path to the file."""
-        return os.path.join(self.base_path, file_path)
+        """
+        Constructs the full absolute path to the file.
+
+        CRITICAL FIX: Validate that the file_path is within base_path before
+        returning the full path to prevent path traversal attacks.
+        """
+        from pathlib import Path
+
+        try:
+            # Resolve both paths to their absolute real paths
+            # This resolves symlinks and relative path components (.., .)
+            real_file_path = Path(file_path).resolve()
+            real_base_path = Path(self.base_path).resolve()
+
+            # Check if the real file path is within the real base path
+            try:
+                real_file_path.relative_to(real_base_path)
+                # Path is safe, return the validated absolute path
+                return str(real_file_path)
+            except ValueError:
+                # relative_to raises ValueError if path is not within base
+                logger.error(
+                    f"SECURITY VIOLATION: File path {file_path} is not within base path {self.base_path}. "
+                    f"Resolved file path: {real_file_path}, Resolved base path: {real_base_path}",
+                    extra={'component': 'ContentExtractor', 'action': 'path_traversal_blocked', 'file_path': file_path}
+                )
+                raise ValueError(f"Path traversal attempt detected: {file_path} is not within {self.base_path}")
+
+        except (OSError, ValueError) as e:
+            logger.error(
+                f"Error validating file path {file_path} against base {self.base_path}: {e}",
+                extra={'component': 'ContentExtractor', 'action': 'path_validation_error', 'error': str(e)}
+            )
+            raise ValueError(f"Invalid file path: {e}") from e
+
+    def _validate_path_safe(self, file_path: str) -> bool:
+        """
+        Validates that a file path is safe to access (within base_path).
+        Returns True if safe, False otherwise.
+        """
+        from pathlib import Path
+
+        try:
+            real_file_path = Path(file_path).resolve()
+            real_base_path = Path(self.base_path).resolve()
+            real_file_path.relative_to(real_base_path)
+            return True
+        except (ValueError, OSError):
+            return False
 
     def _extract_text_from_plain_file(self, full_path: str) -> Optional[str]:
         """Extracts text from plain text files, handling large files efficiently."""
@@ -78,8 +128,22 @@ class ContentExtractor:
     def extract_content(self, file_path: str) -> Optional[Dict[str, Any]]:
         """
         Extracts content and basic metadata from a file based on its type.
+
+        CRITICAL FIX: Now catches ValueError from path validation to handle
+        path traversal attempts gracefully.
         """
-        full_path = self._get_full_path(file_path)
+        # CRITICAL FIX: Path validation is now done inside _get_full_path
+        # This will raise ValueError if the path is outside base_path
+        try:
+            full_path = self._get_full_path(file_path)
+        except ValueError as e:
+            # Path validation failed - path traversal attempt detected
+            logger.warning(f"Path validation failed for {file_path}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected error getting full path for {file_path}: {e}")
+            return None
+
         if not os.path.exists(full_path):
             logger.warning(f"File not found for extraction: {full_path}")
             return None

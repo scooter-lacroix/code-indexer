@@ -1,0 +1,9 @@
+{
+  "hooks": [
+    {
+      "eventName": "SessionStart",
+      "command": "python3",
+      "args": ["plugins/code_indexer/hooks/start_watch.py"]
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+2025-12-30 19:31:06,014 - unified_server - INFO - Health monitor initialized
+2025-12-30 19:31:06,771 - unified_server - INFO - Initialized UnifiedSandboxServer with config
+2025-12-30 19:31:07,014 - unified_server - DEBUG - Performance: system.monitor took 0.00ms
+2025-12-30 19:31:07,116 - unified_server - WARNING - Health check: unhealthy

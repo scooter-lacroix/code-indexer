@@ -4,6 +4,7 @@
 - **Programming Language:** Python (3.10+)
 - **Metadata Storage:** PostgreSQL (via SQLAlchemy)
 - **Primary Search & Indexing:** New internal engine (merging Zoekt and ported features)
+- **Core Engine Driver:** Mixedbread SDK (Python)
 - **Augmented Search:** Elasticsearch (Enterprise-grade full-text search)
 - **Message Broker:** RabbitMQ (via Pika for asynchronous processing)
 - **Legacy/Standalone Fallback:** SQLite (Fallback storage), Ripgrep, Ugrep
@@ -11,5 +12,6 @@
 ## Development & Infrastructure
 - **Database Migrations:** Alembic
 - **Protocol:** Model Context Protocol (MCP)
+- **Agent Integration:** Custom CLI (`code-search`), Skills, and Plugins
 - **Containerization:** Docker & Docker Compose
 - **Build System:** Setuptools (via pyproject.toml)

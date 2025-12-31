@@ -1,0 +1,8 @@
+{
+  "track_id": "agent_integration_20251229",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2025-12-29T00:00:00Z",
+  "updated_at": "2025-12-29T00:00:00Z",
+  "description": "Implement deeper agent integrations (Skills, Plugins, CLI hooks) for Claude Code, OpenAI, and IDEs, moving beyond standard MCP."
+}

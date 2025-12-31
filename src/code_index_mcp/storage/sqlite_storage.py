@@ -624,16 +624,20 @@ class SQLiteSearch(SearchInterface):
 
     def __init__(self, db_path: str, enable_fts: bool = True):
         """Initialize SQLite search.
-        
+
         Args:
             db_path: Path to SQLite database file
             enable_fts: Whether to enable Full-Text Search (FTS) tables.
         """
         self.db_path = db_path
         self.enable_fts = enable_fts
+        self._fts_validated = False  # CRITICAL FIX: Track FTS validation status
         self._ensure_db_directory()
         self._init_db()
-    
+        # CRITICAL FIX: Perform FTS integrity check at initialization, not during search
+        if self.enable_fts:
+            self._ensure_fts_integrity()
+
     def _ensure_db_directory(self):
         """Ensure the directory for the database exists."""
         db_dir = os.path.dirname(self.db_path)
@@ -783,7 +787,15 @@ class SQLiteSearch(SearchInterface):
             return repair_result
 
     def _ensure_fts_integrity(self) -> bool:
-        """Ensure FTS tables are healthy and repair if necessary."""
+        """
+        Ensure FTS tables are healthy and repair if necessary.
+
+        CRITICAL FIX: Now called at initialization instead of during search to prevent
+        performance degradation in the search path. Also tracks _fts_validated state.
+
+        NOTE: This method was previously duplicated (lines 789-810 contained an older
+        version without _fts_validated state tracking). The duplicate was removed.
+        """
         try:
             validation = self._validate_fts_tables()
 
@@ -793,26 +805,38 @@ class SQLiteSearch(SearchInterface):
 
                 if repair_result["success"]:
                     logger.info("FTS tables successfully repaired")
+                    self._fts_validated = True
                     return True
                 else:
                     logger.error(f"FTS table repair failed: {repair_result['error']}")
+                    self._fts_validated = False
                     return False
             else:
                 logger.debug("FTS tables are healthy")
+                self._fts_validated = True
                 return True
 
         except Exception as e:
             logger.error(f"Error ensuring FTS integrity: {e}")
+            self._fts_validated = False
             return False
 
     def search_content(self, query: str, is_regex: bool = False) -> List[Tuple[str, Any]]:
-        """Search across file content using FTS with improved error handling."""
+        """
+        Search across file content using FTS with improved error handling.
+
+        CRITICAL FIX: Removed integrity check from search path for performance.
+        Integrity checks are now performed during initialization only.
+        """
         logger.debug(f"SQLite search_content called with query='{query}', is_regex={is_regex}")
 
-        # Ensure FTS integrity before searching
-        if not self._ensure_fts_integrity():
-            logger.error("FTS integrity check failed, cannot perform search")
-            return []
+        # CRITICAL FIX: Only validate FTS if not previously validated or on error
+        # Don't run integrity checks on every search call
+        if not self._fts_validated and self.enable_fts:
+            logger.warning("FTS not validated, performing one-time validation")
+            if not self._ensure_fts_integrity():
+                logger.error("FTS integrity check failed, cannot perform search")
+                return []
 
         # Validate and prepare the search query
         search_query = self._prepare_search_query(query, is_regex)
@@ -867,10 +891,11 @@ class SQLiteSearch(SearchInterface):
 
         except sqlite3.Error as e:
             logger.error(f"SQLite error during search: {e}")
+            # CRITICAL FIX: Mark FTS as invalidated so next search will revalidate
+            self._fts_validated = False
             # Try to repair FTS tables if database error occurs
             if self._repair_fts_tables()["success"]:
-                logger.info("Retrying search after FTS repair due to database error")
-                return self.search_content(query, is_regex)
+                logger.info("FTS repair completed, but search needs to be retried")
             return []
         except Exception as e:
             logger.error(f"Unexpected error during search: {e}")

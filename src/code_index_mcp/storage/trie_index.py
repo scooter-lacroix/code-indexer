@@ -118,3 +118,49 @@ class TrieFileIndex(FileMetadataInterface):
         # For now, return empty list as this is a simple in-memory implementation
         return []
 
+    # CRITICAL FIX: Added missing abstract methods from FileMetadataInterface
+    def save_file_metadata(self, file_path: str, metadata: Dict[str, Any]) -> None:
+        """Save file metadata to storage."""
+        current = self.root
+        parts = file_path.split('/')
+        for part in parts:
+            current = current.children[part]
+        if current.is_end_of_word and current.file_info:
+            current.file_info.update(metadata)
+        else:
+            raise IOError(f"File {file_path} not found, cannot save metadata")
+
+    def get_file_metadata(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Retrieve file metadata from storage."""
+        file_info = self.get_file_info(file_path)
+        return file_info
+
+    def delete_file_metadata(self, file_path: str) -> None:
+        """Delete file metadata from storage."""
+        self.remove_file(file_path)
+
+    def get_all_file_paths(self) -> List[str]:
+        """Get all file paths in the storage."""
+        files = []
+        def _gather_paths(node: TrieNode, path: str):
+            if node.is_end_of_word:
+                files.append(path)
+            for part, child_node in node.children.items():
+                _gather_paths(child_node, f"{path}/{part}" if path else part)
+        _gather_paths(self.root, "")
+        return files
+
+    def close(self) -> None:
+        """Close the storage backend."""
+        # No-op for in-memory storage
+        pass
+
+    def size(self) -> int:
+        """Get the number of files in the storage."""
+        return len(self.get_all_file_paths())
+
+    def flush(self) -> bool:
+        """Flush any pending operations."""
+        # No-op for in-memory storage
+        return True
+

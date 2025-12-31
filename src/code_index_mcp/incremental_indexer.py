@@ -4,6 +4,9 @@ Incremental Indexing Module
 This module provides functionality for incremental indexing by tracking file
 modification timestamps and content hashes to determine which files have changed
 since the last indexing operation.
+
+PERFORMANCE FIX: Now uses aiofiles for truly asynchronous file I/O operations
+instead of blocking the thread pool with synchronous operations.
 """
 import os
 import hashlib
@@ -13,6 +16,14 @@ from typing import Dict, List, Tuple, Set, Optional, Any, Callable
 from concurrent.futures import ThreadPoolExecutor
 from .project_settings import ProjectSettings
 from .lazy_loader import ChunkedFileReader
+
+# PERFORMANCE FIX: Import aiofiles for truly async file operations
+try:
+    import aiofiles
+    import aiofiles.os as aios
+    AIOFILES_AVAILABLE = True
+except ImportError:
+    AIOFILES_AVAILABLE = False
 
 
 class IncrementalIndexer:
@@ -70,57 +81,76 @@ class IncrementalIndexer:
             print(f"Error calculating hash for {file_path}: {e}")
             return None
     
-    def get_file_metadata(self, file_path: str) -> Dict[str, Any]:
+    def get_file_metadata(self, file_path: str, compute_hash: bool = True) -> Dict[str, Any]:
         """
         Get current metadata for a file.
-        
+
+        PERFORMANCE FIX: Added optional hash computation to avoid expensive hash
+        calculation when not needed (e.g., during initial change detection).
+
         Args:
             file_path: Path to the file
-            
+            compute_hash: Whether to compute file hash (default: True)
+
         Returns:
             Dictionary containing file metadata (timestamp, hash, size)
         """
         try:
             stat_info = os.stat(file_path)
-            return {
+            metadata = {
                 'mtime': stat_info.st_mtime,
                 'size': stat_info.st_size,
-                'hash': self.get_file_hash(file_path),
                 'last_checked': datetime.now().isoformat()
             }
+
+            # Only compute hash if requested (lazy hash computation)
+            if compute_hash:
+                metadata['hash'] = self.get_file_hash(file_path)
+            else:
+                metadata['hash'] = None
+
+            return metadata
         except Exception as e:
             print(f"Error getting metadata for {file_path}: {e}")
             return {}
     
-    def has_file_changed(self, file_path: str) -> bool:
+    def has_file_changed(self, file_path: str, verify_hash: bool = False) -> bool:
         """
         Check if a file has changed since last indexing.
-        
+
+        PERFORMANCE FIX: Optimized change detection to avoid expensive hash calculations
+        unless explicitly requested. Uses timestamp and size as fast pre-checks.
+
         Args:
             file_path: Relative path to the file from project root
-            
+            verify_hash: If True, verify hash even when mtime/size match (for extra certainty)
+
         Returns:
             True if file has changed or is new, False otherwise
         """
         if file_path not in self.file_metadata:
             return True  # New file
-        
+
         try:
             current_stat = os.stat(file_path)
             stored_metadata = self.file_metadata[file_path]
-            
-            # Check if modification time has changed
+
+            # Fast check: modification time changed
             if current_stat.st_mtime != stored_metadata.get('mtime', 0):
                 return True
-            
-            # Check if file size has changed
+
+            # Fast check: file size changed
             if current_stat.st_size != stored_metadata.get('size', 0):
                 return True
-            
+
             # If timestamp and size are the same, file likely hasn't changed
-            # But we can optionally verify with hash for extra certainty
+            # Only verify hash if explicitly requested (e.g., for security-critical files)
+            if verify_hash and 'hash' in stored_metadata and stored_metadata['hash']:
+                current_hash = self.get_file_hash(file_path)
+                return current_hash != stored_metadata['hash']
+
             return False
-            
+
         except Exception as e:
             print(f"Error checking if file changed {file_path}: {e}")
             return True  # Assume changed if we can't check
@@ -306,49 +336,94 @@ class IncrementalIndexer:
         return stored_hash == current_hash
     
     # Async methods for improved performance
-    
+
     async def get_file_hash_async(self, file_path: str) -> Optional[str]:
         """
         Asynchronously calculate SHA-256 hash of a file's content.
-        
+
+        PERFORMANCE FIX: Uses aiofiles for truly asynchronous file I/O instead of
+        blocking the thread pool with run_in_executor.
+
         Args:
             file_path: Path to the file
-            
+
         Returns:
             SHA-256 hash as hex string, or None if file cannot be read
         """
-        loop = asyncio.get_event_loop()
+        if not AIOFILES_AVAILABLE:
+            # Fallback to thread pool if aiofiles is not available
+            loop = asyncio.get_event_loop()
+            try:
+                return await loop.run_in_executor(None, self.get_file_hash, file_path)
+            except Exception as e:
+                print(f"Error calculating hash async for {file_path}: {e}")
+                return None
+
         try:
-            # Run hash calculation in thread pool to avoid blocking
-            return await loop.run_in_executor(None, self.get_file_hash, file_path)
+            sha256_hash = hashlib.sha256()
+            # Use aiofiles for non-blocking async file reading
+            async with aiofiles.open(file_path, 'rb') as f:
+                # Read in 4MB chunks for memory efficiency
+                while chunk := await f.read(4 * 1024 * 1024):
+                    sha256_hash.update(chunk)
+            return sha256_hash.hexdigest()
         except Exception as e:
             print(f"Error calculating hash async for {file_path}: {e}")
             return None
     
-    async def get_file_metadata_async(self, file_path: str) -> Dict[str, Any]:
+    async def get_file_metadata_async(self, file_path: str, compute_hash: bool = True) -> Dict[str, Any]:
         """
         Asynchronously get current metadata for a file.
-        
+
+        PERFORMANCE FIX: Uses aiofiles.os for non-blocking async file stat operations
+        instead of blocking synchronous os.stat calls.
+
         Args:
             file_path: Path to the file
-            
+            compute_hash: Whether to compute file hash (default: True)
+
         Returns:
             Dictionary containing file metadata (timestamp, hash, size)
         """
+        if AIOFILES_AVAILABLE:
+            try:
+                # Use aiofiles.os for async stat operation
+                stat_result = await aios.stat(file_path)
+
+                metadata = {
+                    'mtime': stat_result.st_mtime,
+                    'size': stat_result.st_size,
+                    'last_checked': datetime.now().isoformat()
+                }
+
+                # Only compute hash if requested
+                if compute_hash:
+                    metadata['hash'] = await self.get_file_hash_async(file_path)
+                else:
+                    metadata['hash'] = None
+
+                return metadata
+            except Exception as e:
+                print(f"Error getting metadata async for {file_path}: {e}")
+                return {}
+
+        # Fallback to synchronous stat with async hash
         loop = asyncio.get_event_loop()
         try:
-            # Get basic file stats synchronously (fast operation)
-            stat_info = os.stat(file_path)
-            
-            # Calculate hash asynchronously
-            file_hash = await self.get_file_hash_async(file_path)
-            
-            return {
+            stat_info = await loop.run_in_executor(None, os.stat, file_path)
+
+            metadata = {
                 'mtime': stat_info.st_mtime,
                 'size': stat_info.st_size,
-                'hash': file_hash,
                 'last_checked': datetime.now().isoformat()
             }
+
+            if compute_hash:
+                metadata['hash'] = await self.get_file_hash_async(file_path)
+            else:
+                metadata['hash'] = None
+
+            return metadata
         except Exception as e:
             print(f"Error getting metadata async for {file_path}: {e}")
             return {}

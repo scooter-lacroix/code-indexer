@@ -214,7 +214,10 @@ class SearchStrategy(ABC):
     ) -> Dict[str, List[Tuple[int, str]]]:
         """
         Execute an async search using the specific strategy.
-        
+
+        CRITICAL FIX: Use asyncio.to_thread() for Python 3.9+ instead of deprecated
+        asyncio.get_event_loop().run_in_executor().
+
         Args:
             pattern: The search pattern (string or regex).
             base_path: The root directory to search in.
@@ -223,27 +226,29 @@ class SearchStrategy(ABC):
             file_pattern: Glob pattern to filter files (e.g., "*.py").
             fuzzy: Whether to enable fuzzy search.
             progress_callback: Optional callback for progress updates.
-            
+
         Returns:
             A dictionary mapping filenames to lists of (line_number, line_content) tuples.
         """
-        # Default implementation runs synchronous search in thread pool
-        loop = asyncio.get_event_loop()
-        
+        # CRITICAL FIX: Use asyncio.to_thread() for Python 3.9+ instead of deprecated
+        # asyncio.get_event_loop().run_in_executor(). This is the recommended way
+        # to run synchronous I/O-bound functions in async code starting with Python 3.9.
         def run_search():
             if progress_callback:
                 progress_callback(0.0)
-            
+
             result = self.search(
                 pattern, base_path, case_sensitive, context_lines, file_pattern, fuzzy
             )
-            
+
             if progress_callback:
                 progress_callback(1.0)
-            
+
             return result
-        
-        return await loop.run_in_executor(None, run_search)
+
+        # Use asyncio.to_thread() for cleaner async execution
+        # This is preferred over loop.run_in_executor() for Python 3.9+
+        return await asyncio.to_thread(run_search)
     
     async def search_multiple_async(
         self,

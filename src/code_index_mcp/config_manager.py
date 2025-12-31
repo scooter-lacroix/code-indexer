@@ -11,6 +11,21 @@ from typing import Dict, List, Optional, Any, Set
 from pathlib import Path
 import fnmatch
 
+from .constants import (
+    DEFAULT_MAX_FILE_SIZE,
+    TYPE_SPECIFIC_MAX_SIZE_DEFAULT,
+    TYPE_SPECIFIC_MAX_SIZE_SMALL,
+    NO_FILE_SIZE_LIMIT,
+    DEFAULT_MAX_FILES_PER_DIRECTORY,
+    DEFAULT_MAX_SUBDIRECTORIES_PER_DIRECTORY,
+    LARGE_MAX_FILES_PER_DIRECTORY,
+    LARGE_MAX_SUBDIRECTORIES_PER_DIRECTORY,
+    LARGE_FILE_MAX_SIZE,
+    CONFIG_SOFT_LIMIT_MB,
+    CONFIG_HARD_LIMIT_MB,
+    DEFAULT_MAX_WORKERS,
+)
+
 
 class ConfigManager:
     """Manages configuration for the Code Index MCP server."""
@@ -66,23 +81,23 @@ class ConfigManager:
         """Get default configuration when no config file is found."""
         return {
             "file_filtering": {
-                "max_file_size": 5242880,  # 5MB
+                "max_file_size": DEFAULT_MAX_FILE_SIZE,  # 5MB
                 "type_specific_limits": {
-                    ".py": 1048576,   # 1MB
-                    ".js": 1048576,   # 1MB
-                    ".ts": 1048576,   # 1MB
-                    ".jsx": 1048576,  # 1MB
-                    ".tsx": 1048576,  # 1MB
-                    ".java": 1048576, # 1MB
-                    ".json": 524288,  # 512KB
-                    ".yaml": 524288,  # 512KB
-                    ".yml": 524288,   # 512KB
-                    ".xml": 524288,   # 512KB
+                    ".py": TYPE_SPECIFIC_MAX_SIZE_DEFAULT,   # 1MB
+                    ".js": TYPE_SPECIFIC_MAX_SIZE_DEFAULT,   # 1MB
+                    ".ts": TYPE_SPECIFIC_MAX_SIZE_DEFAULT,   # 1MB
+                    ".jsx": TYPE_SPECIFIC_MAX_SIZE_DEFAULT,  # 1MB
+                    ".tsx": TYPE_SPECIFIC_MAX_SIZE_DEFAULT,  # 1MB
+                    ".java": TYPE_SPECIFIC_MAX_SIZE_DEFAULT, # 1MB
+                    ".json": TYPE_SPECIFIC_MAX_SIZE_SMALL,  # 512KB
+                    ".yaml": TYPE_SPECIFIC_MAX_SIZE_SMALL,  # 512KB
+                    ".yml": TYPE_SPECIFIC_MAX_SIZE_SMALL,   # 512KB
+                    ".xml": TYPE_SPECIFIC_MAX_SIZE_SMALL,   # 512KB
                 }
             },
             "directory_filtering": {
-                "max_files_per_directory": 1000,
-                "max_subdirectories_per_directory": 100,
+                "max_files_per_directory": DEFAULT_MAX_FILES_PER_DIRECTORY,
+                "max_subdirectories_per_directory": DEFAULT_MAX_SUBDIRECTORIES_PER_DIRECTORY,
                 "skip_large_directories": [
                     "**/node_modules/**",
                     "**/venv/**",
@@ -102,7 +117,7 @@ class ConfigManager:
             },
             "performance": {
                 "parallel_processing": False,
-                "max_workers": 4,
+                "max_workers": DEFAULT_MAX_WORKERS,
                 "cache_directory_scans": True,
                 "log_filtering_decisions": False
             },
@@ -126,29 +141,29 @@ class ConfigManager:
                 "elasticsearch_ca_certs": "",
                 "elasticsearch_client_cert": "",
                 "elasticsearch_client_key": "",
-                "sqlite_enable_fts": True # New setting for SQLite FTS
+                "sqlite_enable_fts": True
             }
         }
     
     def get_max_file_size(self, file_path: str) -> int:
         """Get maximum file size for a specific file."""
         file_filtering = self.config.get("file_filtering", {})
-        
+
         # Check explicit inclusions first
         if self._is_explicitly_included_file(file_path):
-            return float('inf')  # No size limit for explicitly included files
-        
+            return NO_FILE_SIZE_LIMIT  # No size limit for explicitly included files
+
         # Get file extension
         _, ext = os.path.splitext(file_path)
         ext = ext.lower()
-        
+
         # Check type-specific limits
         type_limits = file_filtering.get("type_specific_limits", {})
         if ext in type_limits:
             return type_limits[ext]
-        
+
         # Return default max size
-        return file_filtering.get("max_file_size", 5242880)
+        return file_filtering.get("max_file_size", DEFAULT_MAX_FILE_SIZE)
     
     def should_skip_file_by_size(self, file_path: str, file_size: int) -> bool:
         """Check if a file should be skipped based on its size."""
@@ -157,11 +172,11 @@ class ConfigManager:
     
     def get_max_files_per_directory(self) -> int:
         """Get maximum number of files per directory."""
-        return self.config.get("directory_filtering", {}).get("max_files_per_directory", 1000)
-    
+        return self.config.get("directory_filtering", {}).get("max_files_per_directory", DEFAULT_MAX_FILES_PER_DIRECTORY)
+
     def get_max_subdirectories_per_directory(self) -> int:
         """Get maximum number of subdirectories per directory."""
-        return self.config.get("directory_filtering", {}).get("max_subdirectories_per_directory", 100)
+        return self.config.get("directory_filtering", {}).get("max_subdirectories_per_directory", DEFAULT_MAX_SUBDIRECTORIES_PER_DIRECTORY)
     
     def should_skip_directory_by_count(self, directory_path: str, file_count: int, subdir_count: int) -> bool:
         """Check if a directory should be skipped based on file/subdirectory count."""
@@ -223,10 +238,10 @@ class ConfigManager:
     def is_parallel_processing_enabled(self) -> bool:
         """Check if parallel processing is enabled."""
         return self.config.get("performance", {}).get("parallel_processing", False)
-    
+
     def get_max_workers(self) -> int:
         """Get maximum number of workers for parallel processing."""
-        return self.config.get("performance", {}).get("max_workers", 4)
+        return self.config.get("performance", {}).get("max_workers", DEFAULT_MAX_WORKERS)
     
     def is_directory_scan_caching_enabled(self) -> bool:
         """Check if directory scan caching is enabled."""
@@ -238,7 +253,7 @@ class ConfigManager:
             "config_path": self.config_path,
             "has_config_file": self.config_path is not None,
             "file_filtering": {
-                "default_max_size": self.config.get("file_filtering", {}).get("max_file_size", 5242880),
+                "default_max_size": self.config.get("file_filtering", {}).get("max_file_size", DEFAULT_MAX_FILE_SIZE),
                 "type_specific_limits_count": len(self.config.get("file_filtering", {}).get("type_specific_limits", {})),
             },
             "directory_filtering": {
@@ -326,28 +341,28 @@ class ConfigManager:
         size_limits = self.get_config('size_limits')
         if size_limits is None:
             return {
-                'max_file_size': 1073741824,  # 1GB
+                'max_file_size': LARGE_FILE_MAX_SIZE,  # 1GB
                 'type_specific_limits': {}
             }
         return size_limits
-    
+
     def get_directory_thresholds(self) -> Dict[str, Any]:
         """Get directory thresholds from configuration."""
         thresholds = self.get_config('directory_thresholds')
         if thresholds is None:
             return {
-                'max_files_per_directory': 10000,
-                'max_subdirectories_per_directory': 1000
+                'max_files_per_directory': LARGE_MAX_FILES_PER_DIRECTORY,
+                'max_subdirectories_per_directory': LARGE_MAX_SUBDIRECTORIES_PER_DIRECTORY
             }
         return thresholds
-    
+
     def get_memory_caps(self) -> Dict[str, Any]:
         """Get memory caps from configuration."""
         memory_caps = self.get_config('memory_caps')
         if memory_caps is None:
             return {
-                'soft_limit_mb': 8192,  # 8GB
-                'hard_limit_mb': 16384  # 16GB
+                'soft_limit_mb': CONFIG_SOFT_LIMIT_MB,  # 8GB
+                'hard_limit_mb': CONFIG_HARD_LIMIT_MB  # 16GB
             }
         return memory_caps
     

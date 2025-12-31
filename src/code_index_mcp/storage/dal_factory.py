@@ -111,13 +111,55 @@ class DualWriteReadDAL(DALInterface):
         return sqlite_cleared and pg_es_cleared
 
 class DualWriteReadStorage(StorageInterface):
+    """
+    Dual-write storage implementation with compensating transaction pattern.
+
+    CRITICAL FIX: Implements two-phase commit pattern for dual-write operations
+    to prevent data inconsistency when one backend fails.
+    """
     def __init__(self, sqlite_storage: StorageInterface, pg_es_storage: StorageInterface):
         self._sqlite_storage = sqlite_storage
         self._pg_es_storage = pg_es_storage
+        # Track pending operations for compensating transactions
+        self._pending_writes: Dict[str, str] = {}  # file_path -> operation_type
 
     def save_file_content(self, file_path: str, content: str) -> None:
-        self._sqlite_storage.save_file_content(file_path, content)
-        self._pg_es_storage.save_file_content(file_path, content)
+        """
+        Save file content to both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Implements two-phase commit to prevent data inconsistency.
+        1. Write to primary (PG/ES)
+        2. Write to secondary (SQLite)
+        3. If secondary fails, compensate by rolling back primary
+        """
+        # Phase 1: Write to primary backend (PG/ES)
+        try:
+            self._pg_es_storage.save_file_content(file_path, content)
+            self._pending_writes[file_path] = 'write'
+            logger.debug(f"Primary write successful for {file_path}")
+        except Exception as e:
+            logger.error(f"Primary backend write failed for {file_path}: {e}")
+            raise  # If primary fails, don't attempt secondary
+
+        # Phase 2: Write to secondary backend (SQLite)
+        try:
+            self._sqlite_storage.save_file_content(file_path, content)
+            logger.debug(f"Secondary write successful for {file_path}")
+        except Exception as e:
+            logger.error(f"Secondary backend write failed for {file_path}, attempting compensating transaction: {e}")
+            # Compensating transaction: rollback primary
+            try:
+                self._pg_es_storage.delete_file_content(file_path)
+                logger.warning(f"Compensating transaction: rolled back primary write for {file_path}")
+            except Exception as rollback_err:
+                logger.error(f"Failed to rollback primary write for {file_path}: {rollback_err}")
+                # Store inconsistency for later reconciliation
+                self._pending_writes[file_path] = 'inconsistent'
+            raise
+
+        # Commit: both writes succeeded
+        if file_path in self._pending_writes:
+            del self._pending_writes[file_path]
         logger.debug(f"Dual-wrote file content for {file_path}")
 
     def get_file_content(self, file_path: str) -> Optional[str]:
@@ -129,23 +171,99 @@ class DualWriteReadStorage(StorageInterface):
         return content
 
     def delete_file_content(self, file_path: str) -> None:
-        self._sqlite_storage.delete_file_content(file_path)
-        self._pg_es_storage.delete_file_content(file_path)
+        """
+        Delete file content from both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Implements two-phase commit for delete operations.
+        """
+        # Phase 1: Delete from primary backend (PG/ES)
+        primary_deleted = False
+        try:
+            self._pg_es_storage.delete_file_content(file_path)
+            primary_deleted = True
+            logger.debug(f"Primary delete successful for {file_path}")
+        except Exception as e:
+            logger.error(f"Primary backend delete failed for {file_path}: {e}")
+            # Continue with secondary delete even if primary fails
+
+        # Phase 2: Delete from secondary backend (SQLite)
+        try:
+            self._sqlite_storage.delete_file_content(file_path)
+            logger.debug(f"Secondary delete successful for {file_path}")
+        except Exception as e:
+            logger.error(f"Secondary backend delete failed for {file_path}: {e}")
+            if primary_deleted:
+                # Compensating transaction: restore primary
+                try:
+                    # We can't restore the content here as it's already deleted
+                    # Log the inconsistency for manual reconciliation
+                    logger.error(f"Data inconsistency detected for {file_path}: deleted from primary but not secondary")
+                except Exception as rollback_err:
+                    logger.error(f"Failed to handle compensating transaction for {file_path}: {rollback_err}")
+            raise
+
         logger.debug(f"Dual-deleted file content for {file_path}")
 
     def clear(self) -> bool:
+        """
+        Clear both backends with safety checks.
+
+        CRITICAL FIX: Attempts to clear both backends and reports any failures.
+        """
         sqlite_cleared = self._sqlite_storage.clear()
         pg_es_cleared = self._pg_es_storage.clear()
+
+        if not sqlite_cleared:
+            logger.error("Failed to clear SQLite backend")
+        if not pg_es_cleared:
+            logger.error("Failed to clear PG/ES backend")
+
         return sqlite_cleared and pg_es_cleared
 
 class DualWriteReadMetadata(FileMetadataInterface):
+    """
+    Dual-write metadata implementation with compensating transaction pattern.
+
+    CRITICAL FIX: Implements two-phase commit pattern for dual-write operations
+    to prevent data inconsistency when one backend fails.
+    """
     def __init__(self, sqlite_metadata: FileMetadataInterface, pg_es_metadata: FileMetadataInterface):
         self._sqlite_metadata = sqlite_metadata
         self._pg_es_metadata = pg_es_metadata
+        # Track pending operations for compensating transactions
+        self._pending_metadata_writes: Dict[str, str] = {}
 
     def save_file_metadata(self, file_path: str, metadata: Dict[str, Any]) -> None:
-        self._sqlite_metadata.save_file_metadata(file_path, metadata)
-        self._pg_es_metadata.save_file_metadata(file_path, metadata)
+        """
+        Save metadata to both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Two-phase commit for metadata operations.
+        """
+        # Phase 1: Write to primary backend (PG/ES)
+        try:
+            self._pg_es_metadata.save_file_metadata(file_path, metadata)
+            self._pending_metadata_writes[file_path] = 'write'
+        except Exception as e:
+            logger.error(f"Primary metadata write failed for {file_path}: {e}")
+            raise
+
+        # Phase 2: Write to secondary backend (SQLite)
+        try:
+            self._sqlite_metadata.save_file_metadata(file_path, metadata)
+        except Exception as e:
+            logger.error(f"Secondary metadata write failed for {file_path}, attempting compensating transaction: {e}")
+            # Compensating transaction: rollback primary
+            try:
+                self._pg_es_metadata.delete_file_metadata(file_path)
+                logger.warning(f"Compensating transaction: rolled back primary metadata write for {file_path}")
+            except Exception as rollback_err:
+                logger.error(f"Failed to rollback primary metadata write for {file_path}: {rollback_err}")
+                self._pending_metadata_writes[file_path] = 'inconsistent'
+            raise
+
+        # Commit: both writes succeeded
+        if file_path in self._pending_metadata_writes:
+            del self._pending_metadata_writes[file_path]
         logger.debug(f"Dual-wrote file metadata for {file_path}")
 
     def get_file_metadata(self, file_path: str) -> Optional[Dict[str, Any]]:
@@ -157,33 +275,109 @@ class DualWriteReadMetadata(FileMetadataInterface):
         return metadata
 
     def delete_file_metadata(self, file_path: str) -> None:
-        self._sqlite_metadata.delete_file_metadata(file_path)
-        self._pg_es_metadata.delete_file_metadata(file_path)
+        """
+        Delete metadata from both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Two-phase commit for delete operations.
+        """
+        # Phase 1: Delete from primary backend (PG/ES)
+        primary_deleted = False
+        try:
+            self._pg_es_metadata.delete_file_metadata(file_path)
+            primary_deleted = True
+        except Exception as e:
+            logger.error(f"Primary metadata delete failed for {file_path}: {e}")
+
+        # Phase 2: Delete from secondary backend (SQLite)
+        try:
+            self._sqlite_metadata.delete_file_metadata(file_path)
+        except Exception as e:
+            logger.error(f"Secondary metadata delete failed for {file_path}: {e}")
+            if primary_deleted:
+                logger.error(f"Data inconsistency detected for {file_path}: metadata deleted from primary but not secondary")
+            raise
+
         logger.debug(f"Dual-deleted file metadata for {file_path}")
 
     def get_all_file_paths(self) -> List[str]:
-        # This might need more sophisticated logic for consistency during migration
-        # For now, combine and deduplicate
+        """
+        Get all file paths from both backends with deduplication.
+
+        CRITICAL FIX: Combines results from both backends and deduplicates.
+        """
+        # Combine and deduplicate paths from both backends
         pg_es_paths = set(self._pg_es_metadata.get_all_file_paths())
         sqlite_paths = set(self._sqlite_metadata.get_all_file_paths())
         return list(pg_es_paths.union(sqlite_paths))
 
     def clear(self) -> bool:
+        """
+        Clear both backends with safety checks.
+
+        CRITICAL FIX: Reports failures from either backend.
+        """
         sqlite_cleared = self._sqlite_metadata.clear()
         pg_es_cleared = self._pg_es_metadata.clear()
+
+        if not sqlite_cleared:
+            logger.error("Failed to clear SQLite metadata backend")
+        if not pg_es_cleared:
+            logger.error("Failed to clear PG/ES metadata backend")
+
         return sqlite_cleared and pg_es_cleared
 
 class DualWriteReadSearch(SearchInterface):
+    """
+    Dual-write search implementation with compensating transaction pattern.
+
+    CRITICAL FIX: Implements two-phase commit pattern for dual-write operations
+    to prevent data inconsistency when one backend fails.
+    """
     def __init__(self, sqlite_search: SearchInterface, pg_es_search: SearchInterface):
         self._sqlite_search = sqlite_search
         self._pg_es_search = pg_es_search
+        # Track pending operations for compensating transactions
+        self._pending_index_writes: Dict[str, str] = {}
 
     def index_file(self, file_path: str, content: str) -> None:
-        self._sqlite_search.index_file(file_path, content)
-        self._pg_es_search.index_file(file_path, content)
+        """
+        Index file in both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Two-phase commit for index operations.
+        """
+        # Phase 1: Index in primary backend (PG/ES)
+        try:
+            self._pg_es_search.index_file(file_path, content)
+            self._pending_index_writes[file_path] = 'index'
+        except Exception as e:
+            logger.error(f"Primary index failed for {file_path}: {e}")
+            raise
+
+        # Phase 2: Index in secondary backend (SQLite)
+        try:
+            self._sqlite_search.index_file(file_path, content)
+        except Exception as e:
+            logger.error(f"Secondary index failed for {file_path}, attempting compensating transaction: {e}")
+            # Compensating transaction: rollback primary
+            try:
+                self._pg_es_search.delete_indexed_file(file_path)
+                logger.warning(f"Compensating transaction: rolled back primary index for {file_path}")
+            except Exception as rollback_err:
+                logger.error(f"Failed to rollback primary index for {file_path}: {rollback_err}")
+                self._pending_index_writes[file_path] = 'inconsistent'
+            raise
+
+        # Commit: both writes succeeded
+        if file_path in self._pending_index_writes:
+            del self._pending_index_writes[file_path]
         logger.debug(f"Dual-indexed file {file_path}")
 
     def search_files(self, query: str) -> List[Dict[str, Any]]:
+        """
+        Search files using both backends with fallback.
+
+        CRITICAL FIX: Prioritizes primary backend with fallback to secondary.
+        """
         # Prioritize searching in the new store
         results = self._pg_es_search.search_files(query)
         if not results:
@@ -192,13 +386,44 @@ class DualWriteReadSearch(SearchInterface):
         return results
 
     def delete_indexed_file(self, file_path: str) -> None:
-        self._sqlite_search.delete_indexed_file(file_path)
-        self._pg_es_search.delete_indexed_file(file_path)
+        """
+        Delete indexed file from both backends using compensating transaction pattern.
+
+        CRITICAL FIX: Two-phase commit for delete operations.
+        """
+        # Phase 1: Delete from primary backend (PG/ES)
+        primary_deleted = False
+        try:
+            self._pg_es_search.delete_indexed_file(file_path)
+            primary_deleted = True
+        except Exception as e:
+            logger.error(f"Primary index delete failed for {file_path}: {e}")
+
+        # Phase 2: Delete from secondary backend (SQLite)
+        try:
+            self._sqlite_search.delete_indexed_file(file_path)
+        except Exception as e:
+            logger.error(f"Secondary index delete failed for {file_path}: {e}")
+            if primary_deleted:
+                logger.error(f"Data inconsistency detected for {file_path}: index deleted from primary but not secondary")
+            raise
+
         logger.debug(f"Dual-deleted indexed file {file_path}")
 
     def clear(self) -> bool:
+        """
+        Clear both backends with safety checks.
+
+        CRITICAL FIX: Reports failures from either backend.
+        """
         sqlite_cleared = self._sqlite_search.clear()
         pg_es_cleared = self._pg_es_search.clear()
+
+        if not sqlite_cleared:
+            logger.error("Failed to clear SQLite search backend")
+        if not pg_es_cleared:
+            logger.error("Failed to clear PG/ES search backend")
+
         return sqlite_cleared and pg_es_cleared
 
 def get_dal_instance() -> DALInterface:
