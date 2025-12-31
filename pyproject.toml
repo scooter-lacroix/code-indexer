@@ -28,7 +28,6 @@ dependencies = [
     "sqlalchemy>=2.0.0",
     "lxml>=6.0.0",
     "cffi>=1.17.0",
-    "charset-normalizer>=3.4.0",
     "cryptography>=45.0.0",
     "pycparser>=2.22",
     "six>=1.17.0",
@@ -55,6 +54,8 @@ no-build-isolation = false
 index-url = "https://pypi.org/simple/"
 # CPU-only PyTorch index for torch packages
 extra-index-url = ["https://download.pytorch.org/whl/cpu"]
+# Allow uv to pick best version from any index (needed when same package exists in multiple indexes)
+index-strategy = "unsafe-best-match"
 
 # Explicitly block ALL GPU/CUDA packages using constraint-dependencies
 constraint-dependencies = [
