@@ -9,6 +9,7 @@ import logging
 import re
 import time
 import hashlib
+from datetime import datetime
 from typing import Any, Dict, Optional, List, Tuple
 from abc import ABC, abstractmethod
 from functools import lru_cache
@@ -696,3 +697,78 @@ class ElasticsearchSearch(SearchInterface):
             logger.info("ElasticsearchSearch client connection implicitly closed or managed by client.")
         else:
             logger.info("ElasticsearchSearch client was not initialized.")
+
+    def index_file(self, file_path: str, content: str) -> None:
+        """Index a file for search.
+
+        Args:
+            file_path: Path of the file to index
+            content: Content of the file to index
+
+        Raises:
+            IOError: If the file cannot be indexed
+        """
+        doc = {
+            "file_path": file_path,
+            "content": content,
+            "timestamp": datetime.now().isoformat()
+        }
+        self.index_document(file_path, doc)
+
+    def delete_indexed_file(self, file_path: str) -> None:
+        """Delete a file from the search index.
+
+        Args:
+            file_path: Path of the file to delete from index
+        """
+        if not self._connected or not self.es:
+            logger.warning("Elasticsearch not connected, skipping delete")
+            return
+
+        try:
+            self.es.delete(index=self.index_name, id=file_path)
+            logger.debug(f"Deleted file from Elasticsearch index: {file_path}")
+        except Exception as e:
+            logger.warning(f"Failed to delete file from Elasticsearch: {e}")
+
+    def search_files(self, query: str) -> List[Dict[str, Any]]:
+        """Search for files matching the query.
+
+        Args:
+            query: The search query string
+
+        Returns:
+            A list of dictionaries containing file search results
+        """
+        results = self.search_content(query)
+        return [
+            {
+                "file_path": file_path,
+                "score": score,
+                "content": content
+            }
+            for file_path, (content, score) in results
+        ]
+
+    def clear(self) -> bool:
+        """Clear the search index.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self._connected or not self.es:
+            logger.warning("Elasticsearch not connected, cannot clear")
+            return False
+
+        try:
+            self.es.delete_by_query(
+                index=self.index_name,
+                body={"query": {"match_all": {}}},
+                refresh=True
+            )
+            self.clear_cache()
+            logger.info(f"Cleared Elasticsearch index: {self.index_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to clear Elasticsearch index: {e}")
+            return False

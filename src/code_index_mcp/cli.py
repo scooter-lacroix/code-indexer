@@ -50,7 +50,15 @@ async def search_command(args, engine: CoreEngine):
             if item.generated_metadata and "line_number" in item.generated_metadata:
                 line_info = f":{item.generated_metadata['line_number']}"
 
-            print(f"{path}{line_info} (Score: {item.score:.2f})")
+            # Handle score - convert to float if it's a string
+            score = item.score
+            if isinstance(score, str):
+                try:
+                    score = float(score)
+                except (ValueError, TypeError):
+                    score = 0.0
+
+            print(f"{path}{line_info} (Score: {score:.2f})")
             if args.content and item.text:
                 print(f"  {item.text.strip()}")
             print()
