@@ -613,7 +613,9 @@ class LocalVectorBackend:
                         f"but current configuration uses '{self.model_name}'. "
                         f"Search results may be degraded. Reindex recommended."
                     )
-                elif self._index_metadata.dimension != self.dimension:
+
+                # Check dimension mismatch (always check, regardless of model name)
+                if self._index_metadata.dimension != self.dimension:
                     logger.warning(
                         f"DIMENSION MISMATCH: Index has {self._index_metadata.dimension}D "
                         f"but model expects {self.dimension}D. "
