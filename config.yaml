@@ -22,7 +22,7 @@ dal_settings:
   # Backend type for PostgreSQL/Elasticsearch-only phase (post-migration)
   # Options: "sqlite_only", "dual_write_read", "postgresql_elasticsearch_only"
   backend_type: "postgresql_elasticsearch_only"
-  
+
   # PostgreSQL connection details for the 'postgresql_elasticsearch' backend
   # These should ideally be sourced from a secure secrets management system.
   postgresql_user: "${POSTGRES_USER:-user}"
@@ -51,6 +51,33 @@ dal_settings:
   elasticsearch_ca_certs: "${ELASTICSEARCH_CA_CERTS:-}" # Path to CA certificate bundle
   elasticsearch_client_cert: "${ELASTICSEARCH_CLIENT_CERT:-}" # Path to client certificate
   elasticsearch_client_key: "${ELASTICSEARCH_CLIENT_KEY:-}" # Path to client key
+
+# RabbitMQ Configuration for Asynchronous Indexing
+rabbitmq_settings:
+  # RabbitMQ connection details
+  # These should ideally be sourced from a secure secrets management system.
+  rabbitmq_host: "${RABBITMQ_HOST:-localhost}"
+  rabbitmq_port: "${RABBITMQ_PORT:-5672}"
+  rabbitmq_username: "${RABBITMQ_USERNAME:-guest}"
+  rabbitmq_password: "${RABBITMQ_PASSWORD:-guest}"
+
+  # Queue and exchange configuration
+  rabbitmq_queue_name: "${RABBITMQ_QUEUE_NAME:-indexing_queue}"
+  rabbitmq_exchange_name: "${RABBITMQ_EXCHANGE_NAME:-indexing_exchange}"
+  rabbitmq_routing_key: "${RABBITMQ_ROUTING_KEY:-file_changes}"
+  rabbitmq_exchange_type: "${RABBITMQ_EXCHANGE_TYPE:-topic}"
+  rabbitmq_durable: "${RABBITMQ_DURABLE:-true}"
+
+  # Batch indexing configuration for improved throughput
+  rabbitmq_batching_enabled: "${RABBITMQ_BATCHING_ENABLED:-true}"
+  rabbitmq_batch_size: "${RABBITMQ_BATCH_SIZE:-50}"  # Number of operations to batch before flushing
+  rabbitmq_batch_timeout: "${RABBITMQ_BATCH_TIMEOUT:-5.0}"  # Seconds to wait before auto-flushing batch
+  rabbitmq_max_batch_size: "${RABBITMQ_MAX_BATCH_SIZE:-500}"  # Maximum batch size
+
+  # Backpressure control settings
+  rabbitmq_backpressure_enabled: "${RABBITMQ_BACKPRESSURE_ENABLED:-true}"
+  rabbitmq_queue_threshold: "${RABBITMQ_QUEUE_THRESHOLD:-1000}"  # Queue depth threshold for backpressure
+  rabbitmq_latency_threshold_ms: "${RABBITMQ_LATENCY_THRESHOLD_MS:-5000}"  # Latency threshold for backpressure
 
 # Existing content
 
