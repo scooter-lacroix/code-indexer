@@ -51,9 +51,10 @@ dependencies = [
 # This system is CPU/AMD-only and must NOT install NVIDIA packages
 [tool.uv]
 no-build-isolation = false
-# Use CPU-only PyTorch index as PRIMARY source
-# DO NOT add PyPI as extra-index-url - it provides GPU packages
-index-url = "https://download.pytorch.org/whl/cpu"
+# PyPI as primary source
+index-url = "https://pypi.org/simple/"
+# CPU-only PyTorch index for torch packages
+extra-index-url = ["https://download.pytorch.org/whl/cpu"]
 
 # Explicitly block ALL GPU/CUDA packages using constraint-dependencies
 constraint-dependencies = [
