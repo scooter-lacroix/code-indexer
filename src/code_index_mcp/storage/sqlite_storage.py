@@ -618,6 +618,86 @@ class SQLiteFileMetadata(FileMetadataInterface):
         # SQLite connections are managed per-operation, so no persistent connection to close
         pass
 
+    def save_file_metadata(self, file_path: str, metadata: Dict[str, Any]) -> None:
+        """Save file metadata to storage.
+
+        Args:
+            file_path: The path of the file
+            metadata: The metadata dictionary to save
+
+        Raises:
+            IOError: If the metadata cannot be written
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                metadata_json = json.dumps(metadata)
+                conn.execute('''
+                    UPDATE files SET metadata = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE file_path = ?
+                ''', (metadata_json, file_path))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error saving metadata for {file_path}: {e}")
+            raise IOError(f"Failed to save metadata for {file_path}: {e}")
+
+    def get_file_metadata(self, file_path: str) -> Optional[Dict[str, Any]]:
+        """Retrieve file metadata from storage.
+
+        Args:
+            file_path: The path of the file
+
+        Returns:
+            The metadata dictionary if found, None otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('''
+                    SELECT metadata FROM files WHERE file_path = ?
+                ''', (file_path,))
+                row = cursor.fetchone()
+                if row and row[0]:
+                    return json.loads(row[0])
+                return None
+        except Exception as e:
+            logger.error(f"Error getting metadata for {file_path}: {e}")
+            return None
+
+    def delete_file_metadata(self, file_path: str) -> None:
+        """Delete file metadata from storage.
+
+        Args:
+            file_path: The path of the file
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute('DELETE FROM files WHERE file_path = ?', (file_path,))
+                conn.commit()
+        except Exception as e:
+            logger.error(f"Error deleting metadata for {file_path}: {e}")
+
+    def get_all_file_paths(self) -> List[str]:
+        """Get all file paths in the storage.
+
+        Returns:
+            List of all file paths
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('SELECT file_path FROM files ORDER BY file_path')
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logger.error(f"Error getting all file paths: {e}")
+            return []
+
+    def flush(self) -> bool:
+        """Flush any pending operations.
+
+        Returns:
+            True if successful, False otherwise
+        """
+        # SQLite operations are auto-committed, so this is a no-op
+        return True
+
 
 class SQLiteSearch(SearchInterface):
     """SQLite-based search capabilities."""
