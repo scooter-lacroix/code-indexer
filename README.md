@@ -161,14 +161,22 @@ uv pip install 'faiss-cpu>=1.7.4' 'sentence-transformers>=2.2.0' 'numpy>=1.24.0'
 
 ### 🏗️ **Comprehensive Setup (PostgreSQL + Elasticsearch)**
 
-**1. Database Setup:**
+**1. Start Required Services:**
 ```bash
-# Using Docker Compose (recommended)
-docker-compose up -d
+# Using Podman Compose (recommended for AMD/CPU-only systems)
+podman compose up -d
 
-# Or use convenience script
-python run.py start-dev-dbs
+# Or using Docker Compose (alternative)
+docker compose up -d
+
+# Stop any local Elasticsearch before starting containers
+sudo systemctl stop elasticsearch 2>/dev/null || true
 ```
+
+This will start:
+- PostgreSQL on port 5432
+- Elasticsearch on port 9200
+- RabbitMQ on ports 5672 (AMQP) and 15672 (Management UI)
 
 **2. Environment Configuration:**
 ```bash
