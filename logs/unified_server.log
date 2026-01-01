@@ -320,3 +320,9 @@
 2025-12-31 04:17:18,927 - unified_server - WARNING - Health check: unhealthy
 2025-12-31 04:18:11,315 - unified_server - DEBUG - Performance: system.monitor took 0.00ms
 2025-12-31 04:18:20,029 - unified_server - WARNING - Health check: unhealthy
+2025-12-31 12:21:41,438 - unified_server - INFO - Health monitor initialized
+2025-12-31 12:21:42,059 - unified_server - INFO - Initialized UnifiedSandboxServer with config
+2025-12-31 12:21:42,439 - unified_server - DEBUG - Performance: system.monitor took 0.00ms
+2025-12-31 12:21:42,542 - unified_server - WARNING - Health check: warning
+2025-12-31 12:21:54,434 - unified_server - INFO - Health monitor initialized
+2025-12-31 12:21:55,039 - unified_server - INFO - Initialized UnifiedSandboxServer with config
