@@ -221,7 +221,7 @@
 - [ ] Verify no linting errors
 - [ ] Create checkpoint commit
 
-## Phase 6: Automatic Backup System
+## Phase 6: Automatic Backup System [checkpoint: 4be1598]
 
 ### Task: 6.1 Create RegistryBackupManager Class
 - [ ] Subtask: Create `src/code_index_mcp/registry/backup_manager.py`
