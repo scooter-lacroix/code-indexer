@@ -126,7 +126,7 @@
 - [ ] Verify no linting errors
 - [ ] Create checkpoint commit
 
-## Phase 4: Auto-Registration Integration
+## Phase 4: Auto-Registration Integration [checkpoint: 1c5f9c3]
 
 ### Task: 4.1 Integrate Registration with manage_project
 - [ ] Subtask: Modify `manage_project` to call registration after MessagePack index save
