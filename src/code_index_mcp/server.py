@@ -108,6 +108,7 @@ from .stats_dashboard import IndexStatisticsCollector, DashboardStats
 # META-REGISTRY: Startup Migration
 # ============================================================================
 from .registry.startup_migration import check_and_migrate_on_startup
+from .registry.backup_scheduler import get_backup_scheduler, setup_signal_handlers
 
 # NOTE: FastMCP instance is created below after indexer_lifespan is defined (line ~528)
 # This ensures the lifespan manager is properly attached during initialization.
@@ -458,6 +459,43 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
         logger.error(f"Error during startup migration: {e}. Continuing with startup...")
 
     # ============================================================================
+    # PHASE 6: Automatic Backup System
+    # ============================================================================
+    # Initialize backup scheduler and perform startup backup check
+    # This ensures the registry is backed up if >24h since last backup
+    logger.info("Initializing automatic backup system...")
+    try:
+        from .registry.project_registry import ProjectRegistry
+        from .registry.directories import get_registry_db_path
+
+        # Initialize project registry for backup operations
+        registry_db_path = get_registry_db_path()
+        project_registry = ProjectRegistry(db_path=registry_db_path)
+
+        # Get or create backup scheduler
+        backup_scheduler = get_backup_scheduler()
+
+        # Perform startup backup check (non-blocking async)
+        backup_created, backup_msg = await backup_scheduler.startup_backup_check(
+            project_registry
+        )
+        if backup_created:
+            logger.info(f"Startup backup created: {backup_msg}")
+        else:
+            logger.debug(f"Startup backup check: {backup_msg}")
+
+        # Setup signal handlers for graceful shutdown
+        setup_signal_handlers(backup_scheduler)
+
+        logger.info("Automatic backup system initialized")
+
+    except Exception as e:
+        # Log error but don't fail startup - backup system can retry later
+        logger.error(f"Error initializing backup system: {e}. Continuing with startup...")
+        backup_scheduler = None
+        project_registry = None
+
+    # ============================================================================
     # PHASE 7: Initialize API Key Manager and Result Ranker
     # ============================================================================
     # The API key manager must be initialized before CoreEngine so that
@@ -579,9 +617,24 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     )
 
     try:
+        # Start periodic backup task
+        if backup_scheduler and project_registry:
+            backup_scheduler.start_periodic_backup(project_registry)
+
         logger.info("Server ready. Waiting for user to set project path...")
         yield context
     finally:
+        # ========================================================================
+        # PHASE 6: Stop periodic backup task
+        # ========================================================================
+        if backup_scheduler:
+            logger.info("Stopping periodic backup task...")
+            try:
+                await backup_scheduler.stop_periodic_backup()
+                logger.info("Periodic backup task stopped")
+            except Exception as e:
+                logger.error(f"Error stopping periodic backup task: {e}")
+
         # CRITICAL: Explicit flush before shutdown to ensure all data is persisted
         logger.info("Flushing storage backends before shutdown...")
 
@@ -1638,10 +1691,10 @@ async def registry_cleanup(
                 "message": "No invalid projects found to remove"
             }
 
-        # Create backup before cleanup
+        # Create backup before cleanup (non-blocking)
         backup_manager = RegistryBackupManager()
         registry = ProjectRegistry()
-        backup_metadata = backup_manager.create_backup(registry=registry)
+        backup_metadata = await backup_manager.create_backup_async(registry=registry)
 
         # Remove invalid projects
         removed_projects = []

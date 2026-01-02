@@ -3,18 +3,25 @@ Registry Backup for the meta-registry system.
 
 This module provides backup and restore functionality for the project registry,
 ensuring data safety during cleanup operations and providing rollback capability.
+
+Phase 6 Enhancements:
+- Filesystem scan recovery for corrupted registry
+- Automatic backup rotation (keep 7 days)
+- Integration with registry_metadata for tracking last_backup_time
+- Startup recovery logic
 """
 
 import shutil
 import sqlite3
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import logging
+import msgpack
 
 from .directories import get_global_registry_dir
-from .project_registry import ProjectRegistry
+from .project_registry import ProjectRegistry, ProjectInfo
 
 logger = logging.getLogger(__name__)
 
@@ -72,25 +79,34 @@ class RegistryBackupManager:
     - Backup creation with timestamp
     - Backup restoration
     - Backup verification
-    - Automatic cleanup of old backups
+    - Automatic cleanup of old backups (keep 7 days)
     - Checksum computation for integrity verification
+    - Filesystem scan recovery for corrupted registry
+    - Startup recovery logic
 
     Attributes:
         backup_dir: Directory where backups are stored
-        max_backups: Maximum number of backups to keep (default: 10)
+        max_backups: Maximum number of backups to keep (default: 7)
+        backup_interval_hours: Hours between automatic backups (default: 24)
     """
+
+    # Metadata key for tracking last backup time
+    METADATA_LAST_BACKUP = "last_backup_time"
+    METADATA_LAST_BACKUP_CHECK = "last_backup_check"
 
     def __init__(
         self,
         backup_dir: Optional[str | Path] = None,
-        max_backups: int = 10
+        max_backups: int = 7,
+        backup_interval_hours: int = 24
     ):
         """
         Initialize the backup manager.
 
         Args:
             backup_dir: Directory for storing backups. If None, uses default.
-            max_backups: Maximum number of backups to retain
+            max_backups: Maximum number of backups to retain (default: 7 days)
+            backup_interval_hours: Hours between automatic backups (default: 24)
         """
         if backup_dir is None:
             registry_dir = get_global_registry_dir()
@@ -99,13 +115,14 @@ class RegistryBackupManager:
             self.backup_dir = Path(backup_dir)
 
         self.max_backups = max_backups
+        self.backup_interval_hours = backup_interval_hours
 
         # Ensure backup directory exists
         self.backup_dir.mkdir(parents=True, exist_ok=True)
 
         logger.info(
             f"RegistryBackupManager initialized (backup_dir={self.backup_dir}, "
-            f"max_backups={max_backups})"
+            f"max_backups={max_backups}, backup_interval_hours={backup_interval_hours})"
         )
 
     def create_backup(
@@ -182,7 +199,11 @@ class RegistryBackupManager:
                 f"({project_count} projects, {backup_size} bytes)"
             )
 
-            # Clean up old backups
+            # Update last backup time in registry metadata
+            if registry is not None:
+                self._update_last_backup_time(registry)
+
+            # Clean up old backups (rotation)
             self._cleanup_old_backups()
 
             return metadata
@@ -467,3 +488,325 @@ class RegistryBackupManager:
         # We can't reliably determine this from just the backup file
         # Return None to indicate caller should specify the path
         return None
+
+    # ------------------------------------------------------------------------
+    # Phase 6: Backup Time Tracking and Periodic Backup
+    # ------------------------------------------------------------------------
+
+    def get_last_backup_time(self, registry: ProjectRegistry) -> Optional[datetime]:
+        """
+        Get the last backup time from registry metadata.
+
+        Args:
+            registry: ProjectRegistry instance
+
+        Returns:
+            Last backup datetime, or None if never backed up
+        """
+        backup_time_str = registry.get_metadata(self.METADATA_LAST_BACKUP)
+        if backup_time_str:
+            try:
+                # Handle if it's a Row object (from sqlite3)
+                # Check if it's a sqlite3.Row by checking for 'keys' method
+                if hasattr(backup_time_str, 'keys'):
+                    backup_time_str = backup_time_str[0]
+                return datetime.fromisoformat(str(backup_time_str))
+            except (ValueError, TypeError) as e:
+                logger.warning(f"Invalid backup time format: {backup_time_str}, error: {e}")
+        return None
+
+    def should_create_backup(self, registry: ProjectRegistry) -> bool:
+        """
+        Check if a backup should be created based on time since last backup.
+
+        Args:
+            registry: ProjectRegistry instance
+
+        Returns:
+            True if backup should be created (more than backup_interval_hours since last)
+        """
+        last_backup = self.get_last_backup_time(registry)
+        if last_backup is None:
+            return True  # Never backed up
+
+        time_since_backup = datetime.now() - last_backup
+        return time_since_backup >= timedelta(hours=self.backup_interval_hours)
+
+    def _update_last_backup_time(self, registry: ProjectRegistry) -> None:
+        """
+        Update the last backup time in registry metadata.
+
+        Args:
+            registry: ProjectRegistry instance
+        """
+        now = datetime.now().isoformat()
+        registry.set_metadata(self.METADATA_LAST_BACKUP, now)
+        logger.debug(f"Updated last backup time: {now}")
+
+    def update_last_backup_check(self, registry: ProjectRegistry) -> None:
+        """
+        Update the last backup check time in registry metadata.
+
+        Args:
+            registry: ProjectRegistry instance
+        """
+        now = datetime.now().isoformat()
+        registry.set_metadata(self.METADATA_LAST_BACKUP_CHECK, now)
+        logger.debug(f"Updated last backup check time: {now}")
+
+    # ------------------------------------------------------------------------
+    # Phase 6: Startup Recovery and Corruption Handling
+    # ------------------------------------------------------------------------
+
+    def recover_registry(
+        self,
+        registry_path: Path,
+        registry: Optional[ProjectRegistry] = None
+    ) -> Tuple[bool, str]:
+        """
+        Attempt to recover a corrupted registry.
+
+        Recovery strategy:
+        1. Try loading the main registry.db
+        2. If corrupted, try the most recent backup
+        3. If backup also corrupted/missing, perform filesystem scan recovery
+
+        Args:
+            registry_path: Path to the registry database
+            registry: Optional ProjectRegistry instance (for metadata updates)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        logger.info(f"Attempting registry recovery: {registry_path}")
+
+        # Step 1: Check if main registry is valid
+        if self._is_registry_valid(registry_path):
+            logger.info("Main registry is valid, no recovery needed")
+            return True, "Registry is valid"
+
+        # Step 2: Try to restore from most recent backup
+        backups = self.list_backups()
+        if backups:
+            most_recent = backups[0]
+            logger.info(f"Attempting recovery from backup: {most_recent.backup_path}")
+
+            if self.verify_backup(most_recent.backup_path):
+                try:
+                    # Verify backup is good before restoring
+                    if self.restore_backup(
+                        backup_path=most_recent.backup_path,
+                        registry_path=registry_path,
+                        verify_before_restore=True
+                    ):
+                        msg = f"Registry restored from backup ({most_recent.project_count} projects)"
+                        logger.info(msg)
+                        return True, msg
+                except Exception as e:
+                    logger.warning(f"Failed to restore from backup: {e}")
+
+        # Step 3: Perform filesystem scan recovery
+        logger.warning("All recovery options failed, attempting filesystem scan recovery")
+        return self._filesystem_scan_recovery(registry_path, registry)
+
+    def _is_registry_valid(self, registry_path: Path) -> bool:
+        """
+        Check if a registry database is valid and readable.
+
+        Args:
+            registry_path: Path to the registry database
+
+        Returns:
+            True if registry is valid
+        """
+        if not registry_path.exists():
+            return False
+
+        try:
+            conn = sqlite3.connect(registry_path)
+            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            tables = {row[0] for row in cursor.fetchall()}
+            conn.close()
+
+            required_tables = {"projects", "registry_metadata"}
+            return required_tables.issubset(tables)
+
+        except sqlite3.Error:
+            return False
+
+    def _filesystem_scan_recovery(
+        self,
+        registry_path: Path,
+        registry: Optional[ProjectRegistry] = None
+    ) -> Tuple[bool, str]:
+        """
+        Recover registry by scanning for .code-indexer/index.msgpack files.
+
+        This is a last-resort recovery mechanism that:
+        1. Scans for all .code-indexer directories
+        2. Extracts metadata from index.msgpack files
+        3. Reconstructs the registry from discovered indexes
+        4. Logs warnings about potential metadata loss
+
+        Args:
+            registry_path: Path where to create the recovered registry
+            registry: Optional ProjectRegistry instance (for direct updates)
+
+        Returns:
+            Tuple of (success: bool, message: str)
+        """
+        logger.warning("Starting filesystem scan recovery - some metadata may be lost")
+
+        # Discover all index.msgpack files
+        discovered_projects = self._scan_for_indexes()
+
+        if not discovered_projects:
+            msg = "No index files found during filesystem scan"
+            logger.error(msg)
+            return False, msg
+
+        logger.warning(f"Discovered {len(discovered_projects)} projects during filesystem scan")
+
+        # Create/recreate registry database
+        if registry_path.exists():
+            registry_path.unlink()
+
+        if registry is None:
+            registry = ProjectRegistry(db_path=registry_path)
+        else:
+            # Reinitialize schema
+            registry._ensure_db_exists()
+
+        # Insert discovered projects
+        recovered_count = 0
+        for project_info in discovered_projects:
+            try:
+                registry.insert(
+                    path=project_info["path"],
+                    indexed_at=project_info["indexed_at"],
+                    file_count=project_info["file_count"],
+                    config=project_info["config"],
+                    stats=project_info["stats"],
+                    index_location=project_info["index_location"]
+                )
+                recovered_count += 1
+            except Exception as e:
+                logger.warning(f"Failed to recover project {project_info['path']}: {e}")
+
+        msg = f"Recovered {recovered_count}/{len(discovered_projects)} projects from filesystem scan"
+        logger.warning(msg)
+
+        if recovered_count > 0:
+            return True, msg
+        else:
+            return False, "No projects could be recovered"
+
+    def _scan_for_indexes(self) -> List[Dict[str, Any]]:
+        """
+        Scan for all .code-indexer/index.msgpack files.
+
+        Returns:
+            List of project info dictionaries extracted from indexes
+        """
+        discovered = []
+
+        # Scan common project root directories
+        scan_roots = [Path("/"), Path.home()]
+
+        for root in scan_roots:
+            try:
+                # Search for .code-indexer directories
+                for indexer_dir in root.rglob(".code-indexer"):
+                    index_file = indexer_dir / "index.msgpack"
+                    if not index_file.exists():
+                        continue
+
+                    try:
+                        # Extract metadata from index file
+                        project_info = self._extract_index_metadata(index_file)
+                        if project_info:
+                            discovered.append(project_info)
+                    except Exception as e:
+                        logger.warning(f"Failed to read index {index_file}: {e}")
+            except PermissionError:
+                # Skip directories we can't access
+                continue
+
+        logger.info(f"Found {len(discovered)} index files during filesystem scan")
+        return discovered
+
+    def _extract_index_metadata(self, index_file: Path) -> Optional[Dict[str, Any]]:
+        """
+        Extract project metadata from an index.msgpack file.
+
+        Args:
+            index_file: Path to the index.msgpack file
+
+        Returns:
+            Dictionary with project metadata, or None if extraction failed
+        """
+        try:
+            with open(index_file, "rb") as f:
+                index_data = msgpack.unpackb(f.read(), raw=False)
+
+            # Extract relevant metadata
+            # The index structure may vary, so we extract what we can
+            project_path = str(index_file.parent.parent)
+
+            # Try to get file count
+            file_count = 0
+            if isinstance(index_data, dict):
+                file_count = index_data.get("file_count", len(index_data.get("files", {})))
+
+            # Try to get indexed timestamp
+            indexed_at = datetime.now()
+            if isinstance(index_data, dict):
+                indexed_at_str = index_data.get("indexed_at")
+                if indexed_at_str:
+                    try:
+                        indexed_at = datetime.fromisoformat(indexed_at_str)
+                    except (ValueError, TypeError):
+                        pass
+
+            return {
+                "path": project_path,
+                "indexed_at": indexed_at,
+                "file_count": file_count,
+                "config": {"recovered": True},  # Mark as recovered
+                "stats": {"recovered": True},
+                "index_location": str(index_file.parent)
+            }
+
+        except Exception as e:
+            logger.warning(f"Failed to extract metadata from {index_file}: {e}")
+            return None
+
+    # ------------------------------------------------------------------------
+    # Phase 6: Non-blocking Backup
+    # ------------------------------------------------------------------------
+
+    async def create_backup_async(
+        self,
+        registry: Optional[ProjectRegistry] = None,
+        registry_path: Optional[str | Path] = None
+    ) -> BackupMetadata:
+        """
+        Create a backup asynchronously (non-blocking).
+
+        This method runs the backup in a thread pool to avoid blocking
+        the main event loop.
+
+        Args:
+            registry: ProjectRegistry instance
+            registry_path: Path to registry database
+
+        Returns:
+            BackupMetadata with backup details
+        """
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        return await loop.run_in_executor(
+            None,
+            lambda: self.create_backup(registry=registry, registry_path=registry_path)
+        )
