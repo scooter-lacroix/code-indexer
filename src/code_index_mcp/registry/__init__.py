@@ -9,11 +9,13 @@ indexed projects across the system. It includes:
 - IndexMigrator: Migration utilities from pickle to MessagePack format
 - StartupMigrationManager: Automatic migration on server startup
 - OrphanDetector: Detection and recovery of orphaned indexes
+- RegistryBackupManager: Backup and restore functionality
 - Directory utilities: Global and per-project directory management
 
 Phase 1: Foundation - Registry and MessagePack Infrastructure
 Phase 3: Migration - Pickle to MessagePack migration
 Phase 4: Auto-Registration - Automatic registration and orphan detection
+Phase 5: MCP Tools - Registry management tools
 Track: meta-registry_20250101
 Target Version: v2.1.0
 """
@@ -46,6 +48,10 @@ from .directories import (
     get_project_index_dir,
     ensure_directories,
 )
+from .registry_backup import (
+    RegistryBackupManager,
+    BackupMetadata,
+)
 
 __all__ = [
     "ProjectRegistry",
@@ -68,4 +74,6 @@ __all__ = [
     "get_project_registry_dir",
     "get_project_index_dir",
     "ensure_directories",
+    "RegistryBackupManager",
+    "BackupMetadata",
 ]

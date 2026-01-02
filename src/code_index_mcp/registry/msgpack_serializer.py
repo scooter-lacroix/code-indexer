@@ -395,3 +395,60 @@ class MessagePackSerializer:
         except IOError as e:
             logger.error(f"Error computing hash for {file_path}: {e}")
             raise IOError(f"Failed to compute file hash: {e}") from e
+
+    def validate_index_file(self, file_path: str | Path) -> tuple[bool, Optional[str]]:
+        """
+        Validate an index file for integrity.
+
+        Checks:
+        - File exists and is readable
+        - File has valid format (MessagePack or pickle)
+        - Data can be deserialized
+
+        Args:
+            file_path: Path to the index file
+
+        Returns:
+            Tuple of (is_valid, error_message)
+
+        Examples:
+            >>> serializer = MessagePackSerializer()
+            >>> is_valid, error = serializer.validate_index_file("index.msgpack")
+            >>> is_valid
+            True
+        """
+        file_path = Path(file_path)
+
+        # Check file exists
+        if not file_path.exists():
+            return False, f"File does not exist: {file_path}"
+
+        # Check file is readable
+        if not os.access(file_path, os.R_OK):
+            return False, f"File is not readable: {file_path}"
+
+        # Check file is not empty
+        if file_path.stat().st_size == 0:
+            return False, f"File is empty: {file_path}"
+
+        # Detect format
+        format_type = self.detect_format(file_path)
+
+        if format_type == FormatType.UNKNOWN:
+            return False, f"Unknown file format: {file_path}"
+
+        # Try to read and deserialize
+        try:
+            data = self.read(file_path)
+
+            # Check data is dict-like (expected structure)
+            if not isinstance(data, dict):
+                return False, f"Data is not dict-like: {type(data)}"
+
+            logger.debug(f"Validated index file: {file_path}")
+            return True, None
+
+        except Exception as e:
+            error_msg = f"Failed to read index file: {e}"
+            logger.error(f"Validation failed for {file_path}: {error_msg}")
+            return False, error_msg

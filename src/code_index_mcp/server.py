@@ -1346,6 +1346,713 @@ def manage_temp(
 
 
 # =============================================================================
+# META-REGISTRY MCP TOOLS (Phase 5)
+# Management tools for the project registry system
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Tool 1: get_registry_status
+# Returns statistics and status information about the project registry
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def get_registry_status(
+    ctx: Context,
+) -> Dict[str, Any]:
+    """
+    Get status and statistics about the project registry.
+
+    Returns comprehensive information about the registry including:
+    - Total project count
+    - Last indexed project
+    - Oldest and newest indexed projects
+    - Storage location
+    - Database health
+    - Format statistics (pickle vs MessagePack)
+
+    Returns:
+        Dictionary with registry status information
+
+    Example:
+        {
+            "success": true,
+            "project_count": 5,
+            "last_indexed": "2025-01-01T12:00:00",
+            "registry_path": "/home/user/.code_indexer_data/registry.db",
+            "oldest_project": "/path/to/old",
+            "newest_project": "/path/to/new",
+            "formats": {"msgpack": 4, "pickle": 1}
+        }
+    """
+    from .registry import ProjectRegistry
+
+    try:
+        registry = ProjectRegistry()
+
+        # Get basic statistics
+        projects = registry.list_all()
+        project_count = len(projects)
+
+        # Get last indexed
+        last_indexed = None
+        if projects:
+            # Sort by indexed_at, newest first
+            sorted_projects = sorted(
+                projects,
+                key=lambda p: p.indexed_at,
+                reverse=True
+            )
+            last_indexed = sorted_projects[0].indexed_at.isoformat()
+
+        # Get oldest and newest projects
+        oldest_project = None
+        newest_project = None
+        if project_count > 0:
+            oldest_project = min(projects, key=lambda p: p.indexed_at).path
+            newest_project = max(projects, key=lambda p: p.indexed_at).path
+
+        # Check format statistics
+        format_stats = {"msgpack": 0, "pickle": 0, "unknown": 0}
+        from .registry.msgpack_serializer import MessagePackSerializer
+        serializer = MessagePackSerializer()
+
+        for project in projects:
+            index_dir = pathlib.Path(project.index_location)
+            if index_dir.exists():
+                # Check for MessagePack files
+                msgpack_files = list(index_dir.rglob("*.msgpack"))
+                pickle_files = list(index_dir.rglob("*.pickle"))
+
+                if msgpack_files:
+                    format_stats["msgpack"] += 1
+                elif pickle_files:
+                    format_stats["pickle"] += 1
+                else:
+                    format_stats["unknown"] += 1
+
+        return {
+            "success": True,
+            "project_count": project_count,
+            "last_indexed": last_indexed,
+            "registry_path": str(registry.db_path),
+            "oldest_project": oldest_project,
+            "newest_project": newest_project,
+            "formats": format_stats,
+            "registry_exists": registry.db_path.exists(),
+        }
+
+    except Exception as e:
+        logger.error(f"Error getting registry status: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 2: registry_health_check
+# Performs health checks on all registered projects
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def registry_health_check(
+    ctx: Context,
+) -> Dict[str, Any]:
+    """
+    Perform health checks on all registered projects.
+
+    Checks:
+    - Project paths exist
+    - Index files exist
+    - MessagePack integrity
+
+    Returns per-project health details and overall status.
+
+    Returns:
+        Dictionary with health check results for each project and overall status
+
+    Example:
+        {
+            "success": true,
+            "overall_status": "healthy",
+            "projects": {
+                "/path/to/project": {
+                    "path_exists": true,
+                    "index_exists": true,
+                    "index_valid": true,
+                    "status": "healthy"
+                }
+            },
+            "summary": {"healthy": 4, "warning": 1, "critical": 0}
+        }
+    """
+    from .registry import ProjectRegistry
+    from .registry.msgpack_serializer import MessagePackSerializer
+
+    try:
+        registry = ProjectRegistry()
+        projects = registry.list_all()
+
+        if not projects:
+            return {
+                "success": True,
+                "overall_status": "healthy",
+                "message": "No projects in registry",
+                "projects": {},
+                "summary": {"healthy": 0, "warning": 0, "critical": 0}
+            }
+
+        serializer = MessagePackSerializer()
+        project_health = {}
+        summary = {"healthy": 0, "warning": 0, "critical": 0}
+
+        for project in projects:
+            health = {
+                "path_exists": False,
+                "index_exists": False,
+                "index_valid": False,
+                "status": "unknown",
+                "issues": []
+            }
+
+            # Check if project path exists
+            project_path = pathlib.Path(project.path)
+            health["path_exists"] = project_path.exists()
+
+            if not health["path_exists"]:
+                health["status"] = "critical"
+                health["issues"].append("Project path does not exist")
+                summary["critical"] += 1
+            else:
+                # Check if index exists
+                index_dir = pathlib.Path(project.index_location)
+                health["index_exists"] = index_dir.exists()
+
+                if not health["index_exists"]:
+                    health["status"] = "warning"
+                    health["issues"].append("Index directory does not exist")
+                    summary["warning"] += 1
+                else:
+                    # Check index integrity
+                    try:
+                        # Try to find and validate an index file
+                        index_files = list(index_dir.rglob("*.msgpack")) + \
+                                     list(index_dir.rglob("*.pickle"))
+
+                        if index_files:
+                            health["index_valid"] = all(
+                                serializer.validate_index_file(f)[0]
+                                for f in index_files
+                            )
+
+                            if not health["index_valid"]:
+                                health["status"] = "warning"
+                                health["issues"].append("Index file validation failed")
+                                summary["warning"] += 1
+                            else:
+                                health["status"] = "healthy"
+                                summary["healthy"] += 1
+                        else:
+                            health["status"] = "warning"
+                            health["issues"].append("No index files found")
+                            summary["warning"] += 1
+
+                    except Exception as e:
+                        health["status"] = "critical"
+                        health["issues"].append(f"Error checking index: {e}")
+                        summary["critical"] += 1
+
+            project_health[project.path] = health
+
+        # Determine overall status
+        if summary["critical"] > 0:
+            overall_status = "critical"
+        elif summary["warning"] > 0:
+            overall_status = "warning"
+        else:
+            overall_status = "healthy"
+
+        return {
+            "success": True,
+            "overall_status": overall_status,
+            "projects": project_health,
+            "summary": summary,
+        }
+
+    except Exception as e:
+        logger.error(f"Error during registry health check: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 3: registry_cleanup
+# Removes invalid projects from the registry
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def registry_cleanup(
+    ctx: Context,
+    force: bool = False,
+) -> Dict[str, Any]:
+    """
+    Clean up the registry by removing invalid projects.
+
+    Removes projects where:
+    - Project path does not exist
+    - Index is corrupted
+
+    Args:
+        force: If True, skip confirmation. If False, requires confirmation.
+
+    Returns:
+        Dictionary with cleanup results
+
+    Example:
+        {
+            "success": true,
+            "removed_count": 2,
+            "removed_projects": ["/path/to/old1", "/path/to/old2"],
+            "backup_path": "/path/to/backup.db"
+        }
+    """
+    from .registry import ProjectRegistry, RegistryBackupManager
+
+    try:
+        # Get health status first
+        health_result = await registry_health_check(ctx)
+
+        if not health_result.get("success"):
+            return health_result
+
+        # Identify projects to remove (critical or warning with missing path)
+        projects_to_remove = []
+        for project_path, health in health_result["projects"].items():
+            if health["status"] == "critical" or not health["path_exists"]:
+                projects_to_remove.append(project_path)
+
+        if not projects_to_remove:
+            return {
+                "success": True,
+                "removed_count": 0,
+                "removed_projects": [],
+                "message": "No invalid projects found to remove"
+            }
+
+        # Create backup before cleanup
+        backup_manager = RegistryBackupManager()
+        registry = ProjectRegistry()
+        backup_metadata = backup_manager.create_backup(registry=registry)
+
+        # Remove invalid projects
+        removed_projects = []
+        for project_path in projects_to_remove:
+            try:
+                if registry.delete(project_path):
+                    removed_projects.append(project_path)
+                    logger.info(f"Removed invalid project: {project_path}")
+            except Exception as e:
+                logger.warning(f"Failed to remove project {project_path}: {e}")
+
+        return {
+            "success": True,
+            "removed_count": len(removed_projects),
+            "removed_projects": removed_projects,
+            "backup_path": str(backup_metadata.backup_path),
+            "message": f"Removed {len(removed_projects)} invalid projects"
+        }
+
+    except Exception as e:
+        logger.error(f"Error during registry cleanup: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 4: reindex_all_projects
+# Re-index all registered projects with change detection
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def reindex_all_projects(
+    ctx: Context,
+    force: bool = False,
+    dry_run: bool = False,
+) -> Dict[str, Any]:
+    """
+    Re-index all registered projects with change detection.
+
+    Iterates through all registered projects and re-indexes them if:
+    - Files have been modified (mtime change)
+    - Files have been added or removed
+    - force flag is set
+
+    Args:
+        force: Re-index all projects regardless of changes
+        dry_run: Only show what would be re-indexed without actually doing it
+
+    Returns:
+        Dictionary with re-indexing results
+
+    Example:
+        {
+            "success": true,
+            "total_projects": 5,
+            "reindexed_count": 2,
+            "skipped_count": 3,
+            "results": [...]
+        }
+    """
+    from .registry import ProjectRegistry
+    from datetime import datetime
+
+    try:
+        registry = ProjectRegistry()
+        projects = registry.list_all()
+
+        if not projects:
+            return {
+                "success": True,
+                "total_projects": 0,
+                "reindexed_count": 0,
+                "skipped_count": 0,
+                "results": [],
+                "message": "No projects in registry"
+            }
+
+        results = []
+        reindexed_count = 0
+        skipped_count = 0
+        failed_count = 0
+
+        for project in projects:
+            result = {
+                "project_path": project.path,
+                "indexed": False,
+                "skipped": False,
+                "error": None,
+                "reason": None
+            }
+
+            try:
+                # Check if project path exists
+                project_path = pathlib.Path(project.path)
+                if not project_path.exists():
+                    result["error"] = "Project path does not exist"
+                    result["reason"] = "missing_path"
+                    failed_count += 1
+                    results.append(result)
+                    continue
+
+                # Check for changes if not forcing
+                if not force:
+                    # Check if any files have been modified since last index
+                    last_indexed = project.indexed_at
+                    has_changes = False
+
+                    # Recursively check file mtimes
+                    for file_path in project_path.rglob("*"):
+                        if file_path.is_file():
+                            file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
+                            if file_mtime > last_indexed:
+                                has_changes = True
+                                break
+
+                    if not has_changes:
+                        result["skipped"] = True
+                        result["reason"] = "no_changes"
+                        skipped_count += 1
+                        results.append(result)
+                        continue
+
+                # Re-index the project
+                if dry_run:
+                    result["indexed"] = True
+                    result["reason"] = "dry_run"
+                    reindexed_count += 1
+                else:
+                    # Call the index_project operation
+                    index_result = await manage_project(
+                        ctx,
+                        action="refresh",
+                    )
+
+                    if isinstance(index_result, dict) and index_result.get("success"):
+                        result["indexed"] = True
+                        result["reason"] = "reindexed"
+
+                        # Update registry timestamp
+                        registry.update(
+                            project.path,
+                            indexed_at=datetime.now()
+                        )
+
+                        reindexed_count += 1
+                    else:
+                        result["error"] = str(index_result)
+                        failed_count += 1
+
+            except Exception as e:
+                result["error"] = str(e)
+                result["reason"] = "error"
+                failed_count += 1
+
+            results.append(result)
+
+        return {
+            "success": True,
+            "total_projects": len(projects),
+            "reindexed_count": reindexed_count,
+            "skipped_count": skipped_count,
+            "failed_count": failed_count,
+            "dry_run": dry_run,
+            "results": results,
+            "message": (
+                f"Re-indexed {reindexed_count}, skipped {skipped_count}, "
+                f"failed {failed_count} projects"
+            )
+        }
+
+    except Exception as e:
+        logger.error(f"Error during re-index all projects: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 5: migrate_legacy_indexes
+# Migrate pickle indexes to MessagePack format
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def migrate_legacy_indexes(
+    ctx: Context,
+    project_path: Optional[str] = None,
+    scan_global: bool = True,
+) -> Dict[str, Any]:
+    """
+    Migrate legacy pickle indexes to MessagePack format.
+
+    Exposes the IndexMigrator functionality as an MCP tool.
+    Can migrate a specific project or all detected legacy indexes.
+
+    Args:
+        project_path: Optional project path to migrate. If None, migrates all.
+        scan_global: Whether to scan the global data directory
+
+    Returns:
+        Dictionary with migration results
+
+    Example:
+        {
+            "success": true,
+            "migrated_count": 3,
+            "results": [...]
+        }
+    """
+    from .registry import IndexMigrator
+
+    try:
+        migrator = IndexMigrator(
+            create_backups=True,
+            verify_after_migration=True
+        )
+
+        # Detect legacy indexes
+        pickle_files = migrator.detect_legacy_indexes(
+            project_path=project_path,
+            scan_global=scan_global
+        )
+
+        if not pickle_files:
+            return {
+                "success": True,
+                "migrated_count": 0,
+                "results": [],
+                "message": "No legacy pickle indexes found"
+            }
+
+        # Migrate each file
+        results = []
+        migrated_count = 0
+        failed_count = 0
+
+        for pickle_file in pickle_files:
+            result = migrator.migrate_index(pickle_file)
+            results.append({
+                "source": str(result.source_path),
+                "target": str(result.target_path),
+                "success": result.success,
+                "backup": str(result.backup_path) if result.backup_path else None,
+                "error": result.error_message,
+                "duration_seconds": result.duration_seconds
+            })
+
+            if result.success:
+                migrated_count += 1
+            else:
+                failed_count += 1
+
+        return {
+            "success": True,
+            "migrated_count": migrated_count,
+            "failed_count": failed_count,
+            "results": results,
+            "message": (
+                f"Migrated {migrated_count} indexes successfully, "
+                f"{failed_count} failed"
+            )
+        }
+
+    except Exception as e:
+        logger.error(f"Error during legacy index migration: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 6: detect_orphaned_indexes
+# Detect orphaned indexes that are not in the registry
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def detect_orphaned_indexes(
+    ctx: Context,
+    max_depth: int = 3,
+) -> Dict[str, Any]:
+    """
+    Detect orphaned indexes that exist on disk but are not registered.
+
+    Offers recovery options (register or cleanup) for each orphan.
+
+    Args:
+        max_depth: Maximum directory depth to search (default: 3)
+
+    Returns:
+        Dictionary with orphan list and recommendations
+
+    Example:
+        {
+            "success": true,
+            "orphan_count": 2,
+            "orphans": [...],
+            "suggestions": {
+                "register": ["/path/to/orphan1"],
+                "cleanup": ["/path/to/orphan2"]
+            }
+        }
+    """
+    from .registry import OrphanDetector
+
+    try:
+        detector = OrphanDetector()
+
+        # Scan for orphans
+        orphans = detector.scan_for_orphans(max_depth=max_depth)
+
+        if not orphans:
+            return {
+                "success": True,
+                "orphan_count": 0,
+                "orphans": [],
+                "suggestions": {"register": [], "cleanup": []},
+                "message": "No orphaned indexes found"
+            }
+
+        # Get suggestions
+        suggestions = detector.suggest_actions(orphans)
+
+        # Format orphan data
+        orphan_data = []
+        for orphan in orphans:
+            orphan_data.append({
+                "path": orphan.path,
+                "index_location": orphan.index_location,
+                "index_exists": orphan.index_exists,
+                "index_size": orphan.index_size,
+                "last_modified": (
+                    orphan.last_modified.isoformat() if orphan.last_modified else None
+                ),
+                "reason": orphan.reason
+            })
+
+        return {
+            "success": True,
+            "orphan_count": len(orphans),
+            "orphans": orphan_data,
+            "suggestions": {
+                "register": suggestions["register"],
+                "cleanup": suggestions["cleanup"]
+            },
+            "message": f"Found {len(orphans)} orphaned indexes"
+        }
+
+    except Exception as e:
+        logger.error(f"Error during orphan detection: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# -----------------------------------------------------------------------------
+# Tool 7: backup_registry
+# Create an immediate backup of the registry
+# -----------------------------------------------------------------------------
+@mcp.tool()
+async def backup_registry(
+    ctx: Context,
+) -> Dict[str, Any]:
+    """
+    Create an immediate backup of the project registry.
+
+    Returns the backup file path and metadata.
+
+    Returns:
+        Dictionary with backup information
+
+    Example:
+        {
+            "success": true,
+            "backup_path": "/path/to/backup.db",
+            "project_count": 5,
+            "timestamp": "2025-01-01T12:00:00"
+        }
+    """
+    from .registry import ProjectRegistry, RegistryBackupManager
+
+    try:
+        registry = ProjectRegistry()
+        backup_manager = RegistryBackupManager()
+
+        # Create backup
+        backup_metadata = backup_manager.create_backup(registry=registry)
+
+        return {
+            "success": True,
+            "backup_path": str(backup_metadata.backup_path),
+            "project_count": backup_metadata.project_count,
+            "timestamp": backup_metadata.timestamp.isoformat(),
+            "backup_size": backup_metadata.backup_size_bytes,
+            "checksum": backup_metadata.checksum,
+            "message": f"Backup created at {backup_metadata.backup_path}"
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating registry backup: {e}")
+        return {
+            "success": False,
+            "error": str(e),
+        }
+
+
+# =============================================================================
+# END OF META-REGISTRY MCP TOOLS
+# =============================================================================
+
+# =============================================================================
 # END OF MEGA-TOOLS
 # Below are the original individual tool functions (preserved for backward compatibility)
 # =============================================================================
