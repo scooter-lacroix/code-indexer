@@ -178,6 +178,31 @@ This will start:
 - Elasticsearch on port 9200
 - RabbitMQ on ports 5672 (AMQP) and 15672 (Management UI)
 
+**Memory Requirements for Elasticsearch:**
+
+The Elasticsearch container is configured with the following memory settings in `docker-compose.yml`:
+- **Heap Size**: 6GB (`-Xms6g -Xmx6g`)
+- **Container Memory Limit**: 12GB
+
+**Important Notes:**
+- The 12GB memory limit requires sufficient system RAM (recommend 16GB+ total system memory)
+- If you have memory constraints, you can reduce to 4GB heap with 8GB limit by editing `docker-compose.yml`:
+  ```yaml
+  environment:
+    - "ES_JAVA_OPTS=-Xms4g -Xmx4g"
+  deploy:
+    resources:
+      limits:
+        memory: 8g
+  ```
+- After changing memory settings, it's recommended to start with a fresh Elasticsearch volume:
+  ```bash
+  podman compose down
+  podman volume rm code-indexer_es_data  # Optional: removes old data
+  podman compose up -d
+  ```
+- The heap size should be ~50% of container limit to allow for off-heap storage, ML native controller, and OS filesystem cache
+
 **2. Environment Configuration:**
 ```bash
 # Set environment variables

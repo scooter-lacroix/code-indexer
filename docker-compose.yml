@@ -23,11 +23,21 @@ services:
     environment:
       - discovery.type=single-node
       - xpack.security.enabled=false
-      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      # Heap Settings: 6GB (provides JVM "breathing room" for code_index and ML operations)
+      - "ES_JAVA_OPTS=-Xms6g -Xmx6g"
+      # Ensure ML and Watcher remain enabled for background tasks
+      - xpack.ml.enabled=true
+      - xpack.watcher.enabled=true
       # Disk watermark settings for systems with limited disk space
       - cluster.routing.allocation.disk.watermark.low=95%
       - cluster.routing.allocation.disk.watermark.high=98%
       - cluster.routing.allocation.disk.watermark.flood_stage=99%
+    # Container memory limit should be ~2x Heap for performance/ML requirements
+    # Allows for off-heap storage, ML native controller, and OS filesystem cache
+    deploy:
+      resources:
+        limits:
+          memory: 12g
     ulimits:
       memlock:
         soft: -1
