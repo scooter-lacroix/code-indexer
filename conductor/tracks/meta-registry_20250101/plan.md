@@ -152,7 +152,7 @@
 - [ ] Verify no linting errors
 - [ ] Create checkpoint commit
 
-## Phase 5: MCP Tools Implementation
+## Phase 5: MCP Tools Implementation [checkpoint: f661fe8]
 
 ### Task: 5.1 Implement get_registry_status()
 - [ ] Subtask: Add MCP tool to `server.py`
