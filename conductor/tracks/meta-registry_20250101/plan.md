@@ -97,7 +97,7 @@
 - [ ] Verify no linting errors
 - [ ] Create checkpoint commit
 
-## Phase 3: Migration - Pickle to MessagePack
+## Phase 3: Migration - Pickle to MessagePack [checkpoint: d70c8cf]
 
 ### Task: 3.1 Create IndexMigrator Class
 - [ ] Subtask: Create `src/code_index_mcp/registry/index_migrator.py`
