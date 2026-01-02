@@ -124,7 +124,7 @@
 
 1.  **安裝套件**：
     ```bash
-    pip install code-index-mcp
+    pip install sc-code-indexer
     ```
 
 2.  **設定宿主應用**：您需要手動更新宿主應用的 MCP 設定，將命令從 `"command": "uvx"` 修改為 `"command": "code-index-mcp"`。
@@ -228,8 +228,8 @@
 1. 複製儲存庫：
 
 ```bash
-git clone https://github.com/username/code-index-mcp.git
-cd code-index-mcp
+git clone https://github.com/scooter-lacroix/code-indexer.git
+cd code-indexer
 ```
 
 2. 安裝相依套件：

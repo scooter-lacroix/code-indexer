@@ -616,7 +616,7 @@ Remember: This is a system with PostgreSQL metadata storage, Elasticsearch searc
   "mcpServers": {
     "code-index": {
       "command": "uvx",
-      "args": ["git+https://github.com/your-repo/code-index-mcp.git"],
+      "args": ["git+https://github.com/scooter-lacroix/code-indexer.git"],
       "env": {
         "DAL_BACKEND_TYPE": "postgresql_elasticsearch_only",
         "POSTGRES_HOST": "localhost",

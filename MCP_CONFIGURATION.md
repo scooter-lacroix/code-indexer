@@ -17,17 +17,17 @@ The Code Index MCP Server provides code indexing and search capabilities, making
 ### Local Installation
 ```bash
 # Clone and install
-git clone https://github.com/scooter-lacroix/code-index-mcp.git
-cd code-index-mcp
+git clone https://github.com/scooter-lacroix/code-indexer.git
+cd code-indexer
 uv pip install -e .
 
 # Or install from package
-pip install code-index-mcp
+pip install sc-code-indexer
 ```
 
 ### Direct UV Installation
 ```bash
-uvx git+https://github.com/scooter-lacroix/code-index-mcp.git
+uvx git+https://github.com/scooter-lacroix/code-indexer.git
 ```
 
 ## Configuration Examples
@@ -39,7 +39,7 @@ uvx git+https://github.com/scooter-lacroix/code-index-mcp.git
   "mcpServers": {
     "code-index": {
       "command": "uvx",
-      "args": ["git+https://github.com/scooter-lacroix/code-index-mcp.git"],
+      "args": ["git+https://github.com/scooter-lacroix/code-indexer.git"],
       "env": {},
       "start_on_launch": true
     }
@@ -195,7 +195,7 @@ code-index search_symbols "function_name" --path "src/*"
 index_repository --path "/home/user/my_project"
 
 # Re-index with remote repository
-index_repository --url "https://github.com/scooter-lacroix/code-index-mcp.git"
+index_repository --url "https://github.com/scooter-lacroix/code-indexer.git"
 ```
 
 ### HTTP Server Mode

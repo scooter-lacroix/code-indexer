@@ -23,23 +23,23 @@ This is the fastest way to get started with the latest features:
 
 ```bash
 # Install and run directly
-uvx git+https://github.com/your-repo/code-index-mcp.git
+uvx git+https://github.com/scooter-lacroix/code-indexer.git
 
 # Or install globally
-pip install git+https://github.com/your-repo/code-index-mcp.git
+pip install git+https://github.com/scooter-lacroix/code-indexer.git
 ```
 
 ### Method 2: Package Installation
 
 ```bash
 # Using uv (recommended)
-uv add code-index-mcp
+uv add sc-code-indexer
 
 # Using pip
-pip install code-index-mcp
+pip install sc-code-indexer
 
 # Using pipx for isolated installation
-pipx install code-index-mcp
+pipx install sc-code-indexer
 ```
 
 ### Method 3: Development Installation
@@ -48,8 +48,8 @@ For development, customization, or contributing:
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/code-index-mcp.git
-cd code-index-mcp
+git clone https://github.com/scooter-lacroix/code-indexer.git
+cd code-indexer
 
 # Using uv (recommended)
 uv sync
@@ -248,7 +248,7 @@ Add to your Claude Desktop configuration (`~/Library/Application Support/Claude/
   "mcpServers": {
     "code-index": {
       "command": "uvx",
-      "args": ["git+https://github.com/your-repo/code-index-mcp.git"],
+      "args": ["git+https://github.com/scooter-lacroix/code-indexer.git"],
       "env": {
         "DAL_BACKEND_TYPE": "postgresql_elasticsearch_only",
         "POSTGRES_HOST": "localhost",
@@ -296,7 +296,7 @@ Add to your MCP configuration:
   "mcpServers": {
     "code-index": {
       "command": "uvx",
-      "args": ["git+https://github.com/your-repo/code-index-mcp.git"],
+      "args": ["git+https://github.com/scooter-lacroix/code-indexer.git"],
       "env": {
         "DAL_BACKEND_TYPE": "postgresql_elasticsearch_only"
       }
@@ -434,8 +434,8 @@ python --version
 pip list | grep code-index
 
 # Reinstall if needed
-pip uninstall code-index-mcp
-pip install --no-cache-dir code-index-mcp
+pip uninstall sc-code-indexer
+pip install --no-cache-dir sc-code-indexer
 ```
 
 #### 4. Memory Issues

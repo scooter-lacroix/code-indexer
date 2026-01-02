@@ -148,9 +148,9 @@ uvx git+https://github.com/scooter-lacroix/code-indexer.git
 
 **For package installation:**
 ```bash
-uv add code-index-mcp
+uv add sc-code-indexer
 # or
-pip install code-index-mcp
+pip install sc-code-indexer
 ```
 
 **For local vector search support (recommended):**
