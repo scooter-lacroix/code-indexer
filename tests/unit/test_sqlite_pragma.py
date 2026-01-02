@@ -177,20 +177,16 @@ class TestSQLitePragmaSettings:
 
         # Verify by checking the registry works
         from datetime import datetime
-        from code_index_mcp.registry.project_registry import ProjectInfo
 
-        project = ProjectInfo(
-            id=None,
+        # Use insert method with individual parameters
+        registry.insert(
             path='/test/path',
-            path_hash='abc123',
             indexed_at=datetime.now(),
             file_count=10,
             config={},
             stats={},
             index_location='/test/index'
         )
-
-        registry.register(project)
         retrieved = registry.get_by_path('/test/path')
         assert retrieved is not None
 
