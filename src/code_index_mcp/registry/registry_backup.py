@@ -410,6 +410,68 @@ class RegistryBackupManager:
             logger.error(f"Failed to delete backup {backup_path}: {e}")
             return False
 
+    def restore_latest_backup(
+        self,
+        registry_path: Optional[str | Path] = None,
+        verify_before_restore: bool = True
+    ) -> bool:
+        """
+        Restore registry from the most recent backup.
+
+        Convenience method that finds the latest backup and restores it.
+
+        Args:
+            registry_path: Path where to restore. If None, uses original path from backup.
+            verify_before_restore: Whether to verify backup before restoring
+
+        Returns:
+            True if restoration succeeded, False if no backup found
+        """
+        backups = self.list_backups()
+
+        if not backups:
+            logger.warning("No backups found to restore")
+            return False
+
+        latest_backup = backups[0]  # list_backups returns newest first
+        logger.info(f"Restoring from latest backup: {latest_backup.backup_path}")
+
+        return self.restore_backup(
+            backup_path=latest_backup.backup_path,
+            registry_path=registry_path,
+            verify_before_restore=verify_before_restore
+        )
+
+    def scan_and_recover(
+        self,
+        registry_path: Optional[str | Path] = None
+    ) -> list[dict]:
+        """
+        Recover registry by scanning filesystem for index directories.
+
+        This method scans known locations for index directories and rebuilds
+        the registry from discovered projects.
+
+        Args:
+            registry_path: Path where to create/rebuild the registry.
+                        If None, uses default registry path.
+
+        Returns:
+            List of recovered project information dictionaries
+        """
+        if registry_path is None:
+            from .directories import get_registry_db_path
+            registry_path = get_registry_db_path()
+
+        registry_path = Path(registry_path)
+        logger.info(f"Starting filesystem scan recovery to: {registry_path}")
+
+        # Scan for index directories
+        discovered = self._filesystem_scan_recovery(registry_path)
+
+        logger.info(f"Filesystem scan recovery completed: {len(discovered)} projects recovered")
+        return discovered
+
     # ------------------------------------------------------------------------
     # Private Methods
     # ------------------------------------------------------------------------
@@ -638,13 +700,13 @@ class RegistryBackupManager:
         self,
         registry_path: Path,
         registry: Optional[ProjectRegistry] = None
-    ) -> Tuple[bool, str]:
+    ) -> List[Dict[str, Any]]:
         """
-        Recover registry by scanning for .code-indexer/index.msgpack files.
+        Recover registry by scanning for .code-indexer/files.msgpack files.
 
         This is a last-resort recovery mechanism that:
         1. Scans for all .code-indexer directories
-        2. Extracts metadata from index.msgpack files
+        2. Extracts metadata from files.msgpack files
         3. Reconstructs the registry from discovered indexes
         4. Logs warnings about potential metadata loss
 
@@ -653,17 +715,16 @@ class RegistryBackupManager:
             registry: Optional ProjectRegistry instance (for direct updates)
 
         Returns:
-            Tuple of (success: bool, message: str)
+            List of recovered project info dictionaries
         """
         logger.warning("Starting filesystem scan recovery - some metadata may be lost")
 
-        # Discover all index.msgpack files
+        # Discover all files.msgpack files
         discovered_projects = self._scan_for_indexes()
 
         if not discovered_projects:
-            msg = "No index files found during filesystem scan"
-            logger.error(msg)
-            return False, msg
+            logger.warning("No index files found during filesystem scan")
+            return []
 
         logger.warning(f"Discovered {len(discovered_projects)} projects during filesystem scan")
 
@@ -679,9 +740,10 @@ class RegistryBackupManager:
 
         # Insert discovered projects
         recovered_count = 0
+        recovered = []
         for project_info in discovered_projects:
             try:
-                registry.insert(
+                info = registry.insert(
                     path=project_info["path"],
                     indexed_at=project_info["indexed_at"],
                     file_count=project_info["file_count"],
@@ -689,6 +751,12 @@ class RegistryBackupManager:
                     stats=project_info["stats"],
                     index_location=project_info["index_location"]
                 )
+                recovered.append({
+                    "path": project_info["path"],
+                    "file_count": project_info["file_count"],
+                    "indexed_at": project_info["indexed_at"],
+                    "id": info.id,
+                })
                 recovered_count += 1
             except Exception as e:
                 logger.warning(f"Failed to recover project {project_info['path']}: {e}")
@@ -696,10 +764,7 @@ class RegistryBackupManager:
         msg = f"Recovered {recovered_count}/{len(discovered_projects)} projects from filesystem scan"
         logger.warning(msg)
 
-        if recovered_count > 0:
-            return True, msg
-        else:
-            return False, "No projects could be recovered"
+        return recovered
 
     def _scan_for_indexes(self) -> List[Dict[str, Any]]:
         """
@@ -710,14 +775,42 @@ class RegistryBackupManager:
         """
         discovered = []
 
-        # Scan common project root directories
-        scan_roots = [Path("/"), Path.home()]
+        # Scan common project root directories (avoiding /proc and other system dirs)
+        scan_roots = [Path.home()]
+
+        # Add safe system paths to scan
+        for base in ["/home", "/Users", "/mnt", "/media"]:
+            base_path = Path(base)
+            if base_path.exists() and base_path.is_dir():
+                try:
+                    # Test if we can access it
+                    next(base_path.iterdir())
+                    scan_roots.append(base_path)
+                except (PermissionError, OSError):
+                    pass
 
         for root in scan_roots:
             try:
-                # Search for .code-indexer directories
-                for indexer_dir in root.rglob(".code-indexer"):
-                    index_file = indexer_dir / "index.msgpack"
+                # Search for .code-indexer directories (limited depth to avoid issues)
+                max_depth = 5
+                for indexer_dir in root.glob("**/.code-indexer"):
+                    # Check depth
+                    try:
+                        rel_path = indexer_dir.relative_to(root)
+                        if len(rel_path.parts) > max_depth:
+                            continue
+                    except ValueError:
+                        # Not relative to root
+                        continue
+
+                    # Skip system directories
+                    if any(part.startswith('.') for part in indexer_dir.parts):
+                        continue
+
+                    if "proc" in str(indexer_dir) or "sys" in str(indexer_dir):
+                        continue
+
+                    index_file = indexer_dir / "files.msgpack"  # Updated to look for files.msgpack
                     if not index_file.exists():
                         continue
 
@@ -728,8 +821,9 @@ class RegistryBackupManager:
                             discovered.append(project_info)
                     except Exception as e:
                         logger.warning(f"Failed to read index {index_file}: {e}")
-            except PermissionError:
+            except (PermissionError, OSError) as e:
                 # Skip directories we can't access
+                logger.debug(f"Cannot scan {root}: {e}")
                 continue
 
         logger.info(f"Found {len(discovered)} index files during filesystem scan")

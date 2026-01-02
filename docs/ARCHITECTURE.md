@@ -561,3 +561,618 @@ class ETLPipeline:
 - **Network Bandwidth**: Efficient data transfer protocols
 
 This architecture provides a solid foundation for enterprise-grade code analysis and management, with clear paths for future enhancement and scaling.
+
+## 🗂️ Meta-Registry Architecture (v2.1.0)
+
+### Overview
+
+The **Meta-Registry** is a centralized project tracking system that manages metadata for all indexed projects across the Code Indexer. It provides a single source of truth for project locations, index formats, and indexing history.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Meta-Registry System                        │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Project Registry (SQLite)                   │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ projects table                                  │    │   │
+│  │  │  • id (PK)                                      │    │   │
+│  │  │  • path (unique, indexed)                        │    │   │
+│  │  │  • path_hash (SHA-256, indexed)                  │    │   │
+│  │  │  • indexed_at (timestamp)                        │    │   │
+│  │  │  • file_count                                    │    │   │
+│  │  │  • config (JSON)                                 │    │   │
+│  │  │  • stats (JSON)                                  │    │   │
+│  │  │  • index_location                                │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  │  ┌─────────────────────────────────────────────────┐    │   │
+│  │  │ registry_metadata table                          │    │   │
+│  │  │  • key (unique)                                  │    │   │
+│  │  │  • value (JSON)                                  │    │   │
+│  │  │  Tracks: version, migrations, backups            │    │   │
+│  │  └─────────────────────────────────────────────────┘    │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │           Index Storage (MessagePack Format)            │   │
+│  │  • Project-specific indexes                             │   │
+│  │  • Symbol indexes                                       │   │
+│  │  • Content indexes                                      │   │
+│  └─────────────────────────────────────────────────────────┘   │
+│                                                                 │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │              Backup & Recovery                          │   │
+│  │  • Automatic periodic backups (24h)                     │   │
+│  │  • Backup rotation (7 days)                             │   │
+│  │  • Corruption detection & recovery                      │   │
+│  │  • Filesystem scan recovery                             │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Registry Components
+
+#### 1. Project Registry (`project_registry.py`)
+
+The core registry that maintains project metadata:
+
+```python
+class ProjectRegistry:
+    """
+    Central registry for all indexed projects.
+
+    Key Operations:
+    - insert(): Register new project
+    - update(): Update project metadata
+    - delete(): Remove project from registry
+    - get_by_path(): Retrieve project by path
+    - get_by_path_hash(): Retrieve project by hash
+    - list_all(): List all projects (with pagination)
+    - count(): Get total project count
+    - exists(): Check if project is registered
+    - set_metadata(): Set registry metadata
+    - get_metadata(): Get registry metadata
+    """
+
+    def __init__(self, db_path: Optional[Path] = None):
+        """
+        Initialize registry with:
+        - SQLite database with WAL mode
+        - Automatic schema creation
+        - Path hashing for fast lookups
+        """
+
+    def _hash_path(path: str) -> str:
+        """
+        Generate SHA-256 hash for path.
+        Used for indexed lookups and deduplication.
+        """
+```
+
+**Key Features**:
+- **Path Hashing**: SHA-256 hashes for fast lookups and deduplication
+- **WAL Mode**: Write-Ahead Logging for concurrent access
+- **Atomic Operations**: All changes are transactional
+- **Foreign Keys**: Referential integrity enforcement
+
+#### 2. Index Migrator (`index_migrator.py`)
+
+Handles migration from pickle to MessagePack format:
+
+```python
+class IndexMigrator:
+    """
+    Migrates index files from pickle to MessagePack format.
+
+    Benefits:
+    - 3-5x faster serialization
+    - Cross-platform compatibility
+    - Better security (no arbitrary code execution)
+    - Smaller file sizes
+    """
+
+    def migrate_file(source_path: Path) -> MigrationResult:
+        """
+        Migrate single index file.
+
+        Process:
+        1. Detect format (pickle/msgpack)
+        2. Read and validate data
+        3. Create MessagePack version
+        4. Create backup of original
+        5. Verify migration success
+        """
+
+    def migrate_directory(directory: Path) -> List[MigrationResult]:
+        """Migrate all index files in directory."""
+```
+
+#### 3. Startup Migration Manager (`startup_migration.py`)
+
+Manages automatic migration on server startup:
+
+```python
+class StartupMigrationManager:
+    """
+    Automatic migration on startup.
+
+    Features:
+    - Scans global and project directories
+    - Detects legacy pickle files
+    - Migrates to MessagePack format
+    - Tracks migration in registry
+    - Supports first-access migration
+    """
+
+    def check_legacy_indexes(scan_global: bool = True) -> Dict:
+        """Scan for legacy index files."""
+
+    def perform_startup_migration(auto_migrate: bool = True) -> MigrationState:
+        """Perform migration with progress tracking."""
+
+    def migrate_on_first_access(project_path: Path) -> bool:
+        """Migrate specific project on first access."""
+```
+
+#### 4. Backup Manager (`registry_backup.py`)
+
+Provides backup and restore functionality:
+
+```python
+class RegistryBackupManager:
+    """
+    Backup and restore registry.
+
+    Features:
+    - Timestamped backups
+    - SHA-256 checksums for integrity
+    - 7-day backup rotation
+    - Filesystem scan recovery
+    - Corruption detection
+    """
+
+    def create_backup(registry: ProjectRegistry) -> BackupMetadata:
+        """
+        Create timestamped backup.
+
+        Returns:
+            BackupMetadata with:
+            - backup_path
+            - project_count
+            - checksum
+            - timestamp
+        """
+
+    def restore_latest_backup(target_path: Path) -> bool:
+        """Restore from most recent backup."""
+
+    def scan_and_recover(target_path: Path) -> List[Dict]:
+        """
+        Recover registry by scanning filesystem.
+
+        Scans for index directories and rebuilds registry
+        from discovered projects.
+        """
+```
+
+#### 5. Backup Scheduler (`backup_scheduler.py`)
+
+Manages automatic periodic backups:
+
+```python
+class BackupScheduler:
+    """
+    Automatic periodic backup scheduling.
+
+    Features:
+    - Startup backup check (backup if >24h)
+    - Background periodic task (24h intervals)
+    - Graceful shutdown handling
+    - Signal handlers (SIGTERM, SIGINT)
+    """
+
+    async def startup_backup_check(registry: ProjectRegistry) -> Tuple[bool, str]:
+        """
+        Check and create backup on startup if needed.
+
+        Returns:
+            (backup_created: bool, message: str)
+        """
+
+    async def start_periodic_backups(registry: ProjectRegistry):
+        """Start background periodic backup task."""
+
+    async def shutdown():
+        """Graceful shutdown - completes in-progress backup."""
+```
+
+#### 6. Registration Integrator (`registration_integrator.py`)
+
+Integrates registration with indexing workflow:
+
+```python
+class RegistrationIntegrator:
+    """
+    Integrates project registration with indexing.
+
+    Automatically registers projects:
+    - After initial indexing
+    - On re-index with changes
+    - During migration
+    """
+
+    def register_after_indexing(
+        project_path: str,
+        index_location: str,
+        file_count: int,
+        stats: Dict,
+    ) -> ProjectInfo:
+        """Register project after indexing completes."""
+
+    def update_on_reindex(
+        project_path: str,
+        file_count: int,
+        stats: Dict,
+    ) -> ProjectInfo:
+        """Update project info after re-index."""
+```
+
+#### 7. Orphan Detector (`orphan_detector.py`)
+
+Detects and cleans up orphaned index directories:
+
+```python
+class OrphanDetector:
+    """
+    Detect orphaned index directories.
+
+    Orphan: Index directory without registry entry.
+
+    Features:
+    - Scans index directories
+    - Compares with registry
+    - Reports orphans
+    - Cleanup options
+    """
+
+    def detect_orphans() -> List[OrphanedIndex]:
+        """
+        Detect orphaned index directories.
+
+        Returns:
+            List of OrphanedIndex with:
+            - path
+            - size
+            - last_modified
+            - reason for orphan status
+        """
+
+    def cleanup_orphans() -> int:
+        """Remove orphaned directories. Returns count cleaned."""
+```
+
+#### 8. MessagePack Serializer (`msgpack_serializer.py`)
+
+Handles MessagePack serialization:
+
+```python
+class MessagePackSerializer:
+    """
+    MessagePack serialization for index data.
+
+    Benefits:
+    - Fast serialization (3-5x vs pickle)
+    - Cross-platform compatibility
+    - Secure (no arbitrary code execution)
+    - Compact file size
+    """
+
+    def write(path: Path, data: Dict) -> None:
+        """Write data to MessagePack file."""
+
+    def read(path: Path) -> Dict:
+        """Read data from MessagePack file."""
+
+    def write_stream(path: Path, data: Iterator) -> None:
+        """Write streaming data for large indexes."""
+
+    def read_stream(path: Path) -> Iterator:
+        """Read streaming data for large indexes."""
+```
+
+### Directory Structure
+
+```
+~/.code-indexer/
+├── registry/
+│   ├── projects.db              # Main registry database
+│   └── backups/                 # Registry backups
+│       ├── projects_20250101.msgpack
+│       ├── projects_20250102.msgpack
+│       └── ...
+└── indexes/                     # Legacy global indexes (deprecated)
+```
+
+```
+<project>/.code-indexer/
+├── files.msgpack               # File index
+├── symbols.msgpack             # Symbol index
+├── content.msgpack             # Content index
+└── backups/                    # Index backups
+    ├── files_20250101.msgpack
+    └── ...
+```
+
+### Data Flow
+
+#### Project Registration Flow
+
+```
+1. User sets project path
+   ↓
+2. IncrementalIndexer indexes project
+   ↓
+3. Indexes written to .code-indexer/
+   ↓
+4. RegistrationIntegrator.register_after_indexing()
+   ↓
+5. ProjectRegistry.insert()
+   ├─ Hash project path (SHA-256)
+   ├─ Check for duplicates
+   └─ Insert into projects table
+   ↓
+6. Backup created (if >24h since last)
+   ↓
+7. Registration complete
+```
+
+#### Migration Flow
+
+```
+1. Server startup
+   ↓
+2. StartupMigrationManager.check_legacy_indexes()
+   ├─ Scan ~/.code-indexer/ for pickle files
+   ├─ Scan project directories for pickle files
+   └─ Return list of legacy files
+   ↓
+3. If auto_migrate=True:
+   └─ IndexMigrator.migrate_file()
+       ├─ Read pickle file
+       ├─ Validate data
+       ├─ Write .msgpack version
+       ├─ Create .pickle.backup
+       └─ Verify success
+   ↓
+4. Track migration in registry metadata
+   ↓
+5. Ready for operation
+```
+
+#### Backup Flow
+
+```
+1. BackupScheduler.startup_backup_check()
+   ↓
+2. Check last backup time (from registry_metadata)
+   ↓
+3. If >24h since last backup:
+   ├─ RegistryBackupManager.create_backup()
+   │   ├─ Begin transaction
+   │   ├─ Read all projects
+   │   ├─ Serialize to MessagePack
+   │   ├─ Calculate SHA-256 checksum
+   │   ├─ Write to timestamped file
+   │   └─ Update last_backup_time metadata
+   └─ Rotate old backups (>7 days)
+   ↓
+4. Start background periodic task (24h interval)
+   ↓
+5. On shutdown:
+   └─ Complete in-progress backup
+       └─ Close registry
+```
+
+#### Recovery Flow
+
+```
+1. Detect corruption (SQLite integrity check fails)
+   ↓
+2. RegistryBackupManager.restore_latest_backup()
+   ├─ Find most recent valid backup
+   ├─ Verify checksum
+   ├─ Close corrupted registry
+   ├─ Restore from backup
+   └─ Reopen registry
+   ↓
+3. If no backup available:
+   └─ scan_and_recover()
+       ├─ Scan filesystem for index directories
+       ├─ Rebuild registry from discovered projects
+       └─ Register all found projects
+   ↓
+4. Registry recovered
+```
+
+### Error Handling
+
+#### Corruption Detection
+
+```python
+# SQLite integrity check
+cursor.execute("PRAGMA integrity_check")
+result = cursor.fetchone()
+
+if result[0] != "ok":
+    # Corruption detected
+    logger.error(f"Registry corrupted: {result[0]}")
+    # Trigger recovery
+    backup_manager.restore_latest_backup(db_path)
+```
+
+#### Signal Handling
+
+```python
+# SIGTERM: Complete in-progress operations
+def sigterm_handler(signum, frame):
+    logger.info("SIGTERM received")
+    # Complete backup
+    if backup_in_progress:
+        wait_for_backup_completion()
+    # Close registry
+    registry.close()
+    sys.exit(0)
+
+# SIGINT: Rollback in-progress writes
+def sigint_handler(signum, frame):
+    logger.info("SIGINT received")
+    # Rollback transaction
+    if transaction_in_progress:
+        registry.rollback()
+    # Close registry
+    registry.close()
+    sys.exit(0)
+```
+
+### Performance Considerations
+
+#### Index Optimization
+
+```sql
+-- Key indexes for performance
+CREATE INDEX idx_projects_path ON projects(path);
+CREATE INDEX idx_projects_path_hash ON projects(path_hash);
+CREATE INDEX idx_projects_indexed_at ON projects(indexed_at);
+```
+
+#### Connection Pooling
+
+```python
+# WAL mode allows concurrent readers
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA busy_timeout=5000")
+```
+
+#### Bulk Operations
+
+```python
+# Efficient bulk insert
+def bulk_insert(projects: List[Dict]):
+    with registry._conn:
+        registry._conn.executemany(
+            "INSERT INTO projects (...) VALUES (...)",
+            [p.values() for p in projects]
+        )
+```
+
+### Security Considerations
+
+#### Path Validation
+
+```python
+# Normalize and validate paths
+def validate_path(path: str) -> Path:
+    path = Path(path).resolve()
+    if not path.exists():
+        raise ValueError(f"Path does not exist: {path}")
+    if not path.is_dir():
+        raise ValueError(f"Path is not a directory: {path}")
+    return path
+```
+
+#### Input Sanitization
+
+```python
+# Sanitize metadata before storage
+def sanitize_metadata(metadata: Dict) -> Dict:
+    # Remove potentially dangerous keys
+    dangerous_keys = ['__class__', '__reduce__', 'eval', 'exec']
+    return {k: v for k, v in metadata.items()
+            if k not in dangerous_keys}
+```
+
+#### Backup Integrity
+
+```python
+# Verify backup with checksum
+def verify_backup(backup_path: Path) -> bool:
+    metadata = read_backup_metadata(backup_path)
+
+    # Calculate checksum
+    with open(backup_path, 'rb') as f:
+        checksum = hashlib.sha256(f.read()).hexdigest()
+
+    return checksum == metadata.checksum
+```
+
+### Migration from v2.0 to v2.1
+
+#### Breaking Changes
+
+1. **Registry Introduction**: New centralized project tracking
+2. **MessagePack Format**: Indexes now use MessagePack instead of pickle
+3. **Automatic Migration**: Legacy pickle files migrated on startup
+4. **Backup System**: New automatic backup and recovery
+
+#### Migration Process
+
+```bash
+# Automatic migration on startup
+code-index-mcp
+
+# Manual migration (if needed)
+python -m code_index_mcp.registry.migrate --format msgpack
+```
+
+#### Rollback
+
+```bash
+# Restore from backup
+python -m code_index_mcp.registry.restore --backup <backup_path>
+```
+
+### Testing
+
+#### Test Coverage
+
+- **Unit Tests**: All registry components (>95% coverage)
+- **Integration Tests**: Full workflow tests
+- **Concurrent Access**: Multi-threaded operations
+- **Corruption Recovery**: Backup and restore scenarios
+- **Signal Handling**: SIGTERM/SIGINT edge cases
+
+#### Test Files
+
+```
+tests/
+├── unit/registry/
+│   ├── test_project_registry.py
+│   ├── test_index_migrator.py
+│   ├── test_msgpack_serializer.py
+│   ├── test_backup_scheduler.py
+│   └── test_registry_backup.py
+└── integration/registry/
+    ├── test_full_indexing_workflow.py
+    ├── test_concurrent_access.py
+    ├── test_corruption_recovery.py
+    └── test_signal_handlers.py
+```
+
+### Future Enhancements
+
+#### Planned Features
+
+1. **Distributed Registry**: Multi-machine registry synchronization
+2. **Registry Replication**: Master-slave replication for high availability
+3. **Advanced Analytics**: Project usage statistics and trends
+4. **Registry API**: REST API for registry operations
+5. **Web Dashboard**: Registry management UI
+
+#### Performance Improvements
+
+1. **Caching Layer**: Redis cache for frequently accessed projects
+2. **Batch Operations**: Bulk insert/update operations
+3. **Async Operations**: Async I/O for better concurrency
+4. **Compression**: Compressed backup storage
+
+The Meta-Registry system provides a robust foundation for managing large-scale code analysis operations with built-in reliability, performance, and security features.

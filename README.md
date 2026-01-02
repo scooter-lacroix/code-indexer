@@ -19,7 +19,17 @@
 
 ## 🚀 Unified Edition - v4.0.0
 
-This version introduces the **Unified Core Engine**, a next-generation search and indexing architecture that seamlessly blends semantic understanding with traditional code search:
+This version introduces the **Meta-Registry System** (v2.1.0) and the **Unified Core Engine**, a next-generation search and indexing architecture:
+
+### 🗂️ **Meta-Registry System (v2.1.0)**
+- **✅ Centralized Project Tracking** - Single SQLite registry for all indexed projects
+- **✅ Automatic Registration** - Projects auto-register during indexing
+- **✅ MessagePack Format** - 3-5x faster serialization than pickle
+- **✅ Automatic Backups** - Periodic backups every 24 hours with 7-day rotation
+- **✅ Corruption Recovery** - Automatic recovery from backup or filesystem scan
+- **✅ Orphan Detection** - Automatic detection of orphaned index directories
+- **✅ Concurrent Access** - WAL mode for multi-reader/concurrent-writer support
+- **✅ Migration Support** - Automatic migration from pickle to MessagePack
 
 ### 🌟 **Unified Core Engine**
 - **✅ Local Vector Search** - FAISS-based semantic search with zero cloud dependencies, zero cost, and full privacy
@@ -221,6 +231,15 @@ For Elasticsearch security configuration (authentication, TLS/SSL, API keys), se
 
 For local vector store architecture, configuration, and supported models, see:
 **[🔍 Local Vector Store Guide](docs/LOCAL_VECTOR_STORE.md)**
+
+For Meta-Registry architecture and implementation details, see:
+**[🗂️ Architecture Documentation](docs/ARCHITECTURE.md)**
+
+For migrating from v2.0 to v2.1.0 with the Meta-Registry system, see:
+**[🔄 Migration Guide v2.1](docs/MIGRATION_GUIDE_v2.1.md)**
+
+For troubleshooting registry and migration issues, see:
+**[🔧 Registry Troubleshooting Guide](docs/TROUBLESHOOTING_REGISTRY.md)**
 
 ## 🤖 Agent Integration
 
