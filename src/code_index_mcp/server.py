@@ -3225,7 +3225,7 @@ async def force_reindex(ctx: Context, clear_cache: bool = True) -> Dict[str, Any
             )
 
             # Save the new index
-            ctx.request_context.lifespan_context.settings.save_index(file_index)
+            ctx.request_context.lifespan_context.settings.save_index(file_index, is_reindex=True)
 
             # Update config with new timestamp
             config = ctx.request_context.lifespan_context.settings.load_config()

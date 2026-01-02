@@ -27,6 +27,7 @@ from .search.ag import AgStrategy
 from .search.grep import GrepStrategy
 from .search.basic import BasicSearchStrategy
 from .registry.msgpack_serializer import MessagePackSerializer, FormatType
+from .registry.registration_integrator import register_after_index_save
 
 
 # Prioritized list of search strategies (highest priority first)
@@ -201,8 +202,23 @@ class OptimizedProjectSettings:
             print(f"Error loading config: {e}")
             return {}
     
-    def save_index(self, file_index: Union[Dict[str, Any], TrieFileIndex, SQLiteFileMetadata]):
-        """Save file index using the configured storage backend."""
+    def save_index(
+        self,
+        file_index: Union[Dict[str, Any], TrieFileIndex, SQLiteFileMetadata],
+        is_reindex: bool = False,
+    ):
+        """Save file index using the configured storage backend.
+
+        Phase 4: Auto-Registration Integration
+        - After MessagePack save, automatically register project in registry
+        - Sequential write pattern: index first, registry second
+        - Graceful failure handling: log warning, continue on registration errors
+        - Update registry on reindex
+
+        Args:
+            file_index: The file index to save
+            is_reindex: Whether this is a reindex operation (updates registry instead of inserting)
+        """
         try:
             if self.storage_backend == 'sqlite':
                 if self.use_trie_index:
@@ -221,18 +237,64 @@ class OptimizedProjectSettings:
                         index_data = {'trie_data': file_index.__dict__}
                     self.msgpack_serializer.write(msgpack_path, index_data)
                     print(f"Trie index saved to: {msgpack_path}")
+
+                    # Phase 4: Auto-register after index save
+                    self._auto_register_after_save(index_data, is_reindex)
                 elif isinstance(self.file_index, SQLiteFileMetadata):
                     # SQLite file index is already persisted
                     print("SQLite file index is automatically persisted")
+
+                    # Phase 4: Auto-register for SQLite indexes too
+                    file_count = self.file_index.count_files() if hasattr(self.file_index, 'count_files') else 0
+                    self._auto_register_after_save({"file_count": file_count}, is_reindex)
                 else:
                     # Dict-based index - save with MessagePack
                     self._save_index_msgpack(file_index)
+
+                    # Phase 4: Auto-register after index save
+                    if isinstance(file_index, dict):
+                        self._auto_register_after_save(file_index, is_reindex)
             else:
                 # Memory-based storage
                 self.file_index = file_index
                 print("Index saved to memory")
         except Exception as e:
             print(f"Error saving index: {e}")
+
+    def _auto_register_after_save(self, index_data: Dict[str, Any], is_reindex: bool = False):
+        """
+        Automatically register project after index save.
+
+        This implements Phase 4 auto-registration:
+        - Sequential write pattern (index first, registry second)
+        - Graceful failure handling (log warning, continue)
+        - Update registry on reindex
+
+        Args:
+            index_data: The index data that was just saved
+            is_reindex: Whether this is a reindex operation
+        """
+        if not self.base_path:
+            # No base path set, skip registration
+            return
+
+        try:
+            # Calculate file count
+            if isinstance(index_data, dict):
+                file_count = index_data.get("file_count", len(index_data))
+            else:
+                file_count = 0
+
+            # Call auto-registration (graceful failure handling built-in)
+            register_after_index_save(
+                project_path=self.base_path,
+                index_data=index_data,
+                file_count=file_count,
+                is_reindex=is_reindex,
+            )
+        except Exception as e:
+            # Graceful failure - log warning but don't fail the save operation
+            print(f"Warning: Auto-registration failed (continuing anyway): {e}")
     
     def _save_index_msgpack(self, file_index: Dict[str, Any]):
         """Save dictionary-based index with MessagePack."""
