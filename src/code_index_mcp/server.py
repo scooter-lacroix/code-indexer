@@ -104,6 +104,11 @@ from .search.ranking import ResultRanker, RankingConfig, SearchResult, PathImpor
 from .api_key_manager import APIKeyManager, create_manager_from_env
 from .stats_dashboard import IndexStatisticsCollector, DashboardStats
 
+# ============================================================================
+# META-REGISTRY: Startup Migration
+# ============================================================================
+from .registry.startup_migration import check_and_migrate_on_startup
+
 # NOTE: FastMCP instance is created below after indexer_lifespan is defined (line ~528)
 # This ensures the lifespan manager is properly attached during initialization.
 
@@ -428,6 +433,29 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
 
     # Initialize DAL instance (use configured backend type)
     dal_instance = get_dal_instance()
+
+    # ============================================================================
+    # META-REGISTRY: Startup Migration (Phase 3)
+    # ============================================================================
+    # Check for and migrate legacy pickle indexes to MessagePack format
+    # This runs automatically on server startup to ensure all indexes are
+    # in the current format before the server starts serving requests
+    logger.info("Checking for legacy pickle indexes that need migration...")
+    try:
+        migration_state = check_and_migrate_on_startup(
+            project_path=base_path_from_config if base_path_from_config else None,
+            auto_migrate=True,
+            project_registry=None  # Could be added later if registry tracking is needed
+        )
+        if migration_state.migration_performed:
+            logger.info(
+                f"Startup migration completed: {migration_state.summary()}"
+            )
+        else:
+            logger.debug("No startup migration required")
+    except Exception as e:
+        # Log error but don't fail startup - migration can be retried later
+        logger.error(f"Error during startup migration: {e}. Continuing with startup...")
 
     # ============================================================================
     # PHASE 7: Initialize API Key Manager and Result Ranker
