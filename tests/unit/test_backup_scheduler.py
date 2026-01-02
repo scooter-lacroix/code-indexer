@@ -18,7 +18,7 @@ import tempfile
 import shutil
 import asyncio
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 from src.code_index_mcp.registry.backup_scheduler import (
@@ -227,7 +227,11 @@ class TestStartupBackupCheck:
 
         # Verify it's a valid datetime
         check_datetime = datetime.fromisoformat(str(check_time))
-        assert (datetime.now() - check_datetime).total_seconds() < 5
+        # Make both datetimes timezone-aware for comparison
+        now = datetime.now(timezone.utc)
+        if check_datetime.tzinfo is None:
+            check_datetime = check_datetime.replace(tzinfo=timezone.utc)
+        assert (now - check_datetime).total_seconds() < 5
 
 
 # =============================================================================

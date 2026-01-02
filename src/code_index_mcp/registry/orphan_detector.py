@@ -6,18 +6,20 @@ on the filesystem but are not registered in the project registry, and
 offers recovery options to register or clean them up.
 """
 
+# Standard library imports
+import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
-import logging
-from datetime import datetime
 
-from .project_registry import ProjectRegistry, ProjectInfo
+# Local application imports
 from .directories import (
     get_global_registry_dir,
-    get_project_registry_dir,
     get_project_index_dir,
+    get_project_registry_dir,
 )
+from .project_registry import ProjectInfo, ProjectRegistry
 
 logger = logging.getLogger(__name__)
 
@@ -169,6 +171,13 @@ class OrphanDetector:
         This method performs a depth-first search of the configured search
         paths, looking for .code-indexer directories that are not registered
         in the project registry.
+
+        Symlink handling:
+        - By default, symbolic links are NOT followed (follow_symlinks=False)
+        - When a symlinked project is detected, it is checked against the
+          registry using its resolved path
+        - If follow_symlinks=True, symlinks are followed and the target
+          directory is scanned
 
         Args:
             max_depth: Maximum directory depth to search (default: 3)
@@ -356,7 +365,7 @@ class OrphanDetector:
                 reason=reason,
             )
 
-        except (PermissionError, OSError) as e:
+        except (PermissionError, OSError, ValueError) as e:
             logger.debug(f"Error checking {project_path}: {e}")
             return None
 
@@ -397,14 +406,17 @@ class OrphanDetector:
             stats = {
                 "index_size_bytes": orphan.index_size,
                 "recovered_at": datetime.now().isoformat(),
+                "file_count_estimated": True,
+                "file_count_note": "File count is unavailable for recovered orphan projects",
             }
 
         try:
             # Determine indexed_at from last_modified
             indexed_at = orphan.last_modified if orphan.last_modified else datetime.now()
 
-            # Count files (estimate based on index size)
-            file_count = max(1, orphan.index_size // 1000)  # Rough estimate
+            # File count is not reliably available for orphaned projects
+            # Use 0 with explicit documentation in stats instead of unreliable estimation
+            file_count = 0
 
             # Register the project
             project_info = self.registry.insert(
@@ -560,3 +572,31 @@ class OrphanDetector:
             f"{success_count} succeeded, {failure_count} failed"
         )
         return success_count, failure_count, failed_paths
+
+    # ------------------------------------------------------------------------
+    # Convenience Methods (for backward compatibility with tests)
+    # ------------------------------------------------------------------------
+
+    def detect_orphans(self) -> List[OrphanedProject]:
+        """
+        Detect orphaned projects using default settings.
+
+        Convenience method that calls scan_for_orphans with default parameters.
+
+        Returns:
+            List of OrphanedProject instances
+        """
+        return self.scan_for_orphans()
+
+    def cleanup_orphans(self) -> int:
+        """
+        Detect and clean up all orphaned projects.
+
+        Convenience method that detects orphans and cleans them up.
+
+        Returns:
+            Number of orphans successfully cleaned up
+        """
+        orphans = self.detect_orphans()
+        success_count, _, _ = self.cleanup_all_orphans(orphans)
+        return success_count

@@ -5,14 +5,15 @@ This module provides serialization support for index data with format detection
 and migration capabilities from the legacy pickle format to MessagePack.
 """
 
+# Standard library imports
+import logging
 import os
 import pickle
-import hashlib
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
-from enum import Enum
-import logging
 
+# Third-party imports
 try:
     import msgpack
 except ImportError:
@@ -20,6 +21,9 @@ except ImportError:
         "msgpack is required for serialization. "
         "Install it with: pip install msgpack"
     )
+
+# Local application imports
+from .checksum_utils import compute_sha256_checksum
 
 logger = logging.getLogger(__name__)
 
@@ -107,6 +111,12 @@ class MessagePackSerializer:
         Detection strategy:
         1. Check file extension
         2. If extension is unknown, inspect file content
+        3. If content is ambiguous, try both parsers
+
+        Note on ambiguity:
+        - Magic byte detection can produce false positives
+        - When extension is unknown, both parsers are tried
+        - The first successful parser determines the format
 
         Args:
             file_path: Path to the file to inspect
@@ -124,7 +134,7 @@ class MessagePackSerializer:
         """
         file_path = Path(file_path)
 
-        # Check file extension first
+        # Check file extension first (most reliable)
         if file_path.suffix == MSGPACK_EXT:
             logger.debug(f"Detected MessagePack format by extension: {file_path}")
             return FormatType.MSGPACK
@@ -159,16 +169,59 @@ class MessagePackSerializer:
                         return FormatType.PICKLE
 
                 # Check for MessagePack (most common markers)
+                # Note: This can produce false positives, so we verify by trying to parse
                 if first_byte[0] in MSGPACK_MAGIC_PREFIX:
-                    logger.debug(f"Detected MessagePack format by content: {file_path}")
-                    return FormatType.MSGPACK
+                    # Try to parse as MessagePack to confirm
+                    f.seek(0)
+                    try:
+                        msgpack.unpackb(f.read(), raw=False)
+                        logger.debug(f"Detected MessagePack format by content: {file_path}")
+                        return FormatType.MSGPACK
+                    except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
+                        # Not valid MessagePack, might be pickle or unknown
+                        logger.debug(f"Magic byte matched MessagePack but parsing failed for: {file_path}")
 
-                logger.debug(f"Could not detect format for: {file_path}")
-                return FormatType.UNKNOWN
+                # If we get here, content inspection was inconclusive
+                # For files with no extension, try pickle as fallback
+                logger.debug(f"Format detection inconclusive for: {file_path}, trying parsers")
+                return self._try_both_parsers(file_path)
 
         except (IOError, OSError) as e:
             logger.error(f"Error detecting format for {file_path}: {e}")
             return FormatType.UNKNOWN
+
+    def _try_both_parsers(self, file_path: Path) -> FormatType:
+        """
+        Try both parsers to determine file format.
+
+        This is used when magic byte detection is inconclusive.
+
+        Args:
+            file_path: Path to the file
+
+        Returns:
+            FormatType if one parser succeeds, UNKNOWN otherwise
+        """
+        # Try MessagePack first (preferred format)
+        try:
+            with open(file_path, "rb") as f:
+                data = msgpack.unpackb(f.read(), raw=False)
+            logger.debug(f"Parsed as MessagePack: {file_path}")
+            return FormatType.MSGPACK
+        except (msgpack.exceptions.ExtraData, msgpack.exceptions.UnpackException):
+            pass
+
+        # Try pickle
+        try:
+            with open(file_path, "rb") as f:
+                pickle.load(f)
+            logger.debug(f"Parsed as pickle: {file_path}")
+            return FormatType.PICKLE
+        except (pickle.PickleError, EOFError):
+            pass
+
+        logger.debug(f"Could not parse with either format: {file_path}")
+        return FormatType.UNKNOWN
 
     # ------------------------------------------------------------------------
     # Reading Data
@@ -246,6 +299,10 @@ class MessagePackSerializer:
         """
         Read data from a pickle file (read-only, for migration).
 
+        SECURITY WARNING: Pickle can execute arbitrary code when deserializing.
+        Only load pickle files from trusted sources. This method is intended
+        for migration purposes only and should be used with caution.
+
         Args:
             file_path: Path to the pickle file
 
@@ -255,6 +312,12 @@ class MessagePackSerializer:
         Raises:
             IOError: If there's an error reading or parsing the file
         """
+        # Security warning: pickle can execute arbitrary code
+        logger.warning(
+            f"Loading pickle file for migration: {file_path}. "
+            "Pickle can execute arbitrary code - only load from trusted sources!"
+        )
+
         try:
             with open(file_path, "rb") as f:
                 data = pickle.load(f)
@@ -374,27 +437,11 @@ class MessagePackSerializer:
 
         Raises:
             FileNotFoundError: If the file doesn't exist
+            PermissionError: If the file cannot be read due to permissions
             IOError: If there's an error reading the file
+            OSError: For other filesystem-related errors
         """
-        file_path = Path(file_path)
-
-        if not file_path.exists():
-            raise FileNotFoundError(f"File not found: {file_path}")
-
-        sha256 = hashlib.sha256()
-
-        try:
-            with open(file_path, "rb") as f:
-                for chunk in iter(lambda: f.read(8192), b""):
-                    sha256.update(chunk)
-
-            hash_hex = sha256.hexdigest()
-            logger.debug(f"Computed SHA-256 hash for {file_path}: {hash_hex}")
-            return hash_hex
-
-        except IOError as e:
-            logger.error(f"Error computing hash for {file_path}: {e}")
-            raise IOError(f"Failed to compute file hash: {e}") from e
+        return compute_sha256_checksum(file_path)
 
     def validate_index_file(self, file_path: str | Path) -> tuple[bool, Optional[str]]:
         """
@@ -404,6 +451,7 @@ class MessagePackSerializer:
         - File exists and is readable
         - File has valid format (MessagePack or pickle)
         - Data can be deserialized
+        - Schema validation for expected keys
 
         Args:
             file_path: Path to the index file
@@ -445,10 +493,30 @@ class MessagePackSerializer:
             if not isinstance(data, dict):
                 return False, f"Data is not dict-like: {type(data)}"
 
+            # Schema validation: check for expected keys
+            # At minimum, index data should have one of:
+            # - "files" (dict of file entries)
+            # - "file_count" (int)
+            # - "indexed_at" (timestamp)
+            expected_keys = {"files", "file_count", "indexed_at"}
+            if not any(key in data for key in expected_keys):
+                return False, (
+                    f"Data missing expected keys. "
+                    f"Expected at least one of: {expected_keys}. "
+                    f"Found keys: {set(data.keys())}"
+                )
+
+            # Validate types of critical fields if present
+            if "files" in data and not isinstance(data["files"], (dict, list)):
+                return False, f"Field 'files' has invalid type: {type(data['files'])}"
+
+            if "file_count" in data and not isinstance(data["file_count"], int):
+                return False, f"Field 'file_count' has invalid type: {type(data['file_count'])}"
+
             logger.debug(f"Validated index file: {file_path}")
             return True, None
 
-        except Exception as e:
+        except (ValueError, IOError, OSError) as e:
             error_msg = f"Failed to read index file: {e}"
             logger.error(f"Validation failed for {file_path}: {error_msg}")
             return False, error_msg

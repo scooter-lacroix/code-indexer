@@ -33,6 +33,7 @@ from src.code_index_mcp.registry.directories import (
 )
 from src.code_index_mcp.registry.orphan_detector import OrphanDetector
 from src.code_index_mcp.registry.registration_integrator import RegistrationIntegrator
+from src.code_index_mcp.registry.registry_backup import RegistryBackupManager
 
 
 # ============================================================================
@@ -216,8 +217,19 @@ class TestFullIndexingWorkflow:
         index_dir = get_project_index_dir(temp_project_dir)
         index_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create orphan detector
-        detector = OrphanDetector(registry=registry)
+        # Create a dummy index file
+        serializer = MessagePackSerializer()
+        index_path = index_dir / "files.msgpack"
+        serializer.write(index_path, {
+            "files": ["src/main.py"],
+            "file_count": 1,
+        })
+
+        # Create orphan detector with search path
+        detector = OrphanDetector(
+            registry=registry,
+            search_paths=[str(temp_project_dir.parent)]
+        )
 
         # Detect orphans
         orphans = detector.detect_orphans()
@@ -234,8 +246,19 @@ class TestFullIndexingWorkflow:
         index_dir = get_project_index_dir(temp_project_dir)
         index_dir.mkdir(parents=True, exist_ok=True)
 
-        # Create orphan detector
-        detector = OrphanDetector(registry=registry)
+        # Create a dummy index file
+        serializer = MessagePackSerializer()
+        index_path = index_dir / "files.msgpack"
+        serializer.write(index_path, {
+            "files": ["src/main.py"],
+            "file_count": 1,
+        })
+
+        # Create orphan detector with search path
+        detector = OrphanDetector(
+            registry=registry,
+            search_paths=[str(temp_project_dir.parent)]
+        )
 
         # Clean up orphans
         cleaned = detector.cleanup_orphans()
@@ -544,7 +567,8 @@ class TestBackupIntegration:
         self, temp_project_dir, registry_with_temp_db
     ):
         """Should restore registry from backup after corruption."""
-        registry, db_path = registry_with_temp_db
+        registry, tmpdir = registry_with_temp_db
+        db_path = Path(tmpdir) / "test_registry.db"
 
         # Register project
         now = datetime.now()
@@ -558,8 +582,8 @@ class TestBackupIntegration:
         )
 
         # Create backup
-        with tempfile.TemporaryDirectory() as tmpdir:
-            backup_dir = Path(tmpdir) / "backups"
+        with tempfile.TemporaryDirectory() as backup_tmpdir:
+            backup_dir = Path(backup_tmpdir) / "backups"
             backup_dir.mkdir()
 
             backup_manager = RegistryBackupManager(backup_dir=backup_dir)

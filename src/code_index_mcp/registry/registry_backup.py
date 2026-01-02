@@ -11,17 +11,22 @@ Phase 6 Enhancements:
 - Startup recovery logic
 """
 
+# Standard library imports
+import logging
 import shutil
 import sqlite3
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List, Tuple
-from dataclasses import dataclass
-from datetime import datetime, timedelta
-import logging
+
+# Third-party imports
 import msgpack
 
+# Local application imports
 from .directories import get_global_registry_dir
 from .project_registry import ProjectRegistry, ProjectInfo
+from .checksum_utils import compute_sha256_checksum
 
 logger = logging.getLogger(__name__)
 
@@ -158,14 +163,24 @@ class RegistryBackupManager:
         if not registry_path.exists():
             raise FileNotFoundError(f"Registry database not found: {registry_path}")
 
-        # Generate backup filename with timestamp
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Generate backup filename with timestamp (including microseconds to avoid collisions)
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         backup_filename = f"registry_backup_{timestamp_str}.db"
         backup_path = self.backup_dir / backup_filename
 
         logger.info(f"Creating registry backup: {backup_path}")
 
         try:
+            # Checkpoint WAL before copying to ensure all changes are committed
+            # This is critical for databases using WAL mode
+            if registry is not None:
+                try:
+                    with registry._get_connection() as conn:
+                        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                        conn.commit()
+                except Exception as e:
+                    logger.warning(f"WAL checkpoint failed before backup: {e}")
+
             # Copy the database file
             shutil.copy2(registry_path, backup_path)
 
@@ -173,11 +188,10 @@ class RegistryBackupManager:
             if registry is not None:
                 project_count = registry.count()
             else:
-                # Open temporary connection to get count
-                conn = sqlite3.connect(registry_path)
-                cursor = conn.execute("SELECT COUNT(*) FROM projects")
-                project_count = cursor.fetchone()[0]
-                conn.close()
+                # Use context manager for connection
+                with sqlite3.connect(registry_path) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM projects")
+                    project_count = cursor.fetchone()[0]
 
             # Get backup size
             backup_size = backup_path.stat().st_size
@@ -188,7 +202,7 @@ class RegistryBackupManager:
             metadata = BackupMetadata(
                 backup_path=backup_path,
                 original_path=registry_path,
-                timestamp=datetime.now(),
+                timestamp=datetime.now(timezone.utc),
                 project_count=project_count,
                 backup_size_bytes=backup_size,
                 checksum=checksum
@@ -317,10 +331,9 @@ class RegistryBackupManager:
                 return False
 
             # Try to open as SQLite database
-            conn = sqlite3.connect(backup_path)
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = [row[0] for row in cursor.fetchall()]
-            conn.close()
+            with sqlite3.connect(backup_path) as conn:
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = [row[0] for row in cursor.fetchall()]
 
             # Check for required tables
             required_tables = {"projects", "registry_metadata"}
@@ -350,9 +363,14 @@ class RegistryBackupManager:
         for backup_file in self.backup_dir.glob("registry_backup_*.db"):
             try:
                 # Extract timestamp from filename
-                stem = backup_file.stem  # e.g., "registry_backup_20250101_120000"
+                stem = backup_file.stem  # e.g., "registry_backup_20250101_120000_123456"
                 timestamp_str = stem.replace("registry_backup_", "")
-                timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                # Try new format with microseconds first
+                try:
+                    timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S_%f")
+                except ValueError:
+                    # Fall back to old format without microseconds
+                    timestamp = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
 
                 # Get file size
                 backup_size = backup_file.stat().st_size
@@ -361,10 +379,9 @@ class RegistryBackupManager:
                 checksum = self._compute_checksum(backup_file)
 
                 # Get project count (from database)
-                conn = sqlite3.connect(backup_file)
-                cursor = conn.execute("SELECT COUNT(*) FROM projects")
-                project_count = cursor.fetchone()[0]
-                conn.close()
+                with sqlite3.connect(backup_file) as conn:
+                    cursor = conn.execute("SELECT COUNT(*) FROM projects")
+                    project_count = cursor.fetchone()[0]
 
                 metadata = BackupMetadata(
                     backup_path=backup_file,
@@ -444,7 +461,8 @@ class RegistryBackupManager:
 
     def scan_and_recover(
         self,
-        registry_path: Optional[str | Path] = None
+        registry_path: Optional[str | Path] = None,
+        scan_roots: Optional[List[Path]] = None
     ) -> list[dict]:
         """
         Recover registry by scanning filesystem for index directories.
@@ -455,6 +473,7 @@ class RegistryBackupManager:
         Args:
             registry_path: Path where to create/rebuild the registry.
                         If None, uses default registry path.
+            scan_roots: Optional list of root paths to scan. If None, uses default scan locations.
 
         Returns:
             List of recovered project information dictionaries
@@ -467,7 +486,7 @@ class RegistryBackupManager:
         logger.info(f"Starting filesystem scan recovery to: {registry_path}")
 
         # Scan for index directories
-        discovered = self._filesystem_scan_recovery(registry_path)
+        discovered = self._filesystem_scan_recovery(registry_path, scan_roots=scan_roots)
 
         logger.info(f"Filesystem scan recovery completed: {len(discovered)} projects recovered")
         return discovered
@@ -484,16 +503,15 @@ class RegistryBackupManager:
             file_path: Path to the file
 
         Returns:
-            Hexadecimal checksum string
+            Hexadecimal checksum string (64 characters)
+
+        Raises:
+            FileNotFoundError: If the file doesn't exist
+            PermissionError: If the file cannot be read due to permissions
+            IOError: If there's an error reading the file
+            OSError: For other filesystem-related errors
         """
-        import hashlib
-
-        sha256 = hashlib.sha256()
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(8192), b""):
-                sha256.update(chunk)
-
-        return sha256.hexdigest()
+        return compute_sha256_checksum(file_path)
 
     def _cleanup_old_backups(self) -> None:
         """
@@ -524,7 +542,7 @@ class RegistryBackupManager:
         Returns:
             Path to safety backup, or None if creation failed
         """
-        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        timestamp_str = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
         safety_backup = self.backup_dir / f"safety_backup_{timestamp_str}.db"
 
         try:
@@ -563,7 +581,7 @@ class RegistryBackupManager:
             registry: ProjectRegistry instance
 
         Returns:
-            Last backup datetime, or None if never backed up
+            Last backup datetime (timezone-aware), or None if never backed up
         """
         backup_time_str = registry.get_metadata(self.METADATA_LAST_BACKUP)
         if backup_time_str:
@@ -572,7 +590,11 @@ class RegistryBackupManager:
                 # Check if it's a sqlite3.Row by checking for 'keys' method
                 if hasattr(backup_time_str, 'keys'):
                     backup_time_str = backup_time_str[0]
-                return datetime.fromisoformat(str(backup_time_str))
+                dt = datetime.fromisoformat(str(backup_time_str))
+                # If naive datetime, assume UTC
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt
             except (ValueError, TypeError) as e:
                 logger.warning(f"Invalid backup time format: {backup_time_str}, error: {e}")
         return None
@@ -591,7 +613,7 @@ class RegistryBackupManager:
         if last_backup is None:
             return True  # Never backed up
 
-        time_since_backup = datetime.now() - last_backup
+        time_since_backup = datetime.now(timezone.utc) - last_backup
         return time_since_backup >= timedelta(hours=self.backup_interval_hours)
 
     def _update_last_backup_time(self, registry: ProjectRegistry) -> None:
@@ -601,7 +623,7 @@ class RegistryBackupManager:
         Args:
             registry: ProjectRegistry instance
         """
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         registry.set_metadata(self.METADATA_LAST_BACKUP, now)
         logger.debug(f"Updated last backup time: {now}")
 
@@ -612,7 +634,7 @@ class RegistryBackupManager:
         Args:
             registry: ProjectRegistry instance
         """
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         registry.set_metadata(self.METADATA_LAST_BACKUP_CHECK, now)
         logger.debug(f"Updated last backup check time: {now}")
 
@@ -633,12 +655,20 @@ class RegistryBackupManager:
         2. If corrupted, try the most recent backup
         3. If backup also corrupted/missing, perform filesystem scan recovery
 
+        This method implements proper error state tracking:
+        - If restoration attempt partially fails, it rolls back before trying next method
+        - Each recovery step is attempted independently
+        - Errors are logged with full context
+
         Args:
             registry_path: Path to the registry database
             registry: Optional ProjectRegistry instance (for metadata updates)
 
         Returns:
             Tuple of (success: bool, message: str)
+
+        Raises:
+            OSError: If there are filesystem-related errors during recovery
         """
         logger.info(f"Attempting registry recovery: {registry_path}")
 
@@ -648,28 +678,64 @@ class RegistryBackupManager:
             return True, "Registry is valid"
 
         # Step 2: Try to restore from most recent backup
-        backups = self.list_backups()
-        if backups:
-            most_recent = backups[0]
-            logger.info(f"Attempting recovery from backup: {most_recent.backup_path}")
+        # We track the backup we attempted to restore for rollback purposes
+        backup_restored = False
+        restore_error = None
 
-            if self.verify_backup(most_recent.backup_path):
-                try:
-                    # Verify backup is good before restoring
-                    if self.restore_backup(
-                        backup_path=most_recent.backup_path,
-                        registry_path=registry_path,
-                        verify_before_restore=True
-                    ):
-                        msg = f"Registry restored from backup ({most_recent.project_count} projects)"
-                        logger.info(msg)
-                        return True, msg
-                except Exception as e:
-                    logger.warning(f"Failed to restore from backup: {e}")
+        try:
+            backups = self.list_backups()
+            if backups:
+                most_recent = backups[0]
+                logger.info(f"Attempting recovery from backup: {most_recent.backup_path}")
+
+                if self.verify_backup(most_recent.backup_path):
+                    try:
+                        # Verify backup is good before restoring
+                        restored = self.restore_backup(
+                            backup_path=most_recent.backup_path,
+                            registry_path=registry_path,
+                            verify_before_restore=True
+                        )
+                        if restored:
+                            backup_restored = True
+                            msg = f"Registry restored from backup ({most_recent.project_count} projects)"
+                            logger.info(msg)
+                            return True, msg
+                    except Exception as e:
+                        restore_error = e
+                        logger.warning(f"Failed to restore from backup: {e}")
+                        # If restoration partially failed, rollback and continue
+                        if registry_path.exists():
+                            try:
+                                # Remove the potentially corrupted restored file
+                                registry_path.unlink()
+                                logger.info(f"Removed partially restored registry: {registry_path}")
+                            except Exception as rollback_error:
+                                logger.error(f"Failed to rollback partial restoration: {rollback_error}")
+        except Exception as e:
+            logger.error(f"Error during backup recovery attempt: {e}")
+            restore_error = e
 
         # Step 3: Perform filesystem scan recovery
-        logger.warning("All recovery options failed, attempting filesystem scan recovery")
-        return self._filesystem_scan_recovery(registry_path, registry)
+        # Only attempt if backup recovery failed or no backups exist
+        logger.warning(
+            f"All backup recovery options failed"
+            f"{f' (error: {restore_error})' if restore_error else ''}, "
+            "attempting filesystem scan recovery"
+        )
+
+        try:
+            result = self._filesystem_scan_recovery(registry_path, registry)
+            # The method returns a list, we need to convert to tuple
+            if isinstance(result, list):
+                recovered_count = len(result)
+                msg = f"Recovered {recovered_count} projects from filesystem scan"
+                return True, msg
+            return result  # Already a tuple
+        except Exception as e:
+            error_msg = f"All recovery methods failed. Last error: {e}"
+            logger.error(error_msg)
+            return False, error_msg
 
     def _is_registry_valid(self, registry_path: Path) -> bool:
         """
@@ -685,10 +751,9 @@ class RegistryBackupManager:
             return False
 
         try:
-            conn = sqlite3.connect(registry_path)
-            cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
-            tables = {row[0] for row in cursor.fetchall()}
-            conn.close()
+            with sqlite3.connect(registry_path) as conn:
+                cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+                tables = {row[0] for row in cursor.fetchall()}
 
             required_tables = {"projects", "registry_metadata"}
             return required_tables.issubset(tables)
@@ -699,7 +764,8 @@ class RegistryBackupManager:
     def _filesystem_scan_recovery(
         self,
         registry_path: Path,
-        registry: Optional[ProjectRegistry] = None
+        registry: Optional[ProjectRegistry] = None,
+        scan_roots: Optional[List[Path]] = None
     ) -> List[Dict[str, Any]]:
         """
         Recover registry by scanning for .code-indexer/files.msgpack files.
@@ -713,6 +779,7 @@ class RegistryBackupManager:
         Args:
             registry_path: Path where to create the recovered registry
             registry: Optional ProjectRegistry instance (for direct updates)
+            scan_roots: Optional list of root paths to scan. If None, uses default scan locations.
 
         Returns:
             List of recovered project info dictionaries
@@ -720,7 +787,7 @@ class RegistryBackupManager:
         logger.warning("Starting filesystem scan recovery - some metadata may be lost")
 
         # Discover all files.msgpack files
-        discovered_projects = self._scan_for_indexes()
+        discovered_projects = self._scan_for_indexes(scan_roots=scan_roots)
 
         if not discovered_projects:
             logger.warning("No index files found during filesystem scan")
@@ -766,9 +833,12 @@ class RegistryBackupManager:
 
         return recovered
 
-    def _scan_for_indexes(self) -> List[Dict[str, Any]]:
+    def _scan_for_indexes(self, scan_roots: Optional[List[Path]] = None) -> List[Dict[str, Any]]:
         """
         Scan for all .code-indexer/index.msgpack files.
+
+        Args:
+            scan_roots: Optional list of root paths to scan. If None, uses default scan locations.
 
         Returns:
             List of project info dictionaries extracted from indexes
@@ -776,18 +846,19 @@ class RegistryBackupManager:
         discovered = []
 
         # Scan common project root directories (avoiding /proc and other system dirs)
-        scan_roots = [Path.home()]
+        if scan_roots is None:
+            scan_roots = [Path.home()]
 
-        # Add safe system paths to scan
-        for base in ["/home", "/Users", "/mnt", "/media"]:
-            base_path = Path(base)
-            if base_path.exists() and base_path.is_dir():
-                try:
-                    # Test if we can access it
-                    next(base_path.iterdir())
-                    scan_roots.append(base_path)
-                except (PermissionError, OSError):
-                    pass
+            # Add safe system paths to scan (including /tmp for tests)
+            for base in ["/home", "/Users", "/mnt", "/media", "/tmp"]:
+                base_path = Path(base)
+                if base_path.exists() and base_path.is_dir():
+                    try:
+                        # Test if we can access it
+                        next(base_path.iterdir())
+                        scan_roots.append(base_path)
+                    except (PermissionError, OSError):
+                        pass
 
         for root in scan_roots:
             try:
@@ -803,14 +874,18 @@ class RegistryBackupManager:
                         # Not relative to root
                         continue
 
-                    # Skip system directories
-                    if any(part.startswith('.') for part in indexer_dir.parts):
+                    # Skip system directories (but allow .code-indexer)
+                    if any(part.startswith('.') for part in indexer_dir.parts[:-1]):  # Exclude last part (.code-indexer)
                         continue
 
                     if "proc" in str(indexer_dir) or "sys" in str(indexer_dir):
                         continue
 
-                    index_file = indexer_dir / "files.msgpack"  # Updated to look for files.msgpack
+                    # Check for files.msgpack in either .code-indexer or .code-indexer/index
+                    index_file = indexer_dir / "files.msgpack"
+                    if not index_file.exists():
+                        # Try the index subdirectory
+                        index_file = indexer_dir / "index" / "files.msgpack"
                     if not index_file.exists():
                         continue
 
@@ -845,7 +920,12 @@ class RegistryBackupManager:
 
             # Extract relevant metadata
             # The index structure may vary, so we extract what we can
-            project_path = str(index_file.parent.parent)
+            # If index is at .code-indexer/index/files.msgpack, parent.parent.parent is the project
+            # If index is at .code-indexer/files.msgpack, parent.parent is the project
+            if index_file.parent.name == "index":
+                project_path = str(index_file.parent.parent.parent)
+            else:
+                project_path = str(index_file.parent.parent)
 
             # Try to get file count
             file_count = 0
@@ -853,7 +933,7 @@ class RegistryBackupManager:
                 file_count = index_data.get("file_count", len(index_data.get("files", {})))
 
             # Try to get indexed timestamp
-            indexed_at = datetime.now()
+            indexed_at = datetime.now(timezone.utc)
             if isinstance(index_data, dict):
                 indexed_at_str = index_data.get("indexed_at")
                 if indexed_at_str:

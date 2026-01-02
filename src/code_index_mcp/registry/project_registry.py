@@ -5,16 +5,22 @@ This module provides a SQLite-based registry for tracking indexed projects,
 their metadata, configurations, and statistics.
 """
 
+# Standard library imports
 import sqlite3
 import hashlib
 import json
+import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from dataclasses import dataclass, asdict
-from datetime import datetime
-import logging
 
+# Third-party imports
+from dataclasses import dataclass, asdict
+
+# Local application imports
 from .directories import get_registry_db_path
+from .checksum_utils import compute_sha256_hash
+from .validation_utils import validate_and_normalize_path
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +141,11 @@ class ProjectRegistry:
         db_path: Path to the SQLite database file
     """
 
+    # Allowed sort columns for SQL injection protection
+    ALLOWED_SORT_COLUMNS = {
+        "indexed_at", "path", "file_count", "created_at", "updated_at", "id"
+    }
+
     # SQL Schema definitions
     SQL_CREATE_PROJECTS_TABLE = """
         CREATE TABLE IF NOT EXISTS projects (
@@ -240,9 +251,28 @@ class ProjectRegistry:
             >>> ProjectRegistry._hash_path("/home/user/project")
             'a1b2c3d4e5f6...'
         """
-        sha256 = hashlib.sha256()
-        sha256.update(path.encode('utf-8'))
-        return sha256.hexdigest()
+        return compute_sha256_hash(path)
+
+    @staticmethod
+    def _validate_path(path: str) -> str:
+        """
+        Validate and normalize a path string.
+
+        Args:
+            path: Path string to validate
+
+        Returns:
+            Normalized absolute path string
+
+        Raises:
+            ValueError: If path is not absolute or contains invalid components
+            TypeError: If path is not a string or Path object
+
+        Examples:
+            >>> ProjectRegistry._validate_path("/home/user/project")
+            '/home/user/project'
+        """
+        return validate_and_normalize_path(path, param_name="path")
 
     # ------------------------------------------------------------------------
     # CRUD Operations
@@ -272,9 +302,12 @@ class ProjectRegistry:
             Created ProjectInfo
 
         Raises:
+            ValueError: If path is not absolute
             DuplicateProjectError: If project already exists
             RegistryError: On database errors
         """
+        # Validate and normalize path
+        path = self._validate_path(path)
         path_hash = self._hash_path(path)
 
         try:
@@ -343,9 +376,13 @@ class ProjectRegistry:
             Updated ProjectInfo
 
         Raises:
+            ValueError: If path is not absolute
             ProjectNotFoundError: If project doesn't exist
             RegistryError: On database errors
         """
+        # Validate and normalize path
+        path = self._validate_path(path)
+
         # Build update query dynamically based on provided fields
         updates = []
         params = []
@@ -388,8 +425,15 @@ class ProjectRegistry:
 
                 logger.info(f"Updated project: {path}")
 
-                # Fetch and return updated project
-                return self.get_by_path(path)
+                # Use same connection to fetch updated project (avoids TOCTOU)
+                cursor = conn.execute("SELECT * FROM projects WHERE path = ?", (path,))
+                row = cursor.fetchone()
+
+                if row is None:
+                    # This shouldn't happen after rowcount check, but handle it
+                    raise ProjectNotFoundError(path)
+
+                return self._row_to_project_info(row)
 
         except sqlite3.Error as e:
             raise RegistryError(f"Failed to update project: {e}") from e
@@ -434,8 +478,12 @@ class ProjectRegistry:
             ProjectInfo
 
         Raises:
+            ValueError: If path is not absolute
             ProjectNotFoundError: If project doesn't exist
         """
+        # Validate and normalize path
+        path = self._validate_path(path)
+
         try:
             with self._get_connection() as conn:
                 cursor = conn.execute(
@@ -522,7 +570,17 @@ class ProjectRegistry:
 
         Returns:
             List of ProjectInfo
+
+        Raises:
+            ValueError: If order_by contains an invalid column name
         """
+        # Validate order_by parameter to prevent SQL injection
+        if order_by not in self.ALLOWED_SORT_COLUMNS:
+            raise ValueError(
+                f"Invalid order_by column '{order_by}'. "
+                f"Allowed columns: {sorted(self.ALLOWED_SORT_COLUMNS)}"
+            )
+
         try:
             direction = "DESC" if descending else "ASC"
             query = f"SELECT * FROM projects ORDER BY {order_by} {direction}"
@@ -655,12 +713,18 @@ class ProjectRegistry:
             index_location=row["index_location"]
         )
 
-    def close(self) -> None:
+    def close(self) -> bool:
         """
         Close the registry and perform cleanup.
 
         Note: SQLite connections are managed per-operation, so this is
         primarily for resource cleanup in tests or explicit shutdown.
+
+        Returns:
+            True if WAL checkpoint succeeded, False otherwise
+
+        Raises:
+            RegistryError: On critical errors during cleanup
         """
         # Checkpoint WAL to ensure all changes are committed
         try:
@@ -669,6 +733,37 @@ class ProjectRegistry:
                 conn.commit()
 
             logger.info(f"Registry closed: {self.db_path}")
+            return True
 
         except sqlite3.Error as e:
-            logger.warning(f"Error during WAL checkpoint: {e}")
+            # Log as ERROR since this is a cleanup operation that should succeed
+            logger.error(f"Error during WAL checkpoint for {self.db_path}: {e}")
+            # Return False to indicate failure, but don't raise exception
+            # to allow cleanup to continue
+            return False
+
+    def __enter__(self):
+        """
+        Context manager entry.
+
+        Returns:
+            Self
+        """
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Context manager exit.
+
+        Ensures registry is properly closed on exit.
+
+        Args:
+            exc_type: Exception type if raised
+            exc_val: Exception value if raised
+            exc_tb: Exception traceback if raised
+
+        Returns:
+            False (don't suppress exceptions)
+        """
+        self.close()
+        return False

@@ -1,14 +1,11 @@
-"""
-Directory management utilities for the meta-registry system.
-
-This module provides utilities for managing global and per-project directories
-used by the code indexer's meta-registry feature.
-"""
-
+# Standard library imports
+import logging
 import os
 from pathlib import Path
 from typing import Optional
-import logging
+
+# Local application imports
+from .validation_utils import validate_and_normalize_path, validate_index_name
 
 logger = logging.getLogger(__name__)
 
@@ -64,20 +61,15 @@ def get_project_registry_dir(project_path: str | Path) -> Path:
 
     Raises:
         ValueError: If project_path is empty or not an absolute path
+        TypeError: If project_path is not a string or Path object
 
     Examples:
         >>> get_project_registry_dir("/home/user/myproject")
         Path('/home/user/myproject/.code-indexer')
     """
-    if not project_path:
-        raise ValueError("project_path cannot be empty")
-
-    project_path_obj = Path(project_path)
-
-    if not project_path_obj.is_absolute():
-        raise ValueError(
-            f"project_path must be an absolute path, got: {project_path}"
-        )
+    # Validate and normalize the path
+    normalized_path = validate_and_normalize_path(project_path, param_name="project_path")
+    project_path_obj = Path(normalized_path)
 
     project_dir = project_path_obj / PROJECT_DIR_NAME
     logger.debug(f"Project registry directory for {project_path}: {project_dir}")
@@ -96,7 +88,8 @@ def get_project_index_dir(project_path: str | Path, index_name: Optional[str] = 
         Path object for the project index directory
 
     Raises:
-        ValueError: If project_path is empty or not an absolute path
+        ValueError: If project_path is empty, not an absolute path, or index_name contains invalid characters
+        TypeError: If project_path is not a string or Path object
 
     Examples:
         >>> get_project_index_dir("/home/user/myproject")
@@ -107,6 +100,9 @@ def get_project_index_dir(project_path: str | Path, index_name: Optional[str] = 
     """
     project_dir = get_project_registry_dir(project_path)
     index_dir = project_dir / "index"
+
+    # Validate index_name if provided
+    validate_index_name(index_name)
 
     if index_name:
         index_dir = index_dir / index_name
@@ -129,14 +125,15 @@ def ensure_directories(
 
     Args:
         project_path: Optional project path. Required if create_project is True
-        create_global: Whether to ensure global directory exists
-        create_project: Whether to ensure project directory exists
+        create_global: Whether to ensure global directory exists (default: True)
+        create_project: Whether to ensure project directory exists (default: False)
 
     Returns:
         Dictionary with keys 'global' and/or 'project' containing created Paths
 
     Raises:
         ValueError: If create_project is True but project_path is not provided
+        TypeError: If project_path is not a string or Path object
         OSError: If directory creation fails
 
     Examples:

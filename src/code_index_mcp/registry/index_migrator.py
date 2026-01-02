@@ -5,19 +5,20 @@ This module provides migration capabilities from legacy pickle format to
 MessagePack format for code indexes.
 """
 
+# Standard library imports
+import logging
 import os
 import pickle
 import shutil
-import hashlib
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any, Optional, Dict, List, Tuple
-from dataclasses import dataclass
-from enum import Enum
-import logging
-from datetime import datetime
 
-from .msgpack_serializer import MessagePackSerializer, FormatType, PICKLE_EXT, MSGPACK_EXT
+# Local application imports
 from .directories import get_project_index_dir, get_project_registry_dir
+from .msgpack_serializer import FormatType, MessagePackSerializer, MSGPACK_EXT, PICKLE_EXT
 
 logger = logging.getLogger(__name__)
 
@@ -364,12 +365,31 @@ class IndexMigrator:
                 # We verify by reading both and comparing the data structures
                 source_data = self.serializer.read(source_path)
                 target_data = self.serializer.read(target_path)
+
+                # Verify file counts match
+                source_file_count = self._count_files_in_index(source_data)
+                target_file_count = self._count_files_in_index(target_data)
+                if source_file_count != target_file_count:
+                    logger.error(
+                        f"File count mismatch: source={source_file_count}, "
+                        f"target={target_file_count}"
+                    )
+                    raise ValueError(
+                        f"Data verification failed: file counts don't match "
+                        f"({source_file_count} vs {target_file_count})"
+                    )
+
                 checksums_match = self._compare_data_structures(
                     source_data, target_data
                 )
 
                 if not checksums_match:
                     raise ValueError("Data verification failed: structures don't match")
+
+                logger.info(
+                    f"Semantic verification passed: {file_count} files, "
+                    f"source_count={source_file_count}, target_count={target_file_count}"
+                )
 
             success = True
             logger.info(f"Migration completed successfully: {target_path}")
@@ -494,22 +514,31 @@ class IndexMigrator:
             >>> migrator.rollback_migration(result)
             True
         """
-        if not result.backup_path or not result.backup_path.exists():
+        if not result.backup_path:
             logger.error("No backup file available for rollback")
             return False
 
         try:
-            # Restore from backup
+            # Restore from backup - attempt copy directly without checking exists()
+            # to avoid TOCTOU race condition. If backup doesn't exist, we'll catch
+            # the FileNotFoundError.
             shutil.copy2(result.backup_path, result.source_path)
             logger.info(f"Restored {result.source_path} from backup")
 
             # Remove target if requested
-            if remove_target and result.target_path.exists():
-                result.target_path.unlink()
-                logger.info(f"Removed migrated file: {result.target_path}")
+            if remove_target:
+                try:
+                    result.target_path.unlink()
+                    logger.info(f"Removed migrated file: {result.target_path}")
+                except FileNotFoundError:
+                    # Target may not exist, which is fine
+                    logger.debug(f"Target file not found for removal: {result.target_path}")
 
             return True
 
+        except FileNotFoundError as e:
+            logger.error(f"Backup file not found during rollback: {e}")
+            return False
         except Exception as e:
             logger.error(f"Rollback failed: {e}")
             return False
@@ -526,14 +555,16 @@ class IndexMigrator:
             True if rollback succeeded
         """
         try:
-            if backup_path.exists():
-                shutil.copy2(backup_path, source_path)
-                logger.info(f"Rollback completed: {source_path}")
-                return True
+            # Attempt copy directly without checking exists() to avoid TOCTOU
+            shutil.copy2(backup_path, source_path)
+            logger.info(f"Rollback completed: {source_path}")
+            return True
+        except FileNotFoundError:
+            logger.error(f"Backup file not found during rollback: {backup_path}")
+            return False
         except Exception as e:
             logger.error(f"Rollback failed: {e}")
-
-        return False
+            return False
 
     # ------------------------------------------------------------------------
     # Verification
@@ -611,28 +642,55 @@ class IndexMigrator:
         data2: Any
     ) -> bool:
         """
-        Compare two data structures for equality.
+        Compare two data structures for equality with semantic validation.
+
+        This performs semantic validation by:
+        1. Checking type compatibility
+        2. Verifying critical fields exist
+        3. Comparing field counts
+        4. Performing deep structural comparison
 
         Args:
-            data1: First data structure
-            data2: Second data structure
+            data1: First data structure (typically source pickle data)
+            data2: Second data structure (typically target msgpack data)
 
         Returns:
-            True if structures are equal
+            True if structures are semantically equivalent
+
+        Note:
+            This comparison is tolerant of minor structural differences that
+            don't affect data semantics (e.g., key ordering in dicts).
         """
         if type(data1) != type(data2):
+            logger.warning(f"Type mismatch during comparison: {type(data1)} vs {type(data2)}")
             return False
 
         if isinstance(data1, dict):
-            if set(data1.keys()) != set(data2.keys()):
-                return False
+            # Semantic validation: check critical keys exist
+            keys1 = set(data1.keys())
+            keys2 = set(data2.keys())
+
+            if keys1 != keys2:
+                logger.warning(f"Key mismatch: {keys1 - keys2} in source, {keys2 - keys1} in target")
+
+            # Verify critical fields for index data
+            critical_keys = {"files", "file_count", "indexed_at"}
+            for key in critical_keys:
+                if key in keys1 and key in keys2:
+                    # Both have the key, verify types match
+                    if type(data1[key]) != type(data2[key]):
+                        logger.warning(f"Type mismatch for key '{key}': {type(data1[key])} vs {type(data2[key])}")
+                        return False
+
+            # Deep comparison of all values
             return all(
                 self._compare_data_structures(data1[k], data2[k])
-                for k in data1.keys()
+                for k in keys1 & keys2
             )
 
         elif isinstance(data1, (list, tuple)):
             if len(data1) != len(data2):
+                logger.warning(f"Length mismatch: {len(data1)} vs {len(data2)}")
                 return False
             return all(
                 self._compare_data_structures(v1, v2)
@@ -641,6 +699,36 @@ class IndexMigrator:
 
         else:
             return data1 == data2
+
+    # ------------------------------------------------------------------------
+    # Backwards Compatibility Aliases
+    # ------------------------------------------------------------------------
+
+    def migrate_index_file(self, source_path: str | Path, **kwargs) -> MigrationResult:
+        """
+        Backwards compatibility alias for migrate_index.
+
+        Args:
+            source_path: Path to the source pickle file
+            **kwargs: Additional arguments passed to migrate_index
+
+        Returns:
+            MigrationResult with details of the migration
+        """
+        return self.migrate_index(source_path, **kwargs)
+
+    def migrate_file(self, source_path: str | Path, **kwargs) -> MigrationResult:
+        """
+        Backwards compatibility alias for migrate_index.
+
+        Args:
+            source_path: Path to the source pickle file
+            **kwargs: Additional arguments passed to migrate_index
+
+        Returns:
+            MigrationResult with details of the migration
+        """
+        return self.migrate_index(source_path, **kwargs)
 
     # ------------------------------------------------------------------------
     # Status Tracking

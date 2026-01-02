@@ -343,6 +343,86 @@ from src.code_index_mcp.registry.registry_backup import RegistryBackupManager
 backup_manager = RegistryBackupManager(max_backups=14)  # Keep 14 days
 ```
 
+## 🔒 Security Considerations
+
+### Pickle Security Warning
+
+**CRITICAL**: The pickle format used in v2.0 can execute arbitrary code during deserialization. This is a known security vulnerability in Python's pickle module.
+
+**Migration Security**:
+- During migration, pickle files are loaded for conversion
+- Only load pickle files from trusted sources
+- The system logs a warning when loading pickle files
+- After migration to MessagePack, this vulnerability is eliminated
+
+**MessagePack Security**:
+- MessagePack does not execute code during deserialization
+- Provides only data serialization without code execution
+- Safe for untrusted sources (after format validation)
+
+### Database Security (SQLite)
+
+The meta-registry uses SQLite with the following security measures:
+
+**SQL Injection Protection**:
+- All user-provided column names are validated against a whitelist
+- The `list_all()` method only allows sorting by predefined columns
+- Invalid column names are rejected with a clear error message
+
+**Example of protected code**:
+```python
+# Allowed columns for sorting
+ALLOWED_SORT_COLUMNS = {
+    "indexed_at", "path", "file_count", "created_at", "updated_at", "id"
+}
+
+# Validation prevents SQL injection
+if order_by not in self.ALLOWED_SORT_COLUMNS:
+    raise ValueError(f"Invalid order_by column '{order_by}'")
+```
+
+**Path Validation**:
+- All project paths must be absolute
+- Relative paths are rejected to prevent directory traversal attacks
+- Paths are normalized before storage
+
+**File Permissions**:
+- Registry database: User-readable and writable only (mode 0600)
+- Backup files: Protected with restrictive permissions
+- Index files: Stored in project directories with project permissions
+
+### Migration Rollback Security
+
+When rolling back migrations:
+- The system avoids TOCTOU (Time-of-Check-Time-of-Use) race conditions
+- File operations attempt the copy directly and catch errors
+- This prevents race conditions between checking if a file exists and copying it
+
+**Example of secure rollback**:
+```python
+# Avoids TOCTOU by attempting operation directly
+try:
+    shutil.copy2(backup_path, source_path)
+except FileNotFoundError:
+    logger.error(f"Backup file not found: {backup_path}")
+    return False
+```
+
+### Backup Security
+
+- Automatic backups are created with secure permissions
+- Backup files include SHA-256 checksums for integrity verification
+- Old backups are automatically cleaned up after 7 days
+- Backups are stored in `~/.code-indexer/registry/backups/`
+
+### Recommendations
+
+1. **Verify Source**: Only migrate indexes from trusted sources
+2. **Check Permissions**: Ensure registry and backup files have appropriate permissions
+3. **Monitor Logs**: Watch for security warnings during migration
+4. **Backup First**: Always create backups before manual operations
+5. **Update Regularly**: Keep the system updated for security patches
+
 ## 📚 Additional Resources
 
 - **Architecture Documentation**: See `docs/ARCHITECTURE.md` for Meta-Registry details

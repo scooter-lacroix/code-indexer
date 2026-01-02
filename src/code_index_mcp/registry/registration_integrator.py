@@ -5,14 +5,22 @@ This module provides automatic registration integration with the indexing
 pipeline, ensuring projects are registered after their index is saved.
 """
 
+# Standard library imports
+import logging
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
-from datetime import datetime
-import logging
 
-from .project_registry import ProjectRegistry, ProjectInfo, DuplicateProjectError
+# Local application imports
 from .directories import get_project_index_dir
+from .project_registry import (
+    DuplicateProjectError,
+    ProjectNotFoundError,
+    ProjectInfo,
+    ProjectRegistry,
+    RegistryError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +47,16 @@ class RegistrationIntegrator:
         self,
         registry: Optional[ProjectRegistry] = None,
         enabled: bool = True,
-    ):
+    ) -> None:
         """
         Initialize the registration integrator.
 
         Args:
             registry: ProjectRegistry instance. If None, creates a new instance.
             enabled: Whether auto-registration is enabled (default: True)
+
+        Raises:
+            RegistryError: If registry initialization fails
         """
         self.registry = registry if registry is not None else ProjectRegistry()
         self.enabled = enabled
@@ -90,13 +101,20 @@ class RegistrationIntegrator:
             return None
 
         try:
+            # Validate project_path
+            if project_path is None:
+                logger.warning("Project path is None, skipping registration")
+                return None
+
             # Normalize path
             project_path = os.path.abspath(project_path)
 
             # Get index location
             index_location = str(get_project_index_dir(project_path))
 
-            # Check if already registered
+            # Check if already exists first (for proper reindex handling)
+            # This is intentional: we need to distinguish between "already exists"
+            # and "race condition during new registration"
             exists = self.registry.exists(project_path)
 
             if exists:
@@ -112,18 +130,37 @@ class RegistrationIntegrator:
                     logger.debug(f"Project already registered: {project_path}")
                     return self.registry.get_by_path(project_path)
             else:
-                # Register new project
-                return self._register_new_project(
-                    project_path,
-                    file_count,
-                    config,
-                    index_location,
-                )
+                # Register new project (handle race condition if another process registered first)
+                try:
+                    return self._register_new_project(
+                        project_path,
+                        file_count,
+                        config,
+                        index_location,
+                    )
+                except DuplicateProjectError:
+                    # Race condition - project was just registered by another process
+                    logger.debug(f"Project already registered (race condition): {project_path}")
+                    if is_reindex:
+                        return self._update_registered_project(
+                            project_path,
+                            file_count,
+                            config,
+                        )
+                    return self.registry.get_by_path(project_path)
 
-        except Exception as e:
+        except (RegistryError, OSError, ValueError) as e:
             # Graceful failure handling - log warning, continue
             logger.warning(
                 f"Failed to register project {project_path}: {e}. "
+                f"Continuing anyway (graceful degradation)."
+            )
+            return None
+        except Exception as e:
+            # Catch-all for unexpected errors at API boundary
+            # Log full error including stack trace
+            logger.exception(
+                f"Unexpected error registering project {project_path}: {e}. "
                 f"Continuing anyway (graceful degradation)."
             )
             return None
@@ -146,6 +183,12 @@ class RegistrationIntegrator:
 
         Returns:
             ProjectInfo if registration succeeded, None otherwise
+
+        Raises:
+            DuplicateProjectError: If project already exists
+            RegistryError: If registration fails due to registry errors
+            OSError: If there are filesystem-related errors
+            ValueError: If invalid parameters are provided
         """
         try:
             # Prepare config
@@ -201,6 +244,12 @@ class RegistrationIntegrator:
 
         Returns:
             Updated ProjectInfo if update succeeded, None otherwise
+
+        Raises:
+            RegistryError: If update fails due to registry errors
+            ProjectNotFoundError: If project doesn't exist in registry
+            OSError: If there are filesystem-related errors
+            ValueError: If invalid parameters are provided
         """
         try:
             # Prepare stats
@@ -220,9 +269,9 @@ class RegistrationIntegrator:
             logger.info(f"Auto-updated project on reindex: {project_path}")
             return project_info
 
-        except Exception as e:
+        except (RegistryError, OSError, ValueError) as e:
             logger.error(f"Failed to update project {project_path}: {e}")
-            return None
+            raise
 
     # ------------------------------------------------------------------------
     # Batch Operations
@@ -343,6 +392,48 @@ class RegistrationIntegrator:
         )
 
         return results
+
+    # ------------------------------------------------------------------------
+    # Convenience Methods (for backward compatibility with tests)
+    # ------------------------------------------------------------------------
+
+    def register_after_indexing(
+        self,
+        project_path: str,
+        index_location: str,
+        file_count: int,
+        stats: Optional[Dict[str, Any]] = None,
+        config: Optional[Dict[str, Any]] = None,
+    ) -> Optional[ProjectInfo]:
+        """
+        Register a project after indexing is complete.
+
+        Convenience method for the indexing workflow. This is a simplified
+        version of register_after_save that takes already-extracted parameters.
+
+        Args:
+            project_path: Absolute path to the project
+            index_location: Path to the index directory
+            file_count: Number of files indexed
+            stats: Optional statistics dictionary
+            config: Optional configuration dictionary
+
+        Returns:
+            ProjectInfo if registration succeeded, None otherwise
+        """
+        # Build index_data dict from parameters
+        index_data = {
+            "metadata": stats or {},
+            "file_count": file_count,
+        }
+
+        return self.register_after_save(
+            project_path=project_path,
+            index_data=index_data,
+            file_count=file_count,
+            config=config,
+            is_reindex=False,
+        )
 
 
 # Global singleton instance for convenience

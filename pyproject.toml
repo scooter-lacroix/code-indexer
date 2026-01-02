@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sc-code-indexer"
-version = "2.0.2"
+version = "2.1.0"
 description = "Code indexing and analysis tools for LLMs using MCP"
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
@@ -42,7 +42,7 @@ dependencies = [
     "faiss-cpu>=1.7.4",
     # CPU-only sentence-transformers - exclude GPU/CUDA dependencies
     "sentence-transformers>=2.2.0",
-    "torch>=2.0.0,<2.5", # Pin to stable CPU-compatible versions
+    "torch>=2.6.0", # Updated for sentence-transformers compatibility (CVE-2025-32434)
     "numpy>=1.24.0",
     "pytest-asyncio>=1.3.0",
     "msgpack>=1.0.0",

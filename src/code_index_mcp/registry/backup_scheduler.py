@@ -13,6 +13,7 @@ import signal
 import logging
 from typing import Optional, Tuple
 from pathlib import Path
+from datetime import datetime, timezone
 
 from .project_registry import ProjectRegistry
 from .registry_backup import RegistryBackupManager
@@ -91,7 +92,8 @@ class BackupScheduler:
         else:
             last_backup = self.backup_manager.get_last_backup_time(registry)
             if last_backup:
-                time_ago = (asyncio.get_event_loop().time() - last_backup.timestamp()) / 3600
+                # Use wall clock time instead of monotonic time
+                time_ago = (datetime.now(timezone.utc) - last_backup).total_seconds() / 3600
                 msg = f"Startup backup check: no backup needed (last backup {time_ago:.1f}h ago)"
             else:
                 msg = "Startup backup check: no backup needed (no previous backup)"
@@ -128,6 +130,14 @@ class BackupScheduler:
         Waits for the current backup to complete if in progress.
         """
         logger.info("Stopping periodic backup task...")
+        return await self._stop_periodic_backups()
+
+    async def _stop_periodic_backups(self) -> None:
+        """
+        Internal method to stop the background periodic backup task gracefully.
+
+        Waits for the current backup to complete if in progress.
+        """
 
         # Signal shutdown
         self._shutdown_event.set()

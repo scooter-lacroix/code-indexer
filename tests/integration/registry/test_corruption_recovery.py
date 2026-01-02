@@ -135,16 +135,20 @@ class TestDatabaseCorruptionDetection:
             registry.close()
 
     def test_detect_empty_database(self):
-        """Should handle empty database file."""
+        """Should handle empty database file gracefully."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "empty.db"
 
             # Create empty file
             db_path.write_bytes(b"")
 
-            # Try to open empty database
-            with pytest.raises(Exception):
-                registry = ProjectRegistry(db_path=db_path)
+            # Should handle gracefully by creating schema
+            registry = ProjectRegistry(db_path=db_path)
+
+            # Verify it's a valid empty registry
+            assert registry.count() == 0
+
+            registry.close()
 
 
 # ============================================================================
@@ -276,11 +280,15 @@ class TestFilesystemScanRecovery:
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = Path(tmpdir) / "registry.db"
 
+            # Get the parent directory of temp projects to use as scan root
+            # All temp_project_dirs should be in the same parent directory (the fixture's tmpdir)
+            scan_root = temp_project_dirs[0].parent
+
             # Scan filesystem for index directories
             from src.code_index_mcp.registry.registry_backup import RegistryBackupManager
 
             backup_manager = RegistryBackupManager()
-            recovered_projects = backup_manager.scan_and_recover(db_path)
+            recovered_projects = backup_manager.scan_and_recover(db_path, scan_roots=[scan_root])
 
             assert len(recovered_projects) == len(temp_project_dirs)
 
@@ -322,7 +330,7 @@ class TestFilesystemScanRecovery:
 
             db_path = Path(tmpdir) / "registry.db"
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[Path(tmpdir)])
 
             # Should only recover valid project
             assert len(recovered) == 1
@@ -352,7 +360,7 @@ class TestFilesystemScanRecovery:
 
             db_path = Path(tmpdir) / "registry.db"
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[Path(tmpdir)])
 
             # Should create single registry entry
             assert len(recovered) == 1
@@ -372,12 +380,15 @@ class TestIndexFileCorruptionHandling:
             corrupted_index = get_project_index_dir(temp_project_dirs[0]) / "files.msgpack"
             corrupted_index.write_bytes(b"corrupted data")
 
+            # Get scan root (parent directory containing the temp projects)
+            scan_root = temp_project_dirs[0].parent
+
             # Scan and recover
             from src.code_index_mcp.registry.registry_backup import RegistryBackupManager
 
             db_path = Path(tmpdir) / "registry.db"
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[scan_root])
 
             # Should recover only non-corrupted projects
             assert len(recovered) == 2
@@ -402,7 +413,7 @@ class TestIndexFileCorruptionHandling:
 
             db_path = Path(tmpdir) / "registry.db"
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[Path(tmpdir)])
 
             assert len(recovered) == 1
             assert recovered[0]["file_count"] == 1
@@ -522,7 +533,7 @@ class TestPartialRecoveryScenarios:
 
             db_path = Path(tmpdir) / "registry.db"
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[Path(tmpdir)])
 
             # Should recover 4 projects (one deleted)
             assert len(recovered) == 4
@@ -563,7 +574,7 @@ class TestPartialRecoveryScenarios:
             from src.code_index_mcp.registry.registry_backup import RegistryBackupManager
 
             backup_manager = RegistryBackupManager()
-            recovered = backup_manager.scan_and_recover(db_path)
+            recovered = backup_manager.scan_and_recover(db_path, scan_roots=[Path(tmpdir)])
 
             # Verify merged registry
             new_registry = ProjectRegistry(db_path=db_path)

@@ -29,7 +29,7 @@ import tempfile
 import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.code_index_mcp.registry.registry_backup import (
     RegistryBackupManager,
@@ -486,7 +486,7 @@ class TestBackupTimeTracking:
 
         assert last_backup is not None
         assert isinstance(last_backup, datetime)
-        assert (datetime.now() - last_backup).total_seconds() < 5  # Within 5 seconds
+        assert (datetime.now(timezone.utc) - last_backup).total_seconds() < 5  # Within 5 seconds
 
     def test_should_create_backup_no_previous(self, temp_backup_dir, mock_registry):
         """Test should_create_backup when no previous backup exists."""
@@ -542,7 +542,11 @@ class TestBackupTimeTracking:
 
         # Verify it's a valid datetime
         check_time = datetime.fromisoformat(check_time_str)
-        assert (datetime.now() - check_time).total_seconds() < 2
+        # Make both datetimes timezone-aware for comparison
+        now = datetime.now(timezone.utc)
+        if check_time.tzinfo is None:
+            check_time = check_time.replace(tzinfo=timezone.utc)
+        assert (now - check_time).total_seconds() < 2
 
 
 # =============================================================================
