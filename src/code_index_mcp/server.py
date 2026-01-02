@@ -80,7 +80,7 @@ from .file_reader import (
     ReadingStrategy,
     FileSizeCategory,
 )  # Import SmartFileReader and enums
-from .system_utils import detect_system
+from .system_utils import detect_system, async_ensure_infrastructure
 from .elasticsearch_installer import ElasticsearchInstaller
 from .elasticsearch_config import elasticsearch_config
 from .search_utils import (
@@ -381,6 +381,25 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
     # Load base_path from settings if available, otherwise default to empty string
     logger.info("Initializing Code Indexer MCP server...")
 
+    # Auto-start required infrastructure services (PostgreSQL, Elasticsearch, RabbitMQ)
+    # This ensures the MCP server works out-of-the-box without manual service startup
+    logger.info("Checking infrastructure services (db, elasticsearch, rabbitmq)...")
+    try:
+        infra_ready = await async_ensure_infrastructure(
+            required_services=["db", "elasticsearch", "rabbitmq"],
+            timeout=120,  # 2 minutes max wait for services to start
+            auto_start=True
+        )
+        if infra_ready:
+            logger.info("All infrastructure services are running and healthy")
+        else:
+            logger.warning(
+                "Some infrastructure services may not be available. "
+                "The server will continue with limited functionality."
+            )
+    except Exception as e:
+        logger.warning(f"Error ensuring infrastructure services: {e}. Continuing with startup...")
+
     # Check and potentially install Elasticsearch before initialization
     logger.info("Checking Elasticsearch availability...")
     check_and_install_elasticsearch()
@@ -535,11 +554,44 @@ async def indexer_lifespan(server: FastMCP) -> AsyncIterator[CodeIndexerContext]
         logger.info("Server ready. Waiting for user to set project path...")
         yield context
     finally:
-        # Close DAL instance
+        # CRITICAL: Explicit flush before shutdown to ensure all data is persisted
+        logger.info("Flushing storage backends before shutdown...")
+
+        # Flush DAL instance if it has a flush method
         if dal_instance:
+            logger.info("Flushing DAL instance...")
+            if hasattr(dal_instance, 'flush'):
+                dal_instance.flush()
+                logger.info("DAL instance flushed.")
+
+            # Close DAL instance
             logger.info("Closing DAL instance...")
             dal_instance.close()
             logger.info("DAL instance closed.")
+
+        # Flush settings storage backends (SQLiteStorage, SQLiteFileMetadata)
+        if settings:
+            logger.info("Flushing settings storage backends...")
+            if hasattr(settings, 'cache_storage') and hasattr(settings.cache_storage, 'flush'):
+                try:
+                    settings.cache_storage.flush()
+                    logger.info("Cache storage flushed.")
+                except Exception as e:
+                    logger.error(f"Error flushing cache storage: {e}")
+
+            if hasattr(settings, 'metadata_storage') and hasattr(settings.metadata_storage, 'flush'):
+                try:
+                    settings.metadata_storage.flush()
+                    logger.info("Metadata storage flushed.")
+                except Exception as e:
+                    logger.error(f"Error flushing metadata storage: {e}")
+
+            if hasattr(settings, 'file_index') and hasattr(settings.file_index, 'flush'):
+                try:
+                    settings.file_index.flush()
+                    logger.info("File index flushed.")
+                except Exception as e:
+                    logger.error(f"Error flushing file index: {e}")
 
         # Stop RealtimeIndexer worker thread
         if realtime_indexer:

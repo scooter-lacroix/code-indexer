@@ -22,3 +22,9 @@ This file tracks all major tracks for the project. Each track has its own detail
 
 ## [~] Track: Fix Elasticsearch Indexing Pipeline
 *Link: [./conductor/tracks/elasticsearch_indexing_20251230/](./conductor/tracks/elasticsearch_indexing_20251230/)*
+
+---
+
+## [~] Track: Self-Indexing Meta-Registry with Persistence Fixes
+*Link: [./conductor/tracks/meta-registry_20250101/](./conductor/tracks/meta-registry_20250101/)*
+**Target Version:** v2.1.0 (breaking changes)

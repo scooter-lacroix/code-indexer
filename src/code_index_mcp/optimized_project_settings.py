@@ -26,6 +26,7 @@ from .search.ripgrep import RipgrepStrategy
 from .search.ag import AgStrategy
 from .search.grep import GrepStrategy
 from .search.basic import BasicSearchStrategy
+from .registry.msgpack_serializer import MessagePackSerializer, FormatType
 
 
 # Prioritized list of search strategies (highest priority first)
@@ -58,10 +59,10 @@ def _get_available_strategies() -> List[SearchStrategy]:
 class OptimizedProjectSettings:
     """Enhanced project settings with configurable storage backends."""
     
-    def __init__(self, base_path: str, skip_load: bool = False, 
+    def __init__(self, base_path: str, skip_load: bool = False,
                  storage_backend: str = 'sqlite', use_trie_index: bool = False):
         """Initialize optimized project settings.
-        
+
         Args:
             base_path: Base path of the project
             skip_load: Whether to skip loading files
@@ -73,10 +74,13 @@ class OptimizedProjectSettings:
         self.storage_backend = storage_backend
         self.use_trie_index = use_trie_index
         self.available_strategies: List[SearchStrategy] = []
-        
+
+        # Initialize MessagePack serializer for index persistence
+        self.msgpack_serializer = MessagePackSerializer(use_bin_type=True)
+
         # Initialize storage backend
         self._init_storage_backend()
-        
+
         # Initialize search strategies
         self.refresh_available_strategies()
     
@@ -202,18 +206,24 @@ class OptimizedProjectSettings:
         try:
             if self.storage_backend == 'sqlite':
                 if isinstance(self.file_index, TrieFileIndex):
-                    # For Trie index, we need to serialize it
+                    # For Trie index, serialize with MessagePack
                     index_path = self.get_index_path()
-                    import pickle
-                    with open(index_path, 'wb') as f:
-                        pickle.dump(file_index, f)
-                    print(f"Trie index saved to: {index_path}")
+                    # Use .msgpack extension for new files
+                    msgpack_path = str(Path(index_path).with_suffix('.msgpack'))
+                    # Convert TrieFileIndex to dict for serialization
+                    if hasattr(file_index, 'to_dict'):
+                        index_data = file_index.to_dict()
+                    else:
+                        # Fallback: serialize the trie structure
+                        index_data = {'trie_data': file_index.__dict__}
+                    self.msgpack_serializer.write(msgpack_path, index_data)
+                    print(f"Trie index saved to: {msgpack_path}")
                 elif isinstance(self.file_index, SQLiteFileMetadata):
                     # SQLite file index is already persisted
                     print("SQLite file index is automatically persisted")
                 else:
-                    # Legacy dict-based index
-                    self._save_legacy_index(file_index)
+                    # Dict-based index - save with MessagePack
+                    self._save_index_msgpack(file_index)
             else:
                 # Memory-based storage
                 self.file_index = file_index
@@ -221,60 +231,114 @@ class OptimizedProjectSettings:
         except Exception as e:
             print(f"Error saving index: {e}")
     
-    def _save_legacy_index(self, file_index: Dict[str, Any]):
-        """Save legacy dictionary-based index."""
+    def _save_index_msgpack(self, file_index: Dict[str, Any]):
+        """Save dictionary-based index with MessagePack."""
         try:
             index_path = self.get_index_path()
-            import pickle
-            with open(index_path, 'wb') as f:
-                pickle.dump(file_index, f)
-            print(f"Legacy index saved to: {index_path}")
+            # Use .msgpack extension
+            msgpack_path = str(Path(index_path).with_suffix('.msgpack'))
+            self.msgpack_serializer.write(msgpack_path, file_index)
+            print(f"Index saved to: {msgpack_path}")
         except Exception as e:
-            print(f"Error saving legacy index: {e}")
+            print(f"Error saving index with MessagePack: {e}")
     
     def load_index(self) -> Union[Dict[str, Any], TrieFileIndex, SQLiteFileMetadata, None]:
-        """Load file index using the configured storage backend."""
+        """Load file index using the configured storage backend with format detection."""
         if self.skip_load:
             return {} if self.storage_backend != 'sqlite' else None
-        
+
         try:
             if self.storage_backend == 'sqlite':
                 if self.use_trie_index:
-                    # Load Trie index from file
+                    # Load Trie index from file with format detection
                     index_path = self.get_index_path()
+                    msgpack_path = str(Path(index_path).with_suffix('.msgpack'))
+
+                    # Try MessagePack first
+                    if os.path.exists(msgpack_path):
+                        try:
+                            index_data = self.msgpack_serializer.read(msgpack_path)
+                            print(f"Trie index loaded from MessagePack: {msgpack_path}")
+                            # Reconstruct TrieFileIndex from dict if needed
+                            if isinstance(index_data, dict) and 'trie_data' in index_data:
+                                trie_index = TrieFileIndex()
+                                trie_index.__dict__.update(index_data['trie_data'])
+                                return trie_index
+                            return index_data
+                        except Exception as e:
+                            print(f"Error loading MessagePack index: {e}")
+
+                    # Fallback to legacy pickle file for migration
                     if os.path.exists(index_path):
-                        import pickle
-                        with open(index_path, 'rb') as f:
-                            loaded_index = pickle.load(f)
-                        print(f"Trie index loaded from: {index_path}")
-                        return loaded_index
-                    else:
-                        # Return empty Trie index
-                        return TrieFileIndex()
+                        format_type = self.msgpack_serializer.detect_format(index_path)
+                        if format_type == FormatType.PICKLE:
+                            print(f"Migrating legacy pickle index: {index_path}")
+                            try:
+                                # Read with pickle support and migrate to MessagePack
+                                legacy_data = self.msgpack_serializer.read(index_path)
+                                # Save as MessagePack
+                                self.msgpack_serializer.write(msgpack_path, legacy_data)
+                                print(f"Migrated index to MessagePack: {msgpack_path}")
+                                # Optionally remove old pickle file after successful migration
+                                # os.unlink(index_path)
+                                return legacy_data
+                            except Exception as e:
+                                print(f"Error migrating pickle index: {e}")
+
+                    # Return empty Trie index if no file found
+                    print("No existing Trie index found, creating new one")
+                    return TrieFileIndex()
                 else:
                     # SQLite file index is already loaded
                     print("SQLite file index is ready")
                     return self.file_index
             else:
-                # Memory-based storage - try to load from legacy pickle file
-                return self._load_legacy_index()
+                # Memory-based storage - try to load with format detection
+                return self._load_index_with_format_detection()
         except Exception as e:
             print(f"Error loading index: {e}")
             return {} if self.storage_backend != 'sqlite' else None
     
-    def _load_legacy_index(self) -> Dict[str, Any]:
-        """Load legacy dictionary-based index."""
+    def _load_index_with_format_detection(self) -> Dict[str, Any]:
+        """Load index with automatic format detection and migration."""
         try:
             index_path = self.get_index_path()
+            msgpack_path = str(Path(index_path).with_suffix('.msgpack'))
+
+            # Try MessagePack first
+            if os.path.exists(msgpack_path):
+                try:
+                    index = self.msgpack_serializer.read(msgpack_path)
+                    print(f"Index loaded from MessagePack: {msgpack_path}")
+                    return index
+                except Exception as e:
+                    print(f"Error loading MessagePack index: {e}")
+
+            # Fallback to legacy pickle file
             if os.path.exists(index_path):
-                import pickle
-                with open(index_path, 'rb') as f:
-                    index = pickle.load(f)
-                print(f"Legacy index loaded from: {index_path}")
-                return index
+                format_type = self.msgpack_serializer.detect_format(index_path)
+                if format_type == FormatType.PICKLE:
+                    print(f"Migrating legacy pickle index: {index_path}")
+                    try:
+                        # Read with pickle support
+                        legacy_index = self.msgpack_serializer.read(index_path)
+                        # Migrate to MessagePack
+                        self.msgpack_serializer.write(msgpack_path, legacy_index)
+                        print(f"Migrated index to MessagePack: {msgpack_path}")
+                        return legacy_index
+                    except Exception as e:
+                        print(f"Error migrating pickle index: {e}")
+                else:
+                    # Unknown format, try reading as MessagePack
+                    try:
+                        index = self.msgpack_serializer.read(index_path)
+                        return index
+                    except Exception as e:
+                        print(f"Error reading index: {e}")
+
             return {}
         except Exception as e:
-            print(f"Error loading legacy index: {e}")
+            print(f"Error loading index with format detection: {e}")
             return {}
     
     def save_cache(self, content_cache: Dict[str, Any]):

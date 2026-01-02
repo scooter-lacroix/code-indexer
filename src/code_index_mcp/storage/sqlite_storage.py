@@ -38,8 +38,21 @@ class SQLiteStorage(StorageInterface):
             os.makedirs(db_dir, exist_ok=True)
     
     def _init_db(self):
-        """Initialize the database schema."""
+        """Initialize the database schema with critical PRAGMA settings."""
         with sqlite3.connect(self.db_path) as conn:
+            # CRITICAL: Set PRAGMA settings for durability and consistency
+            # PRAGMA synchronous = FULL: Ensure all writes are synced to disk
+            # This provides maximum durability at the cost of some performance
+            conn.execute('PRAGMA synchronous = FULL')
+
+            # PRAGMA journal_mode = WAL: Use Write-Ahead Logging for better concurrency
+            # WAL mode allows readers to proceed without blocking writers
+            conn.execute('PRAGMA journal_mode = WAL')
+
+            # PRAGMA foreign_keys = ON: Enforce foreign key constraints
+            # Although not used in kv_store, this is a good default for all SQLite DBs
+            conn.execute('PRAGMA foreign_keys = ON')
+
             # Create main key-value table
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS kv_store (
@@ -218,8 +231,19 @@ class SQLiteFileMetadata(FileMetadataInterface):
             os.makedirs(db_dir, exist_ok=True)
     
     def _init_db(self):
-        """Initialize the database schema."""
+        """Initialize the database schema with critical PRAGMA settings."""
         with sqlite3.connect(self.db_path) as conn:
+            # CRITICAL: Set PRAGMA settings for durability and consistency
+            # PRAGMA synchronous = FULL: Ensure all writes are synced to disk
+            conn.execute('PRAGMA synchronous = FULL')
+
+            # PRAGMA journal_mode = WAL: Use Write-Ahead Logging for better concurrency
+            conn.execute('PRAGMA journal_mode = WAL')
+
+            # PRAGMA foreign_keys = ON: Enforce foreign key constraints
+            # This is critical for file_diffs table which has foreign keys
+            conn.execute('PRAGMA foreign_keys = ON')
+
             # Create files table
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS files (
@@ -232,20 +256,20 @@ class SQLiteFileMetadata(FileMetadataInterface):
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            
+
             # Create indexes for efficient lookups
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_files_path ON files(file_path)
             ''')
-            
+
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension)
             ''')
-            
+
             conn.execute('''
                 CREATE INDEX IF NOT EXISTS idx_files_type ON files(file_type)
             ''')
-            
+
             # Create file_versions table
             conn.execute('''
                 CREATE TABLE IF NOT EXISTS file_versions (
@@ -725,8 +749,18 @@ class SQLiteSearch(SearchInterface):
             os.makedirs(db_dir, exist_ok=True)
     
     def _init_db(self):
-        """Initialize the database schema for search."""
+        """Initialize the database schema for search with critical PRAGMA settings."""
         with sqlite3.connect(self.db_path) as conn:
+            # CRITICAL: Set PRAGMA settings for durability and consistency
+            # PRAGMA synchronous = FULL: Ensure all writes are synced to disk
+            conn.execute('PRAGMA synchronous = FULL')
+
+            # PRAGMA journal_mode = WAL: Use Write-Ahead Logging for better concurrency
+            conn.execute('PRAGMA journal_mode = WAL')
+
+            # PRAGMA foreign_keys = ON: Enforce foreign key constraints
+            conn.execute('PRAGMA foreign_keys = ON')
+
             if self.enable_fts:
                 # Create FTS table for file paths
                 conn.execute('''
@@ -734,14 +768,14 @@ class SQLiteSearch(SearchInterface):
                         file_path, content='files', content_rowid='id'
                     )
                 ''')
-                
+
                 # Create FTS table for kv_store values (content search)
                 conn.execute('''
                     CREATE VIRTUAL TABLE IF NOT EXISTS kv_fts USING fts5(
                         key, value_text, content='kv_store', content_rowid='rowid'
                     )
                 ''')
-            
+
             conn.commit()
 
     def _validate_fts_tables(self) -> Dict[str, Any]:
@@ -1204,6 +1238,17 @@ class SQLiteDAL(DALInterface):
         self._storage.close()
         self._metadata.close()
         self._search.close()
+
+    def flush(self) -> None:
+        """
+        Flush all underlying SQLite storage backends to ensure data persistence.
+
+        This method ensures all pending writes are synced to disk before closing.
+        """
+        self._storage.flush()
+        self._metadata.flush()
+        # SQLiteSearch doesn't have a flush method as it's read-only for queries
+        # and writes are auto-committed
 
     def clear_all(self) -> bool:
         """

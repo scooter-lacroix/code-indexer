@@ -201,9 +201,15 @@ class ProjectRegistry:
 
             conn.commit()
 
-            # Enable WAL mode and FULL synchronous
+            # CRITICAL: Set PRAGMA settings for durability and consistency
+            # PRAGMA journal_mode = WAL: Use Write-Ahead Logging for better concurrency
             conn.execute("PRAGMA journal_mode=WAL;")
+
+            # PRAGMA synchronous = FULL: Ensure all writes are synced to disk
             conn.execute("PRAGMA synchronous=FULL;")
+
+            # PRAGMA foreign_keys = ON: Enforce foreign key constraints
+            conn.execute("PRAGMA foreign_keys=ON;")
             conn.commit()
 
             logger.debug(f"Database schema initialized: {self.db_path}")

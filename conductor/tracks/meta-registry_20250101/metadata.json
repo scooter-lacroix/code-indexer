@@ -1,0 +1,9 @@
+{
+  "track_id": "meta-registry_20250101",
+  "type": "feature",
+  "status": "new",
+  "created_at": "2025-01-01T00:00:00Z",
+  "updated_at": "2025-01-01T00:00:00Z",
+  "description": "Implement self-indexing meta-registry feature with persistence fixes",
+  "version": "2.1.0"
+}
